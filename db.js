@@ -77,7 +77,7 @@ function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS tags (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL
+      name TEXT UNIQUE COLLATE NOCASE NOT NULL
     );
   `);
 
@@ -100,8 +100,11 @@ function initializeDatabase() {
       source_note_id INTEGER NOT NULL,
       target_note_id INTEGER NOT NULL, -- Can reference notes that might not exist yet
       link_text TEXT, -- Optional: the text used for the link
+      target_header TEXT,     -- For linking to headers
+      target_block_id TEXT,   -- For linking to specific blocks
+      is_embed BOOLEAN DEFAULT 0 NOT NULL, -- True if this link is an embed
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE (source_note_id, target_note_id, link_text), -- Avoid duplicate links from same source
+      UNIQUE (source_note_id, target_note_id, link_text, target_header, target_block_id, is_embed), -- Updated UNIQUE constraint
       FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE
       -- No FK on target_note_id to allow linking to non-existent notes initially
     );

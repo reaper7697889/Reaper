@@ -12,6 +12,7 @@ const linkService = require("./src/backend/services/linkService");
 const taskService = require("./src/backend/services/taskService");
 const folderService = require("./src/backend/services/folderService");
 const workspaceService = require("./src/backend/services/workspaceService");
+const graphService = require("./src/backend/services/graphService"); // Added graphService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -45,6 +46,8 @@ ipcMain.handle("db:removeTagFromNote", (e, noteId, tagId) => tagService.removeTa
 ipcMain.handle("db:getTagsForNote", (e, noteId) => tagService.getTagsForNote(noteId));
 ipcMain.handle("db:getAllTags", () => tagService.getAllTags());
 ipcMain.handle("db:getNotesForTag", (e, tagId) => tagService.getNotesForTag(tagId));
+ipcMain.handle("tags:renameTag", async (e, tagId, newTagName) => { return tagService.renameTag(tagId, newTagName); });
+ipcMain.handle("tags:deleteTag", async (e, tagId) => { return tagService.deleteTag(tagId); });
 
 // Folder Service
 ipcMain.handle("db:getFolders", (e, parentId = null) => folderService.getFolders(parentId));
@@ -81,6 +84,10 @@ ipcMain.handle("db:deleteTask", (e, taskId) => taskService.deleteTask(taskId));
 ipcMain.handle("db:getTasksForNote", (e, noteId) => taskService.getTasksForNote(noteId));
 ipcMain.handle("db:getTasksForBlock", (e, blockId) => taskService.getTasksForBlock(blockId));
 
+// Graph Service
+ipcMain.handle("graph:getGraphData", async () => {
+  return graphService.getGraphData();
+});
 
 // --- App Lifecycle ---
 
