@@ -2,7 +2,7 @@ const Database = require("better-sqlite3");
 const path = require("path");
 
 // Define the path for the database file within the project structure
-const dbPath = path.join(__dirname, "..", "..", "database.sqlite"); 
+const dbPath = path.join(__dirname, "database.sqlite");
 let db;
 
 function initializeDatabase() {
@@ -56,7 +56,7 @@ function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL CHECK(type IN ("simple", "markdown", "workspace_page")),
+        type TEXT NOT NULL CHECK(type IN ('simple', 'markdown', 'workspace_page')),
         title TEXT,
         content TEXT,
         folder_id INTEGER,
@@ -162,18 +162,13 @@ function initializeDatabase() {
 
   // --- Full-Text Search (FTS5) Tables ---
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(note_id UNINDEXED, title, content, tokenize = 'porter unicode61');`);
-  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(task_id UNINDEXED, description, tokenize = 'porter unicode61');`);
+  // tasks_fts table and triggers moved after tasks table definition
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS database_content_fts USING fts5(row_id UNINDEXED, database_id UNINDEXED, content, tokenize = 'porter unicode61');`);
 
   // Triggers for notes_fts
   db.exec(`CREATE TRIGGER IF NOT EXISTS notes_ai_fts_insert AFTER INSERT ON notes BEGIN INSERT INTO notes_fts (note_id, title, content) VALUES (NEW.id, NEW.title, NEW.content); END;`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS notes_ad_fts_delete AFTER DELETE ON notes BEGIN DELETE FROM notes_fts WHERE note_id = OLD.id; END;`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS notes_au_fts_update AFTER UPDATE ON notes BEGIN DELETE FROM notes_fts WHERE note_id = OLD.id; INSERT INTO notes_fts (note_id, title, content) VALUES (NEW.id, NEW.title, NEW.content); END;`);
-
-  // Triggers for tasks_fts
-  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_ai_fts_insert AFTER INSERT ON tasks BEGIN INSERT INTO tasks_fts (task_id, description) VALUES (NEW.id, NEW.description); END;`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_ad_fts_delete AFTER DELETE ON tasks BEGIN DELETE FROM tasks_fts WHERE task_id = OLD.id; END;`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_au_fts_update AFTER UPDATE ON tasks BEGIN DELETE FROM tasks_fts WHERE task_id = OLD.id; INSERT INTO tasks_fts (task_id, description) VALUES (NEW.id, NEW.description); END;`);
 
   // Triggers for database_content_fts
   db.exec(`CREATE TRIGGER IF NOT EXISTS d_rows_ai_fts_insert AFTER INSERT ON database_rows BEGIN INSERT INTO database_content_fts (row_id, database_id, content) VALUES (NEW.id, NEW.database_id, (SELECT GROUP_CONCAT(COALESCE(drv.value_text, ''), ' ') FROM database_row_values drv JOIN database_columns dc ON drv.column_id = dc.id WHERE drv.row_id = NEW.id AND dc.type IN ('TEXT', 'SELECT', 'MULTI_SELECT', 'DATE'))); END;`);
@@ -208,6 +203,12 @@ function initializeDatabase() {
     );
   `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_task_timestamp AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
+  // FTS for Tasks (moved here from above)
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(task_id UNINDEXED, description, tokenize = 'porter unicode61');`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_ai_fts_insert AFTER INSERT ON tasks BEGIN INSERT INTO tasks_fts (task_id, description) VALUES (NEW.id, NEW.description); END;`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_ad_fts_delete AFTER DELETE ON tasks BEGIN DELETE FROM tasks_fts WHERE task_id = OLD.id; END;`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS tasks_au_fts_update AFTER UPDATE ON tasks BEGIN DELETE FROM tasks_fts WHERE task_id = OLD.id; INSERT INTO tasks_fts (task_id, description) VALUES (NEW.id, NEW.description); END;`);
 
   // Task Dependencies Table
   db.exec(`
@@ -253,9 +254,36 @@ function initializeDatabase() {
 
   // --- Placeholder Tables for Future Features ---
   db.exec(`CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS permissions (id INTEGER PRIMARY KEY);`);
+  // db.exec(`CREATE TABLE IF NOT EXISTS permissions (id INTEGER PRIMARY KEY);`); // Replaced by object_permissions
   db.exec(`CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY);`);
   db.exec(`CREATE TABLE IF NOT EXISTS activity_log (id INTEGER PRIMARY KEY);`);
+
+  // --- Object Permissions Table ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS object_permissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_type TEXT NOT NULL, -- e.g., 'note', 'database_row', 'task', 'database'
+        object_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        permission_level TEXT NOT NULL, -- e.g., 'read', 'write', 'admin'
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE (object_type, object_id, user_id)
+    );
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_object_permissions_object ON object_permissions (object_type, object_id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_object_permissions_user ON object_permissions (user_id);`);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS object_permissions_updated_at_trigger
+    AFTER UPDATE ON object_permissions
+    FOR EACH ROW
+    BEGIN
+        UPDATE object_permissions SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
 
   console.log("Database schema initialized successfully.");
 

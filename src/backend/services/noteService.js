@@ -3,10 +3,11 @@
 const { getDb } = require("../db");
 const { recordNoteHistory } = require('./historyService');
 const linkService = require('./linkService');
+const permissionService = require('./permissionService'); // Added
 
 // --- Note CRUD Operations ---
 
-function createNote(noteData) {
+async function createNote(noteData) { // Made async
   const db = getDb();
   // Ensure userId is destructured, defaulting to null if not provided
   const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0, userId = null } = noteData;
@@ -34,6 +35,18 @@ function createNote(noteData) {
     transaction();
     if (newNoteId) {
         console.log(`Created note with ID: ${newNoteId}`);
+        // Grant admin permission to the creator
+        if (userId) {
+            try {
+                await permissionService.grantPermission(userId, userId, 'note', newNoteId, 'admin');
+                console.log(`Granted admin permission to creator ${userId} for note ${newNoteId}`);
+            } catch (permErr) {
+                // Log the error but don't let permission grant failure roll back note creation.
+                // Depending on policy, this might need to be stricter.
+                console.error(`Failed to grant admin permission to creator ${userId} for note ${newNoteId}:`, permErr.message);
+            }
+        }
+
         // Ensure userId is part of the newValues for history if available
         const newValuesForHistory = { title, content, type, folder_id, workspace_id, is_pinned, userId };
         const oldValuesForHistory = { title: null, content: null, type: null, folder_id: null, workspace_id: null, is_pinned: null, userId: null };
@@ -53,59 +66,68 @@ function createNote(noteData) {
     return newNoteId;
   } catch (err) {
     console.error("Error creating note:", err.message, err.stack);
-    return null;
+    // If transaction was initiated and error occurs, it should be rolled back by db.transaction()
+    return null; // Ensure null is returned on error
   }
 }
 
-function getNoteById(id, requestingUserId = null) {
+async function getNoteById(id, requestingUserId = null) { // Made async
   const db = getDb();
-  let query = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?";
-  const params = [id];
+  // Fetch note without user_id filter first
+  const note = db.prepare("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?").get(id);
+
+  if (!note) {
+    return null;
+  }
 
   if (requestingUserId !== null) {
-    query += " AND (user_id = ? OR user_id IS NULL)";
-    params.push(requestingUserId);
-  }
+    const isOwner = note.user_id === requestingUserId;
+    // If user_id is null, it's considered a public/system note, readable by any authenticated user.
+    // If it's a private note (user_id is not null), then either be owner or have explicit permission.
+    let hasPermission = note.user_id === null;
+    if (!isOwner && note.user_id !== null) { // only check explicit if not owner and note is not public
+        hasPermission = await permissionService.checkPermission(requestingUserId, 'note', id, 'read');
+    }
 
-  try {
-    const stmt = db.prepare(query);
-    const note = stmt.get(...params);
-    // if (note) { // No specific boolean conversion needed here }
-    return note || null;
-  } catch (err) {
-    console.error(`Error getting note ${id} for user ${requestingUserId}:`, err.message);
-    return null;
+    if (!isOwner && !hasPermission) {
+      console.warn(`Access denied for user ${requestingUserId} on note ${id}. Not owner and no read permission.`);
+      return null;
+    }
   }
+  // If requestingUserId is null (e.g. system access), or if user is owner or has permission, return note.
+  return note;
 }
 
-async function updateNote(noteId, updateData, requestingUserId) { // Added requestingUserId (required)
+async function updateNote(noteId, updateData, requestingUserId) {
   const db = getDb();
 
-  // Perform ownership check first using an unfiltered get
-  const noteForOwnershipCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
+  const noteForPermissionCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
 
-  if (!noteForOwnershipCheck) {
+  if (!noteForPermissionCheck) {
     console.error(`Error updating note ${noteId}: Note not found.`);
     return { success: false, error: "Note not found." };
   }
 
-  if (noteForOwnershipCheck.user_id !== null && noteForOwnershipCheck.user_id !== requestingUserId) {
-    console.error(`Authorization failed: User ${requestingUserId} does not own note ${noteId} (owned by ${noteForOwnershipCheck.user_id}).`);
-    return { success: false, error: "Authorization failed: You do not own this note." };
+  const isOwner = noteForPermissionCheck.user_id === requestingUserId;
+  // Allow update if user_id is null (public note) or if user is owner or has explicit write permission
+  let hasWritePermission = noteForPermissionCheck.user_id === null;
+  if (!isOwner && noteForPermissionCheck.user_id !== null) { // only check explicit if not owner and note is not public
+    hasWritePermission = await permissionService.checkPermission(requestingUserId, 'note', noteId, 'write');
   }
 
-  // Proceed with existing getNoteById logic, now potentially filtered if we passed requestingUserId,
-  // but for oldValues, we need the actual current values, so unfiltered is better here.
-  // However, the initial ownership check is the primary gate.
-  const oldNote = getNoteById(noteId, null); // Get current state, unfiltered by user for history
-  if (!oldNote) { // Should not happen if ownership check passed, but as a safeguard
-    console.error(`Error updating note ${noteId}: Note disappeared after ownership check.`);
-    return { success: false, error: "Note not found after ownership check." };
-    console.error(`Error updating note ${noteId}: Note disappeared after ownership check.`);
-    return { success: false, error: "Note not found after ownership check." };
+  if (!isOwner && !hasWritePermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot update note ${noteId}. Not owner and no write permission.`);
+    return { success: false, error: "Permission denied." };
   }
 
-  // user_id is set at creation and checked for ownership. Not typically part of updatableNoteFields by user.
+  // Get current state for history, unfiltered by user
+  const oldNote = db.prepare("SELECT * FROM notes WHERE id = ?").get(noteId);
+  if (!oldNote) { // Should not happen if permission check passed, but as a safeguard
+    console.error(`Error updating note ${noteId}: Note disappeared after permission check.`);
+    return { success: false, error: "Note not found after permission check." };
+  }
+
+  // user_id is set at creation and not typically part of updatableNoteFields by user.
   const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type };
   const newValuesForHistory = { ...oldValuesForHistory };
   const changedFieldsArray = [];
@@ -113,7 +135,7 @@ async function updateNote(noteId, updateData, requestingUserId) { // Added reque
   // user_id is generally not in updatableNoteFields by typical user actions, but rather set at creation or by specific ownership transfer logic.
   // If user_id can be part of updateData, it needs to be added to updatableNoteFields.
   // For now, assuming user_id is NOT changed via general updateNote.
-  const updatableNoteFields = ["title", "content", "type", "folder_id", "workspace_id", "is_pinned", "is_archived"];
+  const updatableNoteFields = ["title", "content", "type", "folder_id", "workspace_id", "is_pinned", "is_archived"]; // user_id is not updatable here
   const versionedFields = ["title", "content", "type"];
   const fieldsToUpdateInNotes = [];
   const valuesForNotesUpdate = [];
@@ -185,28 +207,36 @@ async function updateNote(noteId, updateData, requestingUserId) { // Added reque
   }
 }
 
-function deleteNote(noteId, requestingUserId) { // Added requestingUserId (required)
+async function deleteNote(noteId, requestingUserId) { // Made async
   const db = getDb();
+
+  const noteForPermissionCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
+
+  if (!noteForPermissionCheck) {
+    return { success: false, error: `Note ${noteId} not found for deletion.` };
+  }
+
+  const isOwner = noteForPermissionCheck.user_id === requestingUserId;
+  // Allow delete if user_id is null (public note) or if user is owner or has explicit admin permission
+  let hasAdminPermission = noteForPermissionCheck.user_id === null;
+  if (!isOwner && noteForPermissionCheck.user_id !== null) { // only check explicit if not owner and note is not public
+    hasAdminPermission = await permissionService.checkPermission(requestingUserId, 'note', noteId, 'admin');
+  }
+
+  if (!isOwner && !hasAdminPermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot delete note ${noteId}. Not owner and no admin permission.`);
+    return { success: false, error: "Permission denied." };
+  }
+
+  // Transaction for deletion and potential cleanup
   const transaction = db.transaction(() => {
-    // Ownership check before deleting
-    const noteForOwnershipCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
-
-    if (!noteForOwnershipCheck) {
-      // Note: If we want to distinguish "not found" from "auth failed", this check is important.
-      // For now, throwing error will lead to a generic "failed to delete" if not caught specifically.
-      // Consider returning a specific object like { success: false, error: "Note not found." } if preferred.
-      throw new Error(`Note ${noteId} not found for deletion.`);
-    }
-
-    if (noteForOwnershipCheck.user_id !== null && noteForOwnershipCheck.user_id !== requestingUserId) {
-      throw new Error(`Authorization failed: User ${requestingUserId} does not own note ${noteId}.`);
-    }
-
     const stmt = db.prepare("DELETE FROM notes WHERE id = ?");
     const info = stmt.run(noteId);
 
     if (info.changes > 0) {
       console.log(`Deleted note ${noteId} by user ${requestingUserId}. Rows affected: ${info.changes}`);
+
+      // Cleanup related links (existing logic)
       const cleanupStmt = db.prepare(`
         DELETE FROM database_row_links
         WHERE target_row_id = ?
@@ -218,37 +248,60 @@ function deleteNote(noteId, requestingUserId) { // Added requestingUserId (requi
       `);
       const cleanupInfo = cleanupStmt.run(noteId);
       console.log(`Cleaned up ${cleanupInfo.changes} 'NOTES_TABLE' relation links targeting deleted note ${noteId}.`);
-      return { success: true, changes: info.changes };
+
+      // Revoke all permissions for the deleted note
+      // This is an async function, but db.transaction expects synchronous operations.
+      // This will be handled after the transaction block.
+      // For now, mark that permissions need to be revoked.
+      // permissionService.revokeAllPermissionsForObject('note', noteId); // This will be awaited outside
+
+      return { success: true, changes: info.changes, noteIdDeleted: noteId }; // Pass noteId for permission cleanup
     }
-    // This case (info.changes === 0 after ownership check passed) implies note was deleted between check and delete, which is unlikely in a transaction.
-    // Or, note existed but delete op failed for other reasons.
-    return { success: false, error: "Note not found or delete operation failed unexpectedly." };
+    return { success: false, error: "Note not found during delete operation or delete failed." };
   });
 
   try {
-    return transaction();
+    const result = transaction(); // Run the synchronous part of the transaction
+
+    if (result.success && result.noteIdDeleted) {
+      // Perform async permission revocation after the transaction has committed
+      try {
+        await permissionService.revokeAllPermissionsForObject('note', result.noteIdDeleted);
+        console.log(`Successfully revoked all permissions for note ${result.noteIdDeleted}.`);
+      } catch (permError) {
+        console.error(`Failed to revoke permissions for note ${result.noteIdDeleted}:`, permError.message);
+        // This is a best-effort cleanup. The note is already deleted.
+        // Depending on policy, this could be logged for later reconciliation.
+      }
+    }
+    return { success: result.success, changes: result.changes, error: result.error }; // Return original result status
   } catch (err) {
     console.error(`Error deleting note ${noteId} (user ${requestingUserId}):`, err.message, err.stack);
-    // Ensure rollback is attempted if transaction function throws
-    // (though db.transaction() handles this if the error propagates out of its callback)
-    // try { db.prepare("ROLLBACK").run(); } catch (e) { /* ignore rollback error if already rolled back */ }
     return { success: false, error: err.message || "Failed to delete note." };
   }
 }
 
+// listNotesByFolder is not modified in this subtask for granular permission checks.
+// It retains its existing behavior of filtering by owner or public (user_id IS NULL).
+// A full permission integration for list operations would involve checking each note,
+// which could be complex and performance-intensive, requiring a different strategy.
 function listNotesByFolder(folderId, requestingUserId = null) {
     const db = getDb();
     let query = "SELECT id, type, title, user_id, is_pinned, updated_at FROM notes WHERE folder_id = ? AND is_archived = 0";
     const params = [folderId];
 
+    // This existing filter helps, but doesn't cover explicit shares for notes owned by others.
+    // For a complete permission-aware list, this function would need significant rework.
     if (requestingUserId !== null) {
-        query += " AND (user_id = ? OR user_id IS NULL)";
+        query += " AND (user_id = ? OR user_id IS NULL)"; // Shows own notes or public notes
         params.push(requestingUserId);
     }
     query += " ORDER BY is_pinned DESC, updated_at DESC";
 
     try {
         const stmt = db.prepare(query);
+        // Further filtering based on permissionService.checkPermission for each note could be done here if required,
+        // but that would be inefficient for large lists. This is a common challenge with list operations + ACLs.
         return stmt.all(...params);
     } catch (err) {
         console.error(`Error listing notes for folder ${folderId} (user ${requestingUserId}):`, err.message);

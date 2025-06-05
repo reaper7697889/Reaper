@@ -1,6 +1,7 @@
 // src/backend/services/databaseRowService.js
 const { getDb } = require("../db");
 const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
+const permissionService = require('./permissionService'); // Added
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');
 const smartRuleService = require('./smartRuleService');
@@ -75,23 +76,33 @@ async function _getStoredRowData(rowId, dbInstance) {
 }
 
 // Internal helper for ownership check
-async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInstance, operationNameForError) {
+async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInstance, operationNameForError, requiredPermissionLevel = 'read') { // Added requiredPermissionLevel
   const db = dbInstance || getDb();
-  // Use the imported databaseDefService.getDatabaseById
-  const parentDb = await databaseDefService.getDatabaseById(databaseId, requestingUserId);
+  const parentDb = await databaseDefService.getDatabaseById(databaseId, requestingUserId); // This checks read access implicitly
   if (!parentDb) {
-    throw new Error(`Authorization failed for ${operationNameForError}: Database ID ${databaseId} not found or not accessible by user.`);
+    throw new Error(`Authorization failed for ${operationNameForError}: Parent Database ID ${databaseId} not found or not accessible by user.`);
+  }
+
+  // If a level higher than 'read' is needed for the database itself (e.g. 'write' to add a row)
+  if (requiredPermissionLevel !== 'read') {
+    const isOwner = parentDb.user_id === requestingUserId;
+    let hasRequiredDbPermission = parentDb.user_id === null; // Public DBs allow higher ops if not further restricted by row permissions
+
+    if (!isOwner && parentDb.user_id !== null) {
+        hasRequiredDbPermission = await permissionService.checkPermission(requestingUserId, 'database', databaseId, requiredPermissionLevel);
+    }
+    if (!isOwner && !hasRequiredDbPermission) {
+        throw new Error(`Authorization failed for ${operationNameForError}: User ${requestingUserId} lacks '${requiredPermissionLevel}' permission on database ${databaseId}.`);
+    }
   }
   return parentDb;
 }
 
 async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, requestingUserId = null }) {
   const db = getDb();
-  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow");
+  // Check 'write' permission on the parent database
+  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow", 'write');
 
-  // Fetch column definitions using the potentially user-filtered getColumnsForDatabase
-  // However, for internal consistency of adding a row, we might need all columns.
-  // The _getAccessibleDatabaseOrFail already confirmed user can access the DB container.
   const columnDefsArray = await databaseDefService.getColumnsForDatabase(databaseId, null); // Get all columns for internal logic
   if (!columnDefsArray) throw new Error(`Could not retrieve column definitions for database ${databaseId}`);
   const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
@@ -144,15 +155,24 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
   try {
     transaction();
     if (newRowIdValue) {
-      // Use db instance from current scope for _getStoredRowData if it expects one.
-      _getStoredRowData(newRowIdValue, db).then(newStoredData => {
+      if (requestingUserId) {
+        try {
+          await permissionService.grantPermission(requestingUserId, requestingUserId, 'database_row', newRowIdValue, 'admin');
+          console.log(`Granted admin permission to creator ${requestingUserId} for database_row ${newRowIdValue}`);
+        } catch (permErr) {
+          console.error(`Failed to grant admin permission to creator ${requestingUserId} for database_row ${newRowIdValue}:`, permErr.message);
+          // Log and proceed
+        }
+      }
+
+      _getStoredRowData(newRowIdValue, db).then(newStoredData => { // Existing history logic
         const newRowValuesJson = JSON.stringify(newStoredData);
         recordRowHistory({ rowId: newRowIdValue, oldRowValuesJson: null, newRowValuesJson, db });
       }).catch(histErr => console.error(`Error recording history for new row ${newRowIdValue} (user ${requestingUserId}):`, histErr.message));
+
       console.log(`Added row with ID: ${newRowIdValue} to database ${databaseId} (user ${requestingUserId})`);
       return { success: true, rowId: newRowIdValue };
     }
-    // This path should ideally not be reached if rowInfo.lastInsertRowid was falsy, as an error would have been thrown.
     return { success: false, error: "Row creation failed or newRowIdValue was not obtained." };
   } catch (err) {
     console.error(`Error adding row to DB ${databaseId} (user ${requestingUserId}):`, err.message, err.stack);
@@ -166,16 +186,35 @@ async function getRow(rowId, requestingUserId = null) {
     const rowMetaData = db.prepare("SELECT id, database_id, row_order, recurrence_rule, created_at, updated_at FROM database_rows WHERE id = ?").get(rowId);
     if (!rowMetaData) return null;
 
-    // Ownership check on parent database
-    await _getAccessibleDatabaseOrFail(rowMetaData.database_id, requestingUserId, db, "getRow");
+    // Check read access to parent DB OR explicit read access to the row
+    let canAccessParentDb = false;
+    try {
+        await _getAccessibleDatabaseOrFail(rowMetaData.database_id, requestingUserId, db, "getRow", 'read');
+        canAccessParentDb = true;
+    } catch (dbAccessError) {
+        // If DB access fails, we still might have explicit row permission
+        console.warn(`User ${requestingUserId} does not have read access to parent DB ${rowMetaData.database_id} for row ${rowId}. Checking explicit row permission.`);
+    }
 
-    // Fetch columns using the potentially user-filtered getColumnsForDatabase,
-    // or use an unfiltered version if needed for internal consistency.
-    // For getRow, using user-filtered columns seems fine as it's a read operation.
+    let hasExplicitRowRead = false;
+    if (requestingUserId !== null) { // Only check explicit if user is provided
+        hasExplicitRowRead = await permissionService.checkPermission(requestingUserId, 'database_row', rowId, 'read');
+    }
+
+    // If user cannot read parent DB AND does not have explicit row read permission, deny access.
+    // Exception: If requestingUserId is null (system access), allow if parent DB is accessible (which is true if no error thrown by now)
+    if (requestingUserId !== null && !canAccessParentDb && !hasExplicitRowRead) {
+        console.warn(`Access denied for user ${requestingUserId} on row ${rowId}. No DB read access and no explicit row read permission.`);
+        return null;
+    }
+
+    // If we are here, user has some form of read access (either to DB or explicitly to the row, or system access)
+    // For fetching column definitions, use requestingUserId to respect column visibility if ever implemented,
+    // but for now, it mainly ensures the DB is accessible.
     const allColumnDefinitions = await databaseDefService.getColumnsForDatabase(rowMetaData.database_id, requestingUserId);
-    if (!allColumnDefinitions) { // Should not happen if _getAccessibleDatabaseOrFail passed
-        console.warn(`getRow: Columns for DB ${rowMetaData.database_id} not found after successful DB access check for user ${requestingUserId}.`);
-        return { ...rowMetaData, values: {} }; // Or null
+    if (!allColumnDefinitions) {
+        console.warn(`getRow: Columns for DB ${rowMetaData.database_id} not found for user ${requestingUserId}, even if row access was granted.`);
+        return { ...rowMetaData, values: {} }; // Or null, if columns are essential
     }
     if (allColumnDefinitions.length === 0) return { ...rowMetaData, values: {} };
 
@@ -331,7 +370,24 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
     const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
     if (!currentRowMeta) throw new Error("Row not found.");
 
-    await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow");
+    // Check 'write' permission on parent DB OR explicit 'write' on the row
+    let canWriteParentDb = false;
+    try {
+        await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow", 'write');
+        canWriteParentDb = true;
+    } catch (dbAccessError) {
+        console.warn(`User ${requestingUserId} does not have write access to parent DB ${currentRowMeta.database_id} for row ${rowId}. Checking explicit row permission.`);
+    }
+
+    let hasExplicitRowWrite = false;
+    if (requestingUserId !== null) {
+        hasExplicitRowWrite = await permissionService.checkPermission(requestingUserId, 'database_row', rowId, 'write');
+    }
+
+    if (requestingUserId !== null && !canWriteParentDb && !hasExplicitRowWrite) {
+        throw new Error(`Authorization failed for updateRow: User ${requestingUserId} lacks write permission on DB ${currentRowMeta.database_id} and on row ${rowId}.`);
+    }
+    // If requestingUserId is null (system), it's allowed if DB check passed (which it would have if not erroring)
 
     const oldStoredValues = await _getStoredRowData(rowId, db);
     if (oldStoredValues === null) throw new Error("Could not retrieve current stored values for history.");
@@ -420,22 +476,36 @@ async function deleteRow(rowId, requestingUserId = null) {
     if (!rowMeta) {
       return { success: false, error: "Row not found." };
     }
-    await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow");
 
-    // CASCADE should handle database_row_values and database_row_links.
-    // If not, manual deletion would be needed here, within a transaction.
+    // Check 'admin' permission on parent DB OR explicit 'admin' on the row
+    let canAdminParentDb = false;
+    try {
+        await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow", 'admin');
+        canAdminParentDb = true;
+    } catch (dbAccessError) {
+        console.warn(`User ${requestingUserId} does not have admin access to parent DB ${rowMeta.database_id} for row ${rowId}. Checking explicit row permission.`);
+    }
+
+    let hasExplicitRowAdmin = false;
+    if (requestingUserId !== null) {
+        hasExplicitRowAdmin = await permissionService.checkPermission(requestingUserId, 'database_row', rowId, 'admin');
+    }
+
+    if (requestingUserId !== null && !canAdminParentDb && !hasExplicitRowAdmin) {
+       return { success: false, error: `Authorization failed for deleteRow: User ${requestingUserId} lacks admin permission on DB ${rowMeta.database_id} and on row ${rowId}.` };
+    }
+    // If requestingUserId is null (system), allowed if DB check passed.
+
     const stmt = db.prepare("DELETE FROM database_rows WHERE id = ?");
     const info = stmt.run(rowId);
 
     if (info.changes > 0) {
       console.log(`Deleted row ${rowId} by user ${requestingUserId}.`);
-      // History recording for deletion can be added if needed.
-      // For now, recordRowHistory is mainly for updates/creations.
-      // A simple way: recordRowHistory({rowId, oldRowValuesJson: JSON.stringify(await _getStoredRowData(rowId, db) || {}), newRowValuesJson: null, db});
-      // But _getStoredRowData won't work after delete. Fetch before delete if needed.
+      await permissionService.revokeAllPermissionsForObject('database_row', rowId);
+      console.log(`Successfully revoked all permissions for database_row ${rowId}.`);
       return { success: true, changes: info.changes };
     }
-    return { success: false, error: "Row not found or delete failed." }; // Should be caught by pre-check
+    return { success: false, error: "Row not found or delete failed." };
   } catch (err) {
     console.error(`Error deleting row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to delete row." };
@@ -446,9 +516,12 @@ async function getColumnValuesForRows(databaseId, rowIds, columnId, requestingUs
   const db = getDb();
   if (!rowIds || rowIds.length === 0) return [];
 
-  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "getColumnValuesForRows");
+  // Read access to the database is checked here.
+  // Individual row read access for computed columns will be handled by getRow.
+  // For direct value fetches, DB read access is considered sufficient.
+  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "getColumnValuesForRows", 'read');
 
-  const columnDefsMap = (await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId))
+  const columnDefsMap = (await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId)) // Ensures user can see column defs
       .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
   const targetColDef = columnDefsMap[columnId];
 

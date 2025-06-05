@@ -1,5 +1,6 @@
 // src/backend/services/taskService.js
 const { getDb } = require("../db");
+const permissionService = require('./permissionService'); // Added
 
 // --- Basic Task CRUD Operations ---
 
@@ -8,7 +9,7 @@ const { getDb } = require("../db");
  * @param {object} taskData - { description, note_id, block_id, due_date, reminder_at, is_completed, userId }
  * @returns {object} - { success: boolean, task?: object, error?: string }
  */
-function createTask(taskData) {
+async function createTask(taskData) { // Made async
   const db = getDb();
   const {
     description,
@@ -34,9 +35,19 @@ function createTask(taskData) {
         due_date, reminder_at, is_completed ? 1 : 0,
         userId // Pass userId to the SQL execution
     );
-    // Fetch the newly created task. getTaskById selects user_id, so it will be included.
-    const newTask = getTaskById(info.lastInsertRowid);
-    return { success: true, task: newTask }; // Return the full task object including user_id
+    const newTaskId = info.lastInsertRowid;
+    if (userId && newTaskId) {
+        try {
+            await permissionService.grantPermission(userId, userId, 'task', newTaskId, 'admin');
+            console.log(`Granted admin permission to creator ${userId} for task ${newTaskId}`);
+        } catch (permErr) {
+            console.error(`Failed to grant admin permission to creator ${userId} for task ${newTaskId}:`, permErr.message);
+            // Decide on error handling: proceed or indicate partial failure. For now, log and proceed.
+        }
+    }
+    // Fetch the newly created task.
+    const newTask = await getTaskById(newTaskId, userId); // Use await, pass userId for context
+    return { success: true, task: newTask };
   } catch (err) {
     console.error("Error creating task:", err.message);
     return { success: false, error: "Failed to create task." };
@@ -49,26 +60,32 @@ function createTask(taskData) {
  * @param {number | null} [requestingUserId=null] - Optional ID of the user making the request.
  * @returns {object | null} - The task object (with is_completed as boolean) or null if not found or not authorized.
  */
-function getTaskById(id, requestingUserId = null) {
+async function getTaskById(id, requestingUserId = null) { // Made async
   const db = getDb();
-  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE id = ?";
-  const params = [id];
+  const task = db.prepare("SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE id = ?").get(id);
 
-  if (requestingUserId !== null) {
-    sql += " AND (user_id = ? OR user_id IS NULL)";
-    params.push(requestingUserId);
-  }
-
-  try {
-    const task = db.prepare(sql).get(...params);
-    if (task) {
-      task.is_completed = !!task.is_completed;
-    }
-    return task || null;
-  } catch (err) {
-    console.error(`Error getting task ${id} for user ${requestingUserId}:`, err.message);
+  if (!task) {
     return null;
   }
+
+  if (requestingUserId !== null) {
+    const isOwner = task.user_id === requestingUserId;
+    let hasReadPermission = task.user_id === null; // Public tasks are readable
+
+    if (!isOwner && task.user_id !== null) { // Only check explicit if not owner and task is not public
+        hasReadPermission = await permissionService.checkPermission(requestingUserId, 'task', id, 'read');
+    }
+
+    if (!isOwner && !hasReadPermission) {
+      console.warn(`Access denied for user ${requestingUserId} on task ${id}. Not owner and no read permission.`);
+      return null;
+    }
+  }
+
+  if (task) {
+    task.is_completed = !!task.is_completed;
+  }
+  return task;
 }
 
 /**
@@ -78,15 +95,24 @@ function getTaskById(id, requestingUserId = null) {
  * @param {number} requestingUserId - ID of the user making the request.
  * @returns {object} - { success: boolean, error?: string }
  */
-function updateTask(id, updates, requestingUserId) {
+async function updateTask(id, updates, requestingUserId) { // Made async
   const db = getDb();
 
-  const taskFound = getTaskById(id, null); // Unfiltered fetch for ownership check
-  if (!taskFound) {
+  const taskForPermissionCheck = db.prepare("SELECT user_id FROM tasks WHERE id = ?").get(id);
+  if (!taskForPermissionCheck) {
     return { success: false, error: "Task not found." };
   }
-  if (taskFound.user_id !== null && taskFound.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this task." };
+
+  const isOwner = taskForPermissionCheck.user_id === requestingUserId;
+  let hasWritePermission = taskForPermissionCheck.user_id === null; // Public tasks are writable
+
+  if (!isOwner && taskForPermissionCheck.user_id !== null) { // Only check explicit if not owner and task is not public
+    hasWritePermission = await permissionService.checkPermission(requestingUserId, 'task', id, 'write');
+  }
+
+  if (!isOwner && !hasWritePermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot update task ${id}. Not owner and no write permission.`);
+    return { success: false, error: "Permission denied." };
   }
 
   const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id"];
@@ -124,15 +150,24 @@ function updateTask(id, updates, requestingUserId) {
  * @param {number} requestingUserId - ID of the user making the request.
  * @returns {object} - { success: boolean, error?: string }
  */
-function deleteTask(id, requestingUserId) {
+async function deleteTask(id, requestingUserId) { // Made async
   const db = getDb();
 
-  const taskFound = getTaskById(id, null); // Unfiltered fetch for ownership check
-  if (!taskFound) {
+  const taskForPermissionCheck = db.prepare("SELECT user_id FROM tasks WHERE id = ?").get(id);
+  if (!taskForPermissionCheck) {
     return { success: false, error: "Task not found." };
   }
-  if (taskFound.user_id !== null && taskFound.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this task." };
+
+  const isOwner = taskForPermissionCheck.user_id === requestingUserId;
+  let hasAdminPermission = taskForPermissionCheck.user_id === null; // Public tasks are deletable
+
+  if (!isOwner && taskForPermissionCheck.user_id !== null) { // Only check explicit if not owner and task is not public
+    hasAdminPermission = await permissionService.checkPermission(requestingUserId, 'task', id, 'admin');
+  }
+
+  if (!isOwner && !hasAdminPermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot delete task ${id}. Not owner and no admin permission.`);
+    return { success: false, error: "Permission denied." };
   }
 
   const stmt = db.prepare("DELETE FROM tasks WHERE id = ?");
@@ -141,9 +176,11 @@ function deleteTask(id, requestingUserId) {
     if (info.changes > 0) {
       // Also remove associated dependencies
       db.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(id, id);
+      await permissionService.revokeAllPermissionsForObject('task', id);
+      console.log(`Successfully revoked all permissions for task ${id}.`);
       return { success: true };
     }
-    return { success: false, error: "Task found but delete operation failed."}; // Should not happen if taskFound
+    return { success: false, error: "Task found but delete operation failed." };
   } catch (err) {
     console.error(`Error deleting task ${id} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to delete task." };
@@ -196,15 +233,22 @@ async function addTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
   }
   const db = getDb();
 
-  const task1 = getTaskById(taskId, null); // Unfiltered fetch for ownership check
-  if (!task1) {
-    return { success: false, error: `Task with ID ${taskId} not found.` };
+  // Check permission to modify the primary task
+  const taskForPermissionCheck = await getTaskById(taskId, requestingUserId);
+  if (!taskForPermissionCheck) { // This also handles the permission check for task1
+    return { success: false, error: `Task with ID ${taskId} not found or permission denied.` };
   }
-  if (task1.user_id !== null && task1.user_id !== requestingUserId) {
-    return { success: false, error: `Authorization failed: You do not own task ${taskId}.` };
+  // Further check if user has write/admin permission on task1 (getTaskById only checks read by default for non-owners)
+  const isOwnerTask1 = taskForPermissionCheck.user_id === requestingUserId;
+  let hasWritePermissionTask1 = taskForPermissionCheck.user_id === null;
+  if(!isOwnerTask1 && taskForPermissionCheck.user_id !== null) {
+    hasWritePermissionTask1 = await permissionService.checkPermission(requestingUserId, 'task', taskId, 'write');
+  }
+  if (!isOwnerTask1 && !hasWritePermissionTask1) {
+    return { success: false, error: `Authorization failed: You do not have write permission for task ${taskId}.` };
   }
 
-  const task2Exists = getTaskById(dependsOnTaskId, null); // Check if dependent task exists (no ownership check needed for it)
+  const task2Exists = await getTaskById(dependsOnTaskId, null); // Check if dependent task exists (no user context needed for existence check)
   if (!task2Exists) {
     return { success: false, error: `Task with ID ${dependsOnTaskId} (to depend on) not found.` };
   }
@@ -227,14 +271,21 @@ async function addTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
 async function removeTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
   const db = getDb();
 
-  const task1 = getTaskById(taskId, null); // Unfiltered fetch for ownership check
-  if (!task1) {
-    return { success: false, error: `Task with ID ${taskId} not found.` };
+  // Check permission to modify the primary task
+  const taskForPermissionCheck = await getTaskById(taskId, requestingUserId);
+  if (!taskForPermissionCheck) { // This also handles the permission check for task1
+    return { success: false, error: `Task with ID ${taskId} not found or permission denied.` };
   }
-  if (task1.user_id !== null && task1.user_id !== requestingUserId) {
-    return { success: false, error: `Authorization failed: You do not own task ${taskId}.` };
+  // Further check if user has write/admin permission on task1
+  const isOwnerTask1 = taskForPermissionCheck.user_id === requestingUserId;
+  let hasWritePermissionTask1 = taskForPermissionCheck.user_id === null;
+  if(!isOwnerTask1 && taskForPermissionCheck.user_id !== null) {
+    hasWritePermissionTask1 = await permissionService.checkPermission(requestingUserId, 'task', taskId, 'write');
   }
-  // No need to check ownership of dependsOnTaskId for removal
+  if (!isOwnerTask1 && !hasWritePermissionTask1) {
+    return { success: false, error: `Authorization failed: You do not have write permission for task ${taskId}.` };
+  }
+  // No need to check ownership or permission of dependsOnTaskId for removal itself
 
   try {
     const stmt = db.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?");
@@ -246,26 +297,37 @@ async function removeTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
   }
 }
 
-async function getTaskPrerequisites(taskId, requestingUserId = null) {
+async function getTaskPrerequisites(taskId, requestingUserId = null) { // Made async
   const db = getDb();
   // First, check if the main task itself is accessible to the requesting user
-  const mainTask = getTaskById(taskId, requestingUserId);
+  const mainTask = await getTaskById(taskId, requestingUserId); // Use await
   if (!mainTask) {
-      // This means either the task doesn't exist or the user cannot access it.
-      // Depending on desired behavior, could be an empty array or an error.
-      // For consistency with "return null or empty array if auth fails", return empty array.
       console.warn(`getTaskPrerequisites: Main task ${taskId} not found or not accessible by user ${requestingUserId}.`);
       return [];
   }
 
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.depends_on_task_id WHERE td.task_id = ? ORDER BY t.created_at ASC`;
   try {
-    let rows = db.prepare(sql).all(taskId);
-    if (requestingUserId !== null) {
-      // Filter prerequisites based on the requesting user's ownership or if they are public (user_id IS NULL)
-      rows = rows.filter(r => r.user_id === requestingUserId || r.user_id === null);
+    const prerequisiteTasksRaw = db.prepare(sql).all(taskId);
+    const accessiblePrerequisites = [];
+    for (const task of prerequisiteTasksRaw) {
+        const isOwner = requestingUserId !== null && task.user_id === requestingUserId;
+        let hasReadPermission = requestingUserId !== null && task.user_id === null; // Public tasks
+
+        if (requestingUserId !== null && !isOwner && task.user_id !== null) {
+            hasReadPermission = await permissionService.checkPermission(requestingUserId, 'task', task.id, 'read');
+        } else if (requestingUserId === null && task.user_id !== null) { // Unauthenticated user trying to access private task
+             hasReadPermission = false;
+        } else if (isOwner) { // Owner always has permission
+            hasReadPermission = true;
+        }
+
+
+        if (hasReadPermission) {
+            accessiblePrerequisites.push({ ...task, is_completed: !!task.is_completed });
+        }
     }
-    return rows.map(task => ({ ...task, is_completed: !!task.is_completed }));
+    return accessiblePrerequisites;
   } catch (err) {
     console.error(`Error getting prerequisites for task ${taskId} (user ${requestingUserId}):`, err.message);
     return [];
@@ -275,7 +337,7 @@ async function getTaskPrerequisites(taskId, requestingUserId = null) {
 async function getTasksBlockedBy(taskId, requestingUserId = null) {
   const db = getDb();
   // Check if the main task is accessible
-  const mainTask = getTaskById(taskId, requestingUserId);
+  const mainTask = await getTaskById(taskId, requestingUserId); // Use await
   if (!mainTask) {
       console.warn(`getTasksBlockedBy: Main task ${taskId} not found or not accessible by user ${requestingUserId}.`);
       return [];
@@ -283,11 +345,26 @@ async function getTasksBlockedBy(taskId, requestingUserId = null) {
 
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.task_id WHERE td.depends_on_task_id = ? ORDER BY t.created_at ASC`;
   try {
-    let rows = db.prepare(sql).all(taskId);
-    if (requestingUserId !== null) {
-      rows = rows.filter(r => r.user_id === requestingUserId || r.user_id === null);
+    const blockedTasksRaw = db.prepare(sql).all(taskId);
+    const accessibleBlockedTasks = [];
+    for (const task of blockedTasksRaw) {
+        const isOwner = requestingUserId !== null && task.user_id === requestingUserId;
+        let hasReadPermission = requestingUserId !== null && task.user_id === null; // Public tasks
+
+        if (requestingUserId !== null && !isOwner && task.user_id !== null) {
+            hasReadPermission = await permissionService.checkPermission(requestingUserId, 'task', task.id, 'read');
+        } else if (requestingUserId === null && task.user_id !== null) { // Unauthenticated user trying to access private task
+            hasReadPermission = false;
+        } else if (isOwner) { // Owner always has permission
+            hasReadPermission = true;
+        }
+
+
+        if (hasReadPermission) {
+            accessibleBlockedTasks.push({ ...task, is_completed: !!task.is_completed });
+        }
     }
-    return rows.map(task => ({ ...task, is_completed: !!task.is_completed }));
+    return accessibleBlockedTasks;
   } catch (err) {
     console.error(`Error getting tasks blocked by task ${taskId} (user ${requestingUserId}):`, err.message);
     return [];

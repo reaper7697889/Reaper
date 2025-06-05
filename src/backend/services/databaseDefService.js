@@ -1,5 +1,6 @@
 // src/backend/services/databaseDefService.js
 const { getDb } = require("../db");
+const permissionService = require('./permissionService'); // Added
 
 const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'DATETIME', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'];
 const ALLOWED_ROLLUP_FUNCTIONS = [
@@ -81,62 +82,92 @@ function _validateLookupDefinition(lookupArgs, db, currentDatabaseId) { /* ... (
 }
 
 // --- Database Management ---
-function createDatabase(args) {
+async function createDatabase(args) { // Made async
   const db = getDb();
-  const { name, noteId = null, is_calendar = 0, userId = null } = args; // Extract userId from args
+  const { name, noteId = null, is_calendar = 0, userId = null } = args;
 
   if (!name || typeof name !== 'string' || name.trim() === "") return { success: false, error: "Database name is required." };
   try {
-    const stmt = db.prepare("INSERT INTO note_databases (name, note_id, is_calendar, user_id) VALUES (?, ?, ?, ?)"); // Add user_id to SQL
-    const info = stmt.run(name.trim(), noteId, is_calendar ? 1 : 0, userId); // Pass userId
-    const newDb = getDatabaseById(info.lastInsertRowid); // This should fetch the object including user_id
+    const stmt = db.prepare("INSERT INTO note_databases (name, note_id, is_calendar, user_id) VALUES (?, ?, ?, ?)");
+    const info = stmt.run(name.trim(), noteId, is_calendar ? 1 : 0, userId);
+    const newDbId = info.lastInsertRowid;
+
+    if (userId && newDbId) {
+        try {
+            await permissionService.grantPermission(userId, userId, 'database', newDbId, 'admin');
+            console.log(`Granted admin permission to creator ${userId} for database ${newDbId}`);
+        } catch (permErr) {
+            console.error(`Failed to grant admin permission to creator ${userId} for database ${newDbId}:`, permErr.message);
+            // Log and proceed, or handle more strictly if required
+        }
+    }
+    const newDb = await getDatabaseById(newDbId, userId); // Use await, pass userId for context
     if (newDb) return { success: true, database: newDb };
-    return { success: false, error: "Failed to retrieve newly created database."};
+    return { success: false, error: "Failed to retrieve newly created database." };
   } catch (err) { console.error("Error creating database:", err.message); return { success: false, error: "Failed to create database." }; }
 }
 
-function getDatabaseById(databaseId, requestingUserId = null) {
+async function getDatabaseById(databaseId, requestingUserId = null) { // Made async
   const db = getDb();
-  let query = "SELECT * FROM note_databases WHERE id = ?";
-  const params = [databaseId];
+  const row = db.prepare("SELECT * FROM note_databases WHERE id = ?").get(databaseId);
+
+  if (!row) {
+    return null;
+  }
 
   if (requestingUserId !== null) {
-    query += " AND (user_id = ? OR user_id IS NULL)";
-    params.push(requestingUserId);
+    const isOwner = row.user_id === requestingUserId;
+    let hasReadPermission = row.user_id === null; // Public DBs are readable
+
+    if (!isOwner && row.user_id !== null) { // Only check explicit if not owner and DB is not public
+        hasReadPermission = await permissionService.checkPermission(requestingUserId, 'database', databaseId, 'read');
+    }
+
+    if (!isOwner && !hasReadPermission) {
+      console.warn(`Access denied for user ${requestingUserId} on database ${databaseId}. Not owner and no read permission.`);
+      return null;
+    }
   }
 
-  try {
-    const row = db.prepare(query).get(...params);
-    if (row) row.is_calendar = !!row.is_calendar; // Parse to boolean
-    return row || null;
-  }
-  catch (err) { console.error(`Error getting database by ID ${databaseId} for user ${requestingUserId}:`, err.message); return null; }
+  if (row) row.is_calendar = !!row.is_calendar;
+  return row;
 }
 
-function getDatabasesForNote(noteId, requestingUserId = null) {
+async function getDatabasesForNote(noteId, requestingUserId = null) { // Made async
   const db = getDb();
   try {
-    const allDBsForNote = db.prepare("SELECT * FROM note_databases WHERE note_id = ? ORDER BY created_at DESC").all(noteId);
-
-    if (requestingUserId !== null) {
-        return allDBsForNote
-            .map(row => ({...row, is_calendar: !!row.is_calendar}))
-            .filter(dbItem => dbItem.user_id === null || dbItem.user_id === requestingUserId);
+    const allDBsForNoteRaw = db.prepare("SELECT * FROM note_databases WHERE note_id = ? ORDER BY created_at DESC").all(noteId);
+    const accessibleDBs = [];
+    for (const dbItem of allDBsForNoteRaw) {
+        // Re-use getDatabaseById for consistent permission checking for each DB
+        const accessibleDb = await getDatabaseById(dbItem.id, requestingUserId);
+        if (accessibleDb) {
+            accessibleDBs.push(accessibleDb);
+        }
     }
-    return allDBsForNote.map(row => ({...row, is_calendar: !!row.is_calendar}));
+    return accessibleDBs;
   }
   catch (err) { console.error(`Error getting databases for note ${noteId} (user ${requestingUserId}):`, err.message); return []; }
 }
 
-function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
+async function updateDatabaseMetadata(databaseId, updates, requestingUserId) { // Made async
   const db = getDb();
 
-  const dbToUpdate = getDatabaseById(databaseId, null); // Unfiltered fetch for ownership check
-  if (!dbToUpdate) {
+  const dbForPermissionCheck = db.prepare("SELECT user_id FROM note_databases WHERE id = ?").get(databaseId);
+  if (!dbForPermissionCheck) {
     return { success: false, error: "Database not found." };
   }
-  if (dbToUpdate.user_id !== null && dbToUpdate.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this database." };
+
+  const isOwner = dbForPermissionCheck.user_id === requestingUserId;
+  let hasWritePermission = dbForPermissionCheck.user_id === null; // Public DBs are writable
+
+  if (!isOwner && dbForPermissionCheck.user_id !== null) {
+    hasWritePermission = await permissionService.checkPermission(requestingUserId, 'database', databaseId, 'write');
+  }
+
+  if (!isOwner && !hasWritePermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot update database ${databaseId}. Not owner and no write permission.`);
+    return { success: false, error: "Permission denied." };
   }
 
   const { name, is_calendar } = updates;
@@ -151,7 +182,10 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
     fieldsToSet.set("is_calendar", is_calendar ? 1 : 0);
   }
 
-  if (fieldsToSet.size === 0) return { success: true, message: "No effective changes.", database: getDatabaseById(databaseId, requestingUserId) };
+  if (fieldsToSet.size === 0) {
+    const currentDb = await getDatabaseById(databaseId, requestingUserId); // Use await
+    return { success: true, message: "No effective changes.", database: currentDb };
+  }
 
   const sqlSetParts = Array.from(fieldsToSet.keys()).map(key => `${key} = ?`);
   const sqlValues = Array.from(fieldsToSet.values());
@@ -163,7 +197,8 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
     const stmt = db.prepare(`UPDATE note_databases SET ${sqlSetParts.join(", ")} WHERE id = ?`);
     const info = stmt.run(...sqlValues);
     if (info.changes > 0) {
-      return { success: true, database: getDatabaseById(databaseId, requestingUserId) };
+      const updatedDb = await getDatabaseById(databaseId, requestingUserId); // Use await
+      return { success: true, database: updatedDb };
     }
     // This implies the WHERE clause (id = ?) didn't match, or data was identical.
     // Since we fetched dbToUpdate, it should exist. So, data might be identical.
@@ -176,22 +211,65 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
   }
 }
 
-function deleteDatabase(databaseId, requestingUserId) {
+async function deleteDatabase(databaseId, requestingUserId) { // Made async
   const db = getDb();
 
-  const dbToDelete = getDatabaseById(databaseId, null); // Unfiltered fetch
-  if (!dbToDelete) {
+  const dbForPermissionCheck = db.prepare("SELECT user_id FROM note_databases WHERE id = ?").get(databaseId);
+  if (!dbForPermissionCheck) {
     return { success: false, error: "Database not found." };
   }
-  if (dbToDelete.user_id !== null && dbToDelete.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this database." };
+
+  const isOwner = dbForPermissionCheck.user_id === requestingUserId;
+  let hasAdminPermission = dbForPermissionCheck.user_id === null; // Public DBs are deletable
+
+  if (!isOwner && dbForPermissionCheck.user_id !== null) {
+    hasAdminPermission = await permissionService.checkPermission(requestingUserId, 'database', databaseId, 'admin');
   }
 
-  try {
-    // CASCADE constraints should handle related columns, rows, values, links
+  if (!isOwner && !hasAdminPermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot delete database ${databaseId}. Not owner and no admin permission.`);
+    return { success: false, error: "Permission denied." };
+  }
+
+  // Store row IDs before deleting the database (as CASCADE will remove them)
+  const rowsToDelete = db.prepare("SELECT id FROM database_rows WHERE database_id = ?").all(databaseId);
+
+  const transaction = db.transaction(() => {
+    // CASCADE constraints should handle related columns, rows, values, links from note_databases
     const stmt = db.prepare("DELETE FROM note_databases WHERE id = ?");
     const info = stmt.run(databaseId);
-    return info.changes > 0 ? { success: true } : { success: false, error: "Database not found at delete stage." }; // Should be caught by pre-check
+    if (info.changes > 0) {
+      return { success: true, changes: info.changes };
+    }
+    return { success: false, error: "Database not found at delete stage." };
+  });
+
+  try {
+    const result = transaction(); // Run synchronous part of transaction
+
+    if (result.success) {
+      // If DB deletion was successful, proceed with revoking permissions
+      // First, revoke permissions for all rows that belonged to this database
+      for (const row of rowsToDelete) {
+        try {
+          await permissionService.revokeAllPermissionsForObject('database_row', row.id);
+          console.log(`Revoked permissions for database_row ${row.id} from deleted database ${databaseId}`);
+        } catch (permErr) {
+          console.error(`Error revoking permissions for database_row ${row.id}: ${permErr.message}`);
+          // Log and continue, or collect errors
+        }
+      }
+      // Then, revoke permissions for the database object itself
+      try {
+        await permissionService.revokeAllPermissionsForObject('database', databaseId);
+        console.log(`Revoked permissions for database ${databaseId}`);
+      } catch (permErr) {
+        console.error(`Error revoking permissions for database ${databaseId}: ${permErr.message}`);
+      }
+      return { success: true }; // Overall success
+    } else {
+      return result; // Return the error from the transaction
+    }
   } catch (err) {
     console.error(`Error deleting database ID ${databaseId} (user ${requestingUserId}):`, err.message);
     return { success: false, error: "Failed to delete database due to server error." };
@@ -199,7 +277,7 @@ function deleteDatabase(databaseId, requestingUserId) {
 }
 
 // --- Column Management ---
-function addColumn(args, requestingUserId) { // Added requestingUserId
+async function addColumn(args, requestingUserId) { // Made async
   const {
     databaseId, name, type, columnOrder,
     defaultValue: origDefaultValue, selectOptions: origSelectOptions,
@@ -212,11 +290,19 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
 
   const db = getDb();
 
-  const parentDb = getDatabaseById(databaseId, requestingUserId);
+  // Check 'write' access to the parent database definition
+  const parentDb = await getDatabaseById(databaseId, requestingUserId); // Use await
   if (!parentDb) {
-    return { success: false, error: "Parent database not found or not accessible." };
+    return { success: false, error: "Parent database not found or not accessible for read." };
   }
-  // Ownership implicit if parentDb was fetched successfully with requestingUserId
+  const isOwner = parentDb.user_id === requestingUserId;
+  let hasWritePermission = parentDb.user_id === null;
+  if (!isOwner && parentDb.user_id !== null) {
+    hasWritePermission = await permissionService.checkPermission(requestingUserId, 'database', databaseId, 'write');
+  }
+  if (!isOwner && !hasWritePermission) {
+    return { success: false, error: "Permission denied: You do not have write access to this database definition." };
+  }
 
   const trimmedName = name ? name.trim() : "";
 
@@ -240,7 +326,7 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
     if (finalValues.relationTargetEntityType === 'NOTE_DATABASES') {
         if (finalValues.linkedDatabaseId === null || finalValues.linkedDatabaseId === undefined) return { success: false, error: "linkedDatabaseId required for RELATION to NOTE_DATABASES." };
         // Check accessibility of linkedDatabaseId by the same user (or if it's public)
-        if (!getDatabaseById(finalValues.linkedDatabaseId, requestingUserId)) return { success: false, error: `Linked database ID ${finalValues.linkedDatabaseId} not found or not accessible.` };
+        if (!await getDatabaseById(finalValues.linkedDatabaseId, requestingUserId)) return { success: false, error: `Linked database ID ${finalValues.linkedDatabaseId} not found or not accessible.` }; // Use await
     } else { // NOTES_TABLE
         if (finalValues.linkedDatabaseId !== null && finalValues.linkedDatabaseId !== undefined && String(finalValues.linkedDatabaseId).trim() !== "") return { success: false, error: "linkedDatabaseId must be null for RELATION to NOTES_TABLE."};
         finalValues.linkedDatabaseId = null;
@@ -300,14 +386,14 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
   }
 }
 
-function getColumnsForDatabase(databaseId, requestingUserId = null) {
+async function getColumnsForDatabase(databaseId, requestingUserId = null) { // Made async
   const db = getDb();
-  const parentDb = getDatabaseById(databaseId, requestingUserId);
+  const parentDb = await getDatabaseById(databaseId, requestingUserId); // Use await
   if (!parentDb) {
-    // If parent DB is not found or not accessible, user shouldn't see its columns.
+    // If parent DB is not found or not accessible (checked by getDatabaseById), user shouldn't see its columns.
     return [];
   }
-  // Ownership of parent DB implies permission to see its columns.
+  // Read permission on parent DB (checked by getDatabaseById) implies permission to see its columns' definitions.
   try {
     const stmt = db.prepare("SELECT *, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, relation_target_entity_type FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
     // No need to map is_calendar here, it's a property of the database, not columns.
@@ -318,7 +404,7 @@ function getColumnsForDatabase(databaseId, requestingUserId = null) {
   }
 }
 
-function updateColumn(args, requestingUserId) { // Added requestingUserId
+async function updateColumn(args, requestingUserId) { // Made async
   const { columnId, makeBidirectional, targetInverseColumnName, existingTargetInverseColumnId, ...updateData } = args;
   const db = getDb();
 
@@ -330,10 +416,18 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
     if (!currentCol) throw new Error("Column not found.");
 
-    // Ownership check on parent database
-    const parentDb = getDatabaseById(currentCol.database_id, requestingUserId);
+    // Check 'write' access to the parent database definition
+    const parentDb = await getDatabaseById(currentCol.database_id, requestingUserId); // Use await
     if (!parentDb) {
-      throw new Error("Parent database not found or not accessible.");
+      throw new Error("Parent database not found or not accessible for read.");
+    }
+    const isOwner = parentDb.user_id === requestingUserId;
+    let hasWritePermission = parentDb.user_id === null;
+    if (!isOwner && parentDb.user_id !== null) {
+        hasWritePermission = await permissionService.checkPermission(requestingUserId, 'database', currentCol.database_id, 'write');
+    }
+    if (!isOwner && !hasWritePermission) {
+        throw new Error("Permission denied: You do not have write access to this database definition.");
     }
 
     const fieldsToSet = new Map();
@@ -372,9 +466,9 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
         if (finalState.relation_target_entity_type === 'NOTE_DATABASES') {
             if (finalState.linked_database_id === null || finalState.linked_database_id === undefined) throw new Error("linkedDatabaseId required for RELATION to NOTE_DATABASES.");
             // Check accessibility of the NEW linked_database_id by the same user
-            if (updateData.linked_database_id !== undefined && !getDatabaseById(finalState.linked_database_id, requestingUserId)) {
+            if (updateData.linked_database_id !== undefined && !await getDatabaseById(finalState.linked_database_id, requestingUserId)) { // Use await
                  throw new Error(`New linked database ID ${finalState.linked_database_id} not found or not accessible.`);
-            } else if (updateData.linked_database_id === undefined && !getDatabaseById(finalState.linked_database_id, null)) { // if not updated, ensure it still exists (unfiltered)
+            } else if (updateData.linked_database_id === undefined && !await getDatabaseById(finalState.linked_database_id, null)) { // if not updated, ensure it still exists (unfiltered), Use await
                  throw new Error(`Current linked database ID ${finalState.linked_database_id} seems to be missing (unfiltered check).`);
             }
             fieldsToSet.set("linked_database_id", finalState.linked_database_id);
@@ -421,7 +515,7 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     }
 }
 
-function deleteColumn(columnId, requestingUserId) { // Added requestingUserId
+async function deleteColumn(columnId, requestingUserId) { // Made async
   const db = getDb();
   try {
     const columnToDelete = db.prepare("SELECT database_id FROM database_columns WHERE id = ?").get(columnId);
@@ -429,11 +523,19 @@ function deleteColumn(columnId, requestingUserId) { // Added requestingUserId
       return { success: false, error: "Column not found." };
     }
 
-    const parentDb = getDatabaseById(columnToDelete.database_id, requestingUserId);
+    // Check 'write' access to the parent database definition (as deleting a column is a modification)
+    const parentDb = await getDatabaseById(columnToDelete.database_id, requestingUserId); // Use await
     if (!parentDb) {
-      return { success: false, error: "Parent database not found or not accessible." };
+      return { success: false, error: "Parent database not found or not accessible for read." };
     }
-    // Ownership implies permission to delete column
+    const isOwner = parentDb.user_id === requestingUserId;
+    let hasWritePermission = parentDb.user_id === null;
+    if (!isOwner && parentDb.user_id !== null) {
+        hasWritePermission = await permissionService.checkPermission(requestingUserId, 'database', columnToDelete.database_id, 'write');
+    }
+    if (!isOwner && !hasWritePermission) {
+        return { success: false, error: "Permission denied: You do not have write access to this database definition." };
+    }
 
     const stmt = db.prepare("DELETE FROM database_columns WHERE id = ?");
     const info = stmt.run(columnId);
