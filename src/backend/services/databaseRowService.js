@@ -1,16 +1,13 @@
 // src/backend/services/databaseRowService.js
 const { getDb } = require("../db");
-const { getColumnsForDatabase } // Import from databaseDefService
+const { getColumnsForDatabase }
     = require("./databaseDefService");
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');
 
-// Helper function to prepare value for storage based on column type (for non-RELATION/non-FORMULA/non-ROLLUP types)
 function _prepareValueForStorage(columnType, rawValue) {
   const output = { value_text: null, value_number: null, value_boolean: null };
-  if (rawValue === null || rawValue === undefined) {
-    return output;
-  }
+  if (rawValue === null || rawValue === undefined) return output;
   switch (columnType) {
     case 'TEXT': case 'DATE': case 'SELECT':
       output.value_text = String(rawValue); break;
@@ -29,7 +26,7 @@ function _prepareValueForStorage(columnType, rawValue) {
         } catch(e) { throw new Error("MULTI_SELECT value must be an array or a valid JSON string array."); }
       } else { output.value_text = JSON.stringify(rawValue); }
       break;
-    case 'RELATION': case 'FORMULA': case 'ROLLUP':
+    case 'RELATION': case 'FORMULA': case 'ROLLUP': case 'LOOKUP':
         console.warn(`_prepareValueForStorage called for ${columnType} type. This should be handled separately.`);
         return output;
     default: throw new Error(`Unsupported column type for storage preparation: ${columnType}`);
@@ -45,7 +42,7 @@ function _deserializeValue(columnType, value_text, value_number, value_boolean) 
         case 'MULTI_SELECT':
             try { return value_text ? JSON.parse(value_text) : []; }
             catch (e) { console.error("Error parsing MULTI_SELECT JSON:", e.message, value_text); return []; }
-        case 'RELATION': case 'FORMULA': case 'ROLLUP':
+        case 'RELATION': case 'FORMULA': case 'ROLLUP': case 'LOOKUP':
             console.warn(`_deserializeValue called for ${columnType}. This type should be handled by getRow directly.`);
             return null;
         default: return null;
@@ -71,14 +68,16 @@ function addRow({ databaseId, values, rowOrder = null }) {
       const colDef = columnDefsMap[columnId];
       if (!colDef) throw new Error(`Column with ID ${columnId} not found in database ${databaseId}.`);
 
-      if (colDef.type === 'FORMULA' || colDef.type === 'ROLLUP') continue;
-      else if (colDef.type === 'RELATION') {
-        if (!Array.isArray(rawValue)) throw new Error(`Value for RELATION column ${colDef.name} must be an array of target row IDs.`);
+      if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
+        console.warn(`Attempted to write value for computed column ${colDef.name} (type: ${colDef.type}). Skipping.`);
+        continue;
+      } else if (colDef.type === 'RELATION') {
+        if (!Array.isArray(rawValue)) throw new Error(`Value for RELATION column ${colDef.name} must be an array.`);
         for (const targetRowId of rawValue) {
           if (typeof targetRowId !== 'number') throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}.`);
           const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
           if (!targetRow) throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
-          if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked database ID ${colDef.linked_database_id}.`);
+          if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked DB ${colDef.linked_database_id}.`);
           linkInsertStmt.run(newRowId, columnId, targetRowId, 0);
           if (colDef.inverse_column_id !== null) linkInsertStmt.run(targetRowId, colDef.inverse_column_id, newRowId, 0);
         }
@@ -101,11 +100,6 @@ function addRow({ databaseId, values, rowOrder = null }) {
   }
 }
 
-/**
- * Retrieves a single row with values, including computed FORMULA and ROLLUP values.
- * @param {number} rowId
- * @returns {Promise<object|null>} - The row object with typed values or null if not found/error.
- */
 async function getRow(rowId) {
   const db = getDb();
   try {
@@ -113,102 +107,115 @@ async function getRow(rowId) {
     if (!rowData) return null;
 
     const allColumnDefinitions = getColumnsForDatabase(rowData.database_id);
-    if (!allColumnDefinitions || allColumnDefinitions.length === 0) {
-        return { ...rowData, values: {} };
-    }
+    if (!allColumnDefinitions || allColumnDefinitions.length === 0) return { ...rowData, values: {} };
 
     const rowDataValues = {};
-
     const cellValuesStmt = db.prepare("SELECT value_text, value_number, value_boolean FROM database_row_values WHERE row_id = ? AND column_id = ?");
     const linkedRowsStmt = db.prepare("SELECT target_row_id FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? ORDER BY link_order ASC");
 
-    // Pass 1: Resolve Stored and Relation Values
+    // Pass 1: Stored and Relation Values
     for (const colDef of allColumnDefinitions) {
       if (colDef.type === 'RELATION') {
-        const linkedRows = linkedRowsStmt.all(rowId, colDef.id);
-        rowDataValues[colDef.id] = linkedRows.map(lr => lr.target_row_id);
-      } else if (colDef.type !== 'FORMULA' && colDef.type !== 'ROLLUP') {
+        rowDataValues[colDef.id] = linkedRowsStmt.all(rowId, colDef.id).map(lr => lr.target_row_id);
+      } else if (!['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
         const cell = cellValuesStmt.get(rowId, colDef.id);
         rowDataValues[colDef.id] = cell ? _deserializeValue(colDef.type, cell.value_text, cell.value_number, cell.value_boolean) : null;
       } else {
-        rowDataValues[colDef.id] = null; // Initialize FORMULA/ROLLUP placeholders
+        rowDataValues[colDef.id] = null; // Initialize computed types
       }
     }
 
-    // Pass 2: Calculate FORMULA values
+    // Pass 2: Formula Calculations
     for (const colDef of allColumnDefinitions) {
       if (colDef.type === 'FORMULA') {
         if (colDef.formula_definition && colDef.formula_definition.trim() !== "") {
           const evalResult = evaluateFormula(colDef.formula_definition, rowDataValues, allColumnDefinitions);
-          if (evalResult.error) {
-            console.error(`Error evaluating formula for row ${rowId}, column ${colDef.id} (${colDef.name}): ${evalResult.error}`);
-            rowDataValues[colDef.id] = "#ERROR!";
-          } else {
-            rowDataValues[colDef.id] = evalResult.result;
-          }
-        } else {
-          rowDataValues[colDef.id] = null;
-        }
+          rowDataValues[colDef.id] = evalResult.error ? "#ERROR!" : evalResult.result;
+          if(evalResult.error) console.error(`Formula Error (row ${rowId}, col ${colDef.id}): ${evalResult.error}`);
+        } else { rowDataValues[colDef.id] = null; }
       }
     }
 
-    // Pass 3: Calculate ROLLUP values
+    // Pass 3: Rollup Calculations
     for (const colDef of allColumnDefinitions) {
         if (colDef.type === 'ROLLUP') {
-            if (!colDef.rollup_source_relation_column_id || !colDef.rollup_target_column_id || !colDef.rollup_function) {
-                rowDataValues[colDef.id] = "#CONFIG_ERROR!";
-                console.warn(`Rollup column ${colDef.id} (${colDef.name}) is missing definition components.`);
-                continue;
+            const { rollup_source_relation_column_id: srcRelId, rollup_target_column_id: targetColId, rollup_function: func } = colDef;
+            if (!srcRelId || !targetColId || !func) {
+                rowDataValues[colDef.id] = "#CONFIG_ERROR!"; continue;
             }
-
-            const linkedTargetRowIds = rowDataValues[colDef.rollup_source_relation_column_id];
+            const linkedTargetRowIds = rowDataValues[srcRelId];
             if (!Array.isArray(linkedTargetRowIds)) {
-                rowDataValues[colDef.id] = "#RELATION_ERROR!";
-                console.warn(`Rollup source relation column ${colDef.rollup_source_relation_column_id} for rollup ${colDef.id} did not yield an array.`);
-                continue;
+                rowDataValues[colDef.id] = "#RELATION_ERROR!"; continue;
             }
-            if (linkedTargetRowIds.length === 0) { // No linked rows, perform aggregation on empty set
-                const emptyAgg = performAggregation([], colDef.rollup_function, { type: 'UNKNOWN' }); // Pass a dummy targetColDef
-                rowDataValues[colDef.id] = emptyAgg.result; // e.g. 0 for COUNT_ALL, null for AVG
-                continue;
+            if (linkedTargetRowIds.length === 0) {
+                const emptyAgg = performAggregation([], func, { type: 'UNKNOWN' }); // Default for empty set
+                rowDataValues[colDef.id] = emptyAgg.result; continue;
             }
-
-            const sourceRelationColDef = allColumnDefinitions.find(c => c.id === colDef.rollup_source_relation_column_id);
+            const sourceRelationColDef = allColumnDefinitions.find(c => c.id === srcRelId);
             if (!sourceRelationColDef || !sourceRelationColDef.linked_database_id) {
-                 rowDataValues[colDef.id] = "#CONFIG_ERROR!";
-                 console.warn(`Source relation column for rollup ${colDef.id} is misconfigured.`);
-                 continue;
+                 rowDataValues[colDef.id] = "#CONFIG_ERROR!"; continue;
             }
             const targetDbId = sourceRelationColDef.linked_database_id;
-            const allColsInTargetDb = getColumnsForDatabase(targetDbId); // Potentially async if service was async
-            const targetColDefInLinkedDb = allColsInTargetDb.find(c => c.id === colDef.rollup_target_column_id);
-
+            const allColsInTargetDb = getColumnsForDatabase(targetDbId);
+            const targetColDefInLinkedDb = allColsInTargetDb.find(c => c.id === targetColId);
             if (!targetColDefInLinkedDb) {
-                rowDataValues[colDef.id] = "#TARGET_COL_ERROR!";
-                console.warn(`Target column ${colDef.rollup_target_column_id} for rollup ${colDef.id} not found in target DB ${targetDbId}.`);
-                continue;
+                rowDataValues[colDef.id] = "#TARGET_COL_ERROR!"; continue;
             }
-
             let actualTargetValues = [];
-            if (targetColDefInLinkedDb.type === 'FORMULA' || targetColDefInLinkedDb.type === 'ROLLUP') {
+            if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetColDefInLinkedDb.type)) { // Target is computed
                 for (const targetRowId of linkedTargetRowIds) {
-                    const targetRowFullData = await getRow(targetRowId); // Recursive call
-                    if (targetRowFullData && targetRowFullData.values) {
-                        actualTargetValues.push(targetRowFullData.values[colDef.rollup_target_column_id]);
-                    } else {
-                        actualTargetValues.push(null); // Or handle error if target row not found
-                    }
+                    const targetRowFullData = await getRow(targetRowId); // Recursive
+                    actualTargetValues.push(targetRowFullData ? targetRowFullData.values[targetColId] : null);
                 }
             } else {
-                actualTargetValues = await getColumnValuesForRows(targetDbId, linkedTargetRowIds, colDef.rollup_target_column_id);
+                actualTargetValues = await getColumnValuesForRows(targetDbId, linkedTargetRowIds, targetColId);
+            }
+            const rollupResult = performAggregation(actualTargetValues, func, targetColDefInLinkedDb);
+            rowDataValues[colDef.id] = rollupResult.error ? "#ROLLUP_ERROR!" : rollupResult.result;
+            if(rollupResult.error) console.error(`Rollup Error (row ${rowId}, col ${colDef.id}): ${rollupResult.error}`);
+        }
+    }
+
+    // Pass 4: Lookup Calculations
+    for (const colDef of allColumnDefinitions) {
+        if (colDef.type === 'LOOKUP') {
+            const { lookup_source_relation_column_id: srcRelId, lookup_target_value_column_id: targetValColId, lookup_multiple_behavior: behavior } = colDef;
+            if (!srcRelId || !targetValColId || !behavior) {
+                rowDataValues[colDef.id] = "#CONFIG_ERROR!"; continue;
+            }
+            const linkedTargetRowIds = rowDataValues[srcRelId];
+            if (!Array.isArray(linkedTargetRowIds)) {
+                rowDataValues[colDef.id] = "#RELATION_ERROR!"; continue;
+            }
+            if (linkedTargetRowIds.length === 0) {
+                rowDataValues[colDef.id] = behavior === 'LIST_UNIQUE_STRINGS' ? "" : null; continue;
+            }
+            const sourceRelationColDef = allColumnDefinitions.find(c => c.id === srcRelId);
+            if (!sourceRelationColDef || !sourceRelationColDef.linked_database_id) {
+                 rowDataValues[colDef.id] = "#CONFIG_ERROR!"; continue;
+            }
+            const targetDbId = sourceRelationColDef.linked_database_id;
+            const allColsInTargetDb = getColumnsForDatabase(targetDbId);
+            const targetValueColDefInLinkedDb = allColsInTargetDb.find(c => c.id === targetValColId);
+             if (!targetValueColDefInLinkedDb) {
+                rowDataValues[colDef.id] = "#TARGET_COL_ERROR!"; continue;
             }
 
-            const rollupResult = performAggregation(actualTargetValues, colDef.rollup_function, targetColDefInLinkedDb);
-            if (rollupResult.error) {
-                console.error(`Error calculating rollup for row ${rowId}, column ${colDef.id} (${colDef.name}): ${rollupResult.error}`);
-                rowDataValues[colDef.id] = "#ROLLUP_ERROR!";
+            const rowsToFetchForLookup = behavior === 'FIRST' ? [linkedTargetRowIds[0]] : linkedTargetRowIds;
+            let lookedUpValues = [];
+            if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetValueColDefInLinkedDb.type)) { // Target value is computed
+                 for (const targetRowId of rowsToFetchForLookup) {
+                    const targetRowFullData = await getRow(targetRowId); // Recursive
+                    lookedUpValues.push(targetRowFullData ? targetRowFullData.values[targetValColId] : null);
+                }
             } else {
-                rowDataValues[colDef.id] = rollupResult.result;
+                lookedUpValues = await getColumnValuesForRows(targetDbId, rowsToFetchForLookup, targetValColId);
+            }
+
+            if (behavior === 'FIRST') {
+                rowDataValues[colDef.id] = lookedUpValues.length > 0 ? lookedUpValues[0] : null;
+            } else { // LIST_UNIQUE_STRINGS
+                rowDataValues[colDef.id] = Array.from(new Set(lookedUpValues.filter(v => v !== null && v !== undefined).map(String))).join(', ');
             }
         }
     }
@@ -228,10 +235,8 @@ function updateRow({ rowId, values }) {
   const columnDefsMap = getColumnsForDatabase(rowMeta.database_id).reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
   const transaction = db.transaction(() => {
-    const valueReplaceStmt = db.prepare(
-      "REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean, updated_at, created_at) "+
-      "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, (SELECT created_at FROM database_row_values WHERE row_id = ? AND column_id = ? UNION ALL SELECT CURRENT_TIMESTAMP LIMIT 1))"
-    );
+    // ... (valueReplaceStmt, getLinksStmt, etc. as before) ...
+    const valueReplaceStmt = db.prepare("REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean, updated_at, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, (SELECT created_at FROM database_row_values WHERE row_id = ? AND column_id = ? UNION ALL SELECT CURRENT_TIMESTAMP LIMIT 1))");
     const getLinksStmt = db.prepare("SELECT target_row_id FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?");
     const deleteLinksStmt = db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?");
     const specificLinkDeleteStmt = db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? AND target_row_id = ?");
@@ -241,20 +246,20 @@ function updateRow({ rowId, values }) {
       const columnId = parseInt(columnIdStr, 10);
       if (isNaN(columnId)) throw new Error(`Invalid columnId: ${columnIdStr}`);
       const colDef = columnDefsMap[columnId];
-      if (!colDef) throw new Error(`Column with ID ${columnId} not found for this row's database.`);
+      if (!colDef) throw new Error(`Column with ID ${columnId} not found.`);
 
-      if (colDef.type === 'FORMULA' || colDef.type === 'ROLLUP') {
-        console.warn(`Attempted to update ${colDef.type} column ${colDef.name}. This has no effect.`);
+      if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
+        console.warn(`Attempted to update computed column ${colDef.name} (type: ${colDef.type}). Skipping.`);
         continue;
-      } else if (colDef.type === 'RELATION') {
-        if (!Array.isArray(rawValue)) throw new Error(`Value for RELATION column ${colDef.name} must be an array of target row IDs.`);
+      } else if (colDef.type === 'RELATION') { /* ... existing relation update logic ... */
+        if (!Array.isArray(rawValue)) throw new Error(`Value for RELATION column ${colDef.name} must be an array.`);
         const currentLinkedIds = new Set(getLinksStmt.all(rowId, columnId).map(r => r.target_row_id));
         const newLinkedIds = new Set(rawValue.map(id => parseInt(id, 10)));
         for (const targetRowId of newLinkedIds) {
-            if (isNaN(targetRowId)) throw new Error(`Invalid targetRowId in input for RELATION column ${colDef.name}.`);
+            if (isNaN(targetRowId)) throw new Error(`Invalid targetRowId for RELATION column ${colDef.name}.`);
             const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
             if (!targetRow) throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
-            if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked database ID ${colDef.linked_database_id}.`);
+            if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked DB.`);
         }
         deleteLinksStmt.run(rowId, columnId);
         for (const targetRowId of newLinkedIds) linkInsertStmt.run(rowId, columnId, targetRowId, 0);
@@ -275,12 +280,8 @@ function updateRow({ rowId, values }) {
     return { success: true };
   });
 
-  try {
-    return transaction();
-  } catch (err) {
-    console.error(`Error updating row ${rowId}:`, err.message, err.stack);
-    return { success: false, error: err.message || "Failed to update row." };
-  }
+  try { return transaction(); }
+  catch (err) { console.error(`Error updating row ${rowId}:`, err.message, err.stack); return { success: false, error: err.message || "Failed to update row." }; }
 }
 
 function deleteRow(rowId) {
@@ -295,13 +296,6 @@ function deleteRow(rowId) {
   }
 }
 
-/**
- * Retrieves all values for a specific column across multiple rows.
- * @param {number} databaseId - The ID of the database.
- * @param {Array<number>} rowIds - Array of row IDs to fetch values for.
- * @param {number} columnId - The ID of the column to fetch values for.
- * @returns {Promise<Array<any>>} - Array of values, in the same order as rowIds.
- */
 async function getColumnValuesForRows(databaseId, rowIds, columnId) {
   if (!rowIds || rowIds.length === 0) return [];
   const db = getDb();
@@ -310,8 +304,7 @@ async function getColumnValuesForRows(databaseId, rowIds, columnId) {
     const colDef = allColsInDb.find(c => c.id === columnId);
     if (!colDef) {
       const errorMsg = `getColumnValuesForRows: Column ID ${columnId} not found in database ${databaseId}.`;
-      console.error(errorMsg);
-      throw new Error(errorMsg);
+      console.error(errorMsg); throw new Error(errorMsg);
     }
 
     const resultsMap = new Map();
@@ -325,15 +318,11 @@ async function getColumnValuesForRows(databaseId, rowIds, columnId) {
         groupedLinks[link.source_row_id].push(link.target_row_id);
       });
       rowIds.forEach(id => resultsMap.set(id, groupedLinks[id] || []));
-    } else if (colDef.type === 'FORMULA' || colDef.type === 'ROLLUP') {
-      console.warn(`getColumnValuesForRows cannot directly compute '${colDef.type}' column ${columnId}. Full row evaluation is needed via getRow for each row.`);
-      // This is a limitation: for accurate FORMULA/ROLLUP values, we need the full context of each row.
-      // To resolve this properly here would mean reimplementing getRow's logic for multiple rows.
-      // For now, we signal that these values must be fetched row by row if computed values are needed.
-      // This could be achieved by calling `await Promise.all(rowIds.map(id => getRow(id)))` then plucking the value.
+    } else if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
+      // For computed types, we need full row context for each row.
+      // This can be slow for many rows but ensures correctness.
       for (const id of rowIds) {
-          // Simulate fetching full row for computed values - this can be slow if many rows.
-          const fullRow = await getRow(id); // Recursive/Cross-call.
+          const fullRow = await getRow(id); // `getRow` is now async
           resultsMap.set(id, fullRow ? fullRow.values[columnId] : "#ERROR_ROW_NOT_FOUND#");
       }
     } else {
@@ -351,10 +340,4 @@ async function getColumnValuesForRows(databaseId, rowIds, columnId) {
   }
 }
 
-module.exports = {
-  addRow,
-  getRow,
-  updateRow,
-  deleteRow,
-  getColumnValuesForRows,
-};
+module.exports = { addRow, getRow, updateRow, deleteRow, getColumnValuesForRows };

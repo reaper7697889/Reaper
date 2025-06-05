@@ -135,7 +135,7 @@ function initializeDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         database_id INTEGER NOT NULL,
         name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP')), -- Added 'ROLLUP'
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP')), -- Added 'LOOKUP'
         column_order INTEGER NOT NULL,
         default_value TEXT,
         select_options TEXT,
@@ -143,20 +143,25 @@ function initializeDatabase() {
         inverse_column_id INTEGER DEFAULT NULL,
         formula_definition TEXT DEFAULT NULL,
         formula_result_type TEXT DEFAULT NULL,
-        rollup_source_relation_column_id INTEGER DEFAULT NULL, -- New
-        rollup_target_column_id INTEGER DEFAULT NULL,       -- New
-        rollup_function TEXT DEFAULT NULL CHECK(rollup_function IS NULL OR rollup_function IN ( -- New
+        rollup_source_relation_column_id INTEGER DEFAULT NULL,
+        rollup_target_column_id INTEGER DEFAULT NULL,
+        rollup_function TEXT DEFAULT NULL CHECK(rollup_function IS NULL OR rollup_function IN (
             'COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES', 'SUM', 'AVG', 'MIN', 'MAX',
             'SHOW_UNIQUE', 'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY', 'COUNT_CHECKED',
             'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED'
         )),
+        lookup_source_relation_column_id INTEGER DEFAULT NULL, -- New
+        lookup_target_value_column_id INTEGER DEFAULT NULL,    -- New
+        lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')), -- New
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
         FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
         FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
-        FOREIGN KEY (rollup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL, -- New
-        FOREIGN KEY (rollup_target_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,       -- New
+        FOREIGN KEY (rollup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
+        FOREIGN KEY (rollup_target_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
+        FOREIGN KEY (lookup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL, -- New
+        FOREIGN KEY (lookup_target_value_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,    -- New
         UNIQUE (database_id, name),
         UNIQUE (database_id, column_order)
     );
