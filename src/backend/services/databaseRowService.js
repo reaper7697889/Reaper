@@ -2,8 +2,9 @@
 const { getDb } = require("../db");
 const { getColumnsForDatabase } // Import from databaseDefService
     = require("./databaseDefService");
+const { evaluateFormula } = require('../utils/FormulaEvaluator'); // Import Formula Evaluator
 
-// Helper function to prepare value for storage based on column type (for non-RELATION types)
+// Helper function to prepare value for storage based on column type (for non-RELATION/non-FORMULA types)
 function _prepareValueForStorage(columnType, rawValue) {
   const output = { value_text: null, value_number: null, value_boolean: null };
   if (rawValue === null || rawValue === undefined) {
@@ -40,15 +41,16 @@ function _prepareValueForStorage(columnType, rawValue) {
       }
       break;
     case 'RELATION':
-        console.warn("_prepareValueForStorage called for RELATION type. This should be handled separately.");
+    case 'FORMULA':
+        console.warn(`_prepareValueForStorage called for ${columnType} type. This should be handled separately or not at all.`);
         return output;
     default:
-      throw new Error(`Unsupported column type: ${columnType}`);
+      throw new Error(`Unsupported column type for storage preparation: ${columnType}`);
   }
   return output;
 }
 
-// Helper function to deserialize stored value to actual type (for non-RELATION types)
+// Helper function to deserialize stored value to actual type (for non-RELATION/non-FORMULA types)
 function _deserializeValue(columnType, value_text, value_number, value_boolean) {
     switch (columnType) {
         case 'TEXT':
@@ -67,7 +69,10 @@ function _deserializeValue(columnType, value_text, value_number, value_boolean) 
                 return [];
             }
         case 'RELATION':
-            return []; // Should not be reached.
+        case 'FORMULA':
+            // These types are handled directly in getRow, not via this deserializer for their final value.
+            console.warn(`_deserializeValue called for ${columnType}. This type should be handled by getRow directly.`);
+            return null;
         default:
             return null;
     }
@@ -76,6 +81,7 @@ function _deserializeValue(columnType, value_text, value_number, value_boolean) 
 /**
  * Adds a new row to a database with its associated values.
  * Manages inverse links for bidirectional relations.
+ * FORMULA columns are not written to; their values are computed on read.
  * @param {object} args - { databaseId, values, rowOrder = null }
  * @returns {object} - { success: boolean, rowId?: number, error?: string }
  */
@@ -106,7 +112,10 @@ function addRow({ databaseId, values, rowOrder = null }) {
       const colDef = columnDefsMap[columnId];
       if (!colDef) throw new Error(`Column with ID ${columnId} not found in database ${databaseId}.`);
 
-      if (colDef.type === 'RELATION') {
+      if (colDef.type === 'FORMULA') {
+        // Skip writing any value for FORMULA columns; they are computed on read.
+        continue;
+      } else if (colDef.type === 'RELATION') {
         if (!Array.isArray(rawValue)) {
           throw new Error(`Value for RELATION column ${colDef.name} (ID: ${columnId}) must be an array of target row IDs.`);
         }
@@ -119,15 +128,13 @@ function addRow({ databaseId, values, rowOrder = null }) {
             throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not belong to linked database ID ${colDef.linked_database_id}.`);
           }
 
-          linkInsertStmt.run(newRowId, columnId, targetRowId, 0); // Primary link
+          linkInsertStmt.run(newRowId, columnId, targetRowId, 0);
 
-          // If bidirectional, add inverse link
           if (colDef.inverse_column_id !== null) {
-            // Source for inverse link is targetRowId, target is newRowId
             linkInsertStmt.run(targetRowId, colDef.inverse_column_id, newRowId, 0);
           }
         }
-      } else {
+      } else { // Storable, non-relation, non-formula types
         if (rawValue !== undefined) {
             const preparedValues = _prepareValueForStorage(colDef.type, rawValue);
             valueInsertStmt.run(newRowId, columnId, preparedValues.value_text, preparedValues.value_number, preparedValues.value_boolean);
@@ -146,42 +153,76 @@ function addRow({ databaseId, values, rowOrder = null }) {
   }
 }
 
+/**
+ * Retrieves a single row with its values, including computed FORMULA values.
+ * @param {number} rowId
+ * @returns {object|null} - The row object with typed values or null if not found/error.
+ */
 function getRow(rowId) {
   const db = getDb();
   try {
     const rowData = db.prepare("SELECT * FROM database_rows WHERE id = ?").get(rowId);
     if (!rowData) return null;
 
-    const columns = getColumnsForDatabase(rowData.database_id);
-    if (!columns) {
+    const allColumnDefinitions = getColumnsForDatabase(rowData.database_id);
+    if (!allColumnDefinitions) {
         console.error(`Could not fetch columns for database_id ${rowData.database_id} when retrieving row ${rowId}`);
         return { ...rowData, values: {} };
     }
 
-    const valuesFormatted = {};
+    const rowDataValues = {}; // This will hold all cell values, keyed by columnId
+
+    // First Pass: Resolve all stored values (non-FORMULA, non-RELATION) and RELATION links
     const cellValuesStmt = db.prepare("SELECT value_text, value_number, value_boolean FROM database_row_values WHERE row_id = ? AND column_id = ?");
     const linkedRowsStmt = db.prepare("SELECT target_row_id FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? ORDER BY link_order ASC");
 
-    for (const col of columns) {
-      if (col.type === 'RELATION') {
-        const linkedRows = linkedRowsStmt.all(rowId, col.id);
-        valuesFormatted[col.id] = linkedRows.map(lr => lr.target_row_id);
-      } else {
-        const cell = cellValuesStmt.get(rowId, col.id);
+    for (const colDef of allColumnDefinitions) {
+      if (colDef.type === 'RELATION') {
+        const linkedRows = linkedRowsStmt.all(rowId, colDef.id);
+        rowDataValues[colDef.id] = linkedRows.map(lr => lr.target_row_id);
+      } else if (colDef.type !== 'FORMULA') {
+        const cell = cellValuesStmt.get(rowId, colDef.id);
         if (cell) {
-          valuesFormatted[col.id] = _deserializeValue(col.type, cell.value_text, cell.value_number, cell.value_boolean);
+          rowDataValues[colDef.id] = _deserializeValue(colDef.type, cell.value_text, cell.value_number, cell.value_boolean);
         } else {
-          valuesFormatted[col.id] = null;
+          rowDataValues[colDef.id] = null; // Or apply colDef.default_value if that logic is added
         }
       }
     }
-    return { ...rowData, values: valuesFormatted };
+
+    // Second Pass: Calculate FORMULA values using the resolved rowDataValues as context
+    for (const colDef of allColumnDefinitions) {
+      if (colDef.type === 'FORMULA') {
+        if (colDef.formula_definition && colDef.formula_definition.trim() !== "") {
+          // Pass allColumnDefinitions for name-to-ID mapping within the evaluator
+          const evalResult = evaluateFormula(colDef.formula_definition, rowDataValues, allColumnDefinitions);
+          if (evalResult.error) {
+            console.error(`Error evaluating formula for row ${rowId}, column ${colDef.id} (${colDef.name}): ${evalResult.error}`);
+            rowDataValues[colDef.id] = "#ERROR!"; // User-friendly error indicator
+          } else {
+            rowDataValues[colDef.id] = evalResult.result;
+          }
+        } else {
+          console.warn(`Formula column ${colDef.id} (${colDef.name}) has no definition.`);
+          rowDataValues[colDef.id] = null;
+        }
+      }
+    }
+
+    return { ...rowData, values: rowDataValues };
   } catch (err) {
-    console.error(`Error getting row ${rowId}:`, err.message);
+    console.error(`Error getting row ${rowId}:`, err.message, err.stack);
     return null;
   }
 }
 
+
+/**
+ * Updates values for an existing row. Manages inverse links.
+ * FORMULA columns are not directly updatable via this method.
+ * @param {object} args - { rowId, values }
+ * @returns {object} - { success: boolean, error?: string }
+ */
 function updateRow({ rowId, values }) {
   const db = getDb();
   const rowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
@@ -211,15 +252,18 @@ function updateRow({ rowId, values }) {
       const colDef = columnDefsMap[columnId];
       if (!colDef) throw new Error(`Column with ID ${columnId} not found for this row's database.`);
 
-      if (colDef.type === 'RELATION') {
+      if (colDef.type === 'FORMULA') {
+        // FORMULA columns cannot be set directly.
+        console.warn(`Attempted to update FORMULA column ${colDef.name} (ID: ${columnId}). This has no effect.`);
+        continue;
+      } else if (colDef.type === 'RELATION') {
         if (!Array.isArray(rawValue)) {
           throw new Error(`Value for RELATION column ${colDef.name} (ID: ${columnId}) must be an array of target row IDs.`);
         }
 
         const currentLinkedIds = new Set(getLinksStmt.all(rowId, columnId).map(r => r.target_row_id));
-        const newLinkedIds = new Set(rawValue.map(id => parseInt(id, 10))); // Ensure new IDs are numbers
+        const newLinkedIds = new Set(rawValue.map(id => parseInt(id, 10)));
 
-        // Validate new targetRowIds before making changes
         for (const targetRowId of newLinkedIds) {
             if (isNaN(targetRowId)) throw new Error(`Invalid targetRowId in input for RELATION column ${colDef.name}.`);
             const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
@@ -229,13 +273,11 @@ function updateRow({ rowId, values }) {
             }
         }
 
-        // Update Primary Links
-        deleteLinksStmt.run(rowId, columnId); // Clear all current primary links for this cell
+        deleteLinksStmt.run(rowId, columnId);
         for (const targetRowId of newLinkedIds) {
-          linkInsertStmt.run(rowId, columnId, targetRowId, 0); // Add new primary links
+          linkInsertStmt.run(rowId, columnId, targetRowId, 0);
         }
 
-        // Update Inverse Links if bidirectional
         if (colDef.inverse_column_id !== null) {
           const colB_id = colDef.inverse_column_id;
           const idsToUnlinkFromInverse = [...currentLinkedIds].filter(id => !newLinkedIds.has(id));
@@ -248,7 +290,7 @@ function updateRow({ rowId, values }) {
             linkInsertStmt.run(idToLink, colB_id, rowId, 0);
           }
         }
-      } else { // Non-RELATION types
+      } else {
         if (rawValue === undefined) continue;
         const preparedValues = _prepareValueForStorage(colDef.type, rawValue);
         valueReplaceStmt.run(rowId, columnId, preparedValues.value_text, preparedValues.value_number, preparedValues.value_boolean, rowId, columnId);
@@ -268,17 +310,6 @@ function updateRow({ rowId, values }) {
 
 function deleteRow(rowId) {
   const db = getDb();
-  // For bidirectional relations, we need to manually clean up inverse links
-  // because ON DELETE CASCADE on database_row_links.target_row_id might not cover all scenarios
-  // if a column definition itself is deleted, or if we want to be absolutely sure.
-  // However, the schema's ON DELETE CASCADE on database_rows(id) for database_row_links.source_row_id
-  // and database_row_links.target_row_id IS comprehensive.
-  // When rowId is deleted:
-  // 1. All links where rowId is source_row_id are deleted (CASCADE on database_row_links.source_row_id).
-  //    This automatically handles one side of any bidirectional link.
-  // 2. All links where rowId is target_row_id are deleted (CASCADE on database_row_links.target_row_id).
-  //    This handles the other side of any bidirectional link.
-  // So, no explicit inverse link cleanup is needed here in deleteRow due to schema.
   try {
     const stmt = db.prepare("DELETE FROM database_rows WHERE id = ?");
     const info = stmt.run(rowId);

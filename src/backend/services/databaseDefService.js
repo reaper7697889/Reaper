@@ -1,7 +1,8 @@
 // src/backend/services/databaseDefService.js
 const { getDb } = require("../db");
 
-const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION'];
+// Updated to include 'FORMULA'
+const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA'];
 
 // --- Helper Functions ---
 /**
@@ -17,7 +18,6 @@ function _clearInverseColumnLink(inverseColumnId, db) {
         console.log(`Cleared inverse_column_id for column ${inverseColumnId}`);
     } catch (err) {
         console.error(`Error clearing inverse_column_id for column ${inverseColumnId}:`, err.message);
-        // Potentially re-throw if this failure should halt the parent operation
     }
 }
 
@@ -38,8 +38,7 @@ function _validateTargetInverseColumn(targetColumnId, expectedDbId, expectedBack
     return targetCol;
 }
 
-
-// --- Database Management (mostly unchanged from previous versions) ---
+// --- Database Management ---
 function createDatabase({ name, noteId = null }) {
   const db = getDb();
   if (!name || typeof name !== 'string' || name.trim() === "") {
@@ -94,9 +93,6 @@ function updateDatabaseName({ databaseId, name }) {
 function deleteDatabase(databaseId) {
   const db = getDb();
   try {
-    // ON DELETE CASCADE for database_id in database_columns will handle related columns.
-    // ON DELETE CASCADE for linked_database_id in database_columns (SET NULL) will handle FKs.
-    // ON DELETE CASCADE for inverse_column_id in database_columns (SET NULL) will handle FKs.
     const stmt = db.prepare("DELETE FROM note_databases WHERE id = ?");
     const info = stmt.run(databaseId);
     return info.changes > 0 ? { success: true } : { success: false, error: "Database not found." };
@@ -116,7 +112,9 @@ function addColumn(args) {
     linkedDatabaseId: origLinkedDbId,
     makeBidirectional = false,
     targetInverseColumnName,
-    existingTargetInverseColumnId
+    existingTargetInverseColumnId,
+    formula_definition: origFormulaDefinition,
+    formula_result_type: origFormulaResultType
   } = args;
 
   const db = getDb();
@@ -131,19 +129,27 @@ function addColumn(args) {
   let defaultValue = origDefaultValue;
   let selectOptions = origSelectOptions;
   let linkedDatabaseId = origLinkedDbId;
-  let finalInverseColumnId = null; // This will be NULL unless bidirectional is successful
+  let inverseColumnId = null; // Will be set by bidirectional logic if applicable
+  let formulaDefinition = origFormulaDefinition;
+  let formulaResultType = origFormulaResultType;
 
-  // Initial validation and setup based on type
+  // Type-specific validation and field nullification
   if (type === 'RELATION') {
     if (linkedDatabaseId === null || linkedDatabaseId === undefined) {
       return { success: false, error: "linkedDatabaseId is required for RELATION type columns." };
     }
     const targetDbInfo = getDatabaseById(linkedDatabaseId);
     if (!targetDbInfo) return { success: false, error: `Linked database ID ${linkedDatabaseId} not found.` };
-    defaultValue = null;
-    selectOptions = null;
-  } else {
-    linkedDatabaseId = null; // Not applicable for non-RELATION
+    defaultValue = null; selectOptions = null; formulaDefinition = null; formulaResultType = null;
+  } else if (type === 'FORMULA') {
+    if (!formulaDefinition || String(formulaDefinition).trim() === "") {
+        return { success: false, error: "formula_definition is required for FORMULA type columns."};
+    }
+    // formula_result_type is optional
+    defaultValue = null; selectOptions = null; linkedDatabaseId = null; /* inverseColumnId already null */
+  } else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
+    linkedDatabaseId = null; /* inverseColumnId already null */
+    formulaDefinition = null; formulaResultType = null;
     if (makeBidirectional) return { success: false, error: "Bidirectional links can only be made for RELATION type columns."};
     if (type === 'SELECT' || type === 'MULTI_SELECT') {
       if (selectOptions) {
@@ -160,13 +166,20 @@ function addColumn(args) {
     }
   }
 
-  // Transaction for complex bidirectional setup
   const transaction = db.transaction(() => {
-    // Step 1: Insert the primary column (ColA), initially without inverse_column_id
     const colAStmt = db.prepare(
-      "INSERT INTO database_columns (database_id, name, type, column_order, default_value, select_options, linked_database_id, inverse_column_id) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
+      `INSERT INTO database_columns (
+        database_id, name, type, column_order,
+        default_value, select_options, linked_database_id, inverse_column_id,
+        formula_definition, formula_result_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    const colAInfo = colAStmt.run(databaseId, trimmedName, type, columnOrder, defaultValue, selectOptions, linkedDatabaseId);
+    // inverse_column_id is initially NULL, will be updated if bidirectional
+    const colAInfo = colAStmt.run(
+        databaseId, trimmedName, type, columnOrder,
+        defaultValue, selectOptions, linkedDatabaseId, null,
+        formulaDefinition, formulaResultType
+    );
     const colAId = colAInfo.lastInsertRowid;
     if (!colAId) throw new Error("Failed to create primary column.");
 
@@ -174,42 +187,33 @@ function addColumn(args) {
       let colBId;
       if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) {
         colBId = existingTargetInverseColumnId;
-        // Validate existingTargetInverseColumnId (ColB)
         const validationResult = _validateTargetInverseColumn(colBId, linkedDatabaseId, databaseId, db);
         if (typeof validationResult === 'string') throw new Error(validationResult);
         const targetCol = validationResult;
         if (targetCol.inverse_column_id !== null && targetCol.inverse_column_id !== colAId) {
             throw new Error(`Target inverse column ${colBId} is already linked to another column (${targetCol.inverse_column_id}).`);
         }
-        // Update ColB to point to ColA
         db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colAId, colBId);
       } else {
-        // Auto-create inverse column (ColB)
         const currentDb = getDatabaseById(databaseId);
-        const inverseColName = targetInverseColumnName ? targetInverseColumnName.trim() : `Related ${currentDb ? currentDb.name : 'DB' } - ${trimmedName}`;
-        if (!inverseColName) throw new Error("Generated inverse column name is empty.");
-
-        // Check uniqueness of inverseColName in target DB
-        const existingByName = db.prepare("SELECT id FROM database_columns WHERE database_id = ? AND name = ? COLLATE NOCASE").get(linkedDatabaseId, inverseColName);
-        if(existingByName) throw new Error(`Inverse column name "${inverseColName}" already exists in target database.`);
-
-        // Determine next column_order for ColB in target database
+        const invColName = targetInverseColumnName ? targetInverseColumnName.trim() : `Related ${currentDb ? currentDb.name : 'DB'} - ${trimmedName}`;
+        if (!invColName) throw new Error("Generated inverse column name is empty.");
+        const existingByName = db.prepare("SELECT id FROM database_columns WHERE database_id = ? AND name = ? COLLATE NOCASE").get(linkedDatabaseId, invColName);
+        if(existingByName) throw new Error(`Inverse column name "${invColName}" already exists in target database.`);
         const lastOrderStmt = db.prepare("SELECT MAX(column_order) as max_order FROM database_columns WHERE database_id = ?");
         const lastOrderResult = lastOrderStmt.get(linkedDatabaseId);
         const colBOrder = (lastOrderResult && typeof lastOrderResult.max_order === 'number' ? lastOrderResult.max_order : 0) + 1;
 
         const colBStmt = db.prepare(
-          "INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id) VALUES (?, ?, 'RELATION', ?, ?, ?)"
+          "INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id, formula_definition, formula_result_type) VALUES (?, ?, 'RELATION', ?, ?, ?, NULL, NULL)"
         );
-        const colBInfo = colBStmt.run(linkedDatabaseId, inverseColName, colBOrder, databaseId, colAId);
+        const colBInfo = colBStmt.run(linkedDatabaseId, invColName, colBOrder, databaseId, colAId);
         colBId = colBInfo.lastInsertRowid;
         if (!colBId) throw new Error("Failed to create inverse column.");
       }
-      // Update ColA to point to ColB
       db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colBId, colAId);
-      finalInverseColumnId = colBId; // Store for the return object
     }
-    return colAId; // Return ColA's ID from transaction
+    return colAId;
   });
 
   try {
@@ -218,7 +222,6 @@ function addColumn(args) {
     return { success: true, column: finalColA };
   } catch (err) {
     console.error("Error adding column (transactional part):", err.message);
-    // Check for specific unique constraint errors that might not be caught by pre-checks if names are tricky
      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         if (err.message.includes('name')) return { success: false, error: "Column name already exists for this database." };
         if (err.message.includes('column_order')) return { success: false, error: "Column order already exists for this database." };
@@ -227,11 +230,10 @@ function addColumn(args) {
   }
 }
 
-
 function getColumnsForDatabase(databaseId) {
   const db = getDb();
   try {
-    const stmt = db.prepare("SELECT id, database_id, name, type, column_order, default_value, select_options, linked_database_id, inverse_column_id FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
+    const stmt = db.prepare("SELECT id, database_id, name, type, column_order, default_value, select_options, linked_database_id, inverse_column_id, formula_definition, formula_result_type FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
     return stmt.all(databaseId);
   } catch (err) {
     console.error(`Error getting columns for database ${databaseId}:`, err.message);
@@ -251,113 +253,48 @@ function updateColumn(args) {
     const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
     if (!currentCol) throw new Error("Column not found.");
 
+    let newType = updateData.type !== undefined ? updateData.type : currentCol.type;
     let newLinkedDbId = updateData.linked_database_id !== undefined ? updateData.linked_database_id : currentCol.linked_database_id;
-    const newType = updateData.type !== undefined ? updateData.type : currentCol.type;
     let newInverseColId = updateData.inverse_column_id !== undefined ? updateData.inverse_column_id : currentCol.inverse_column_id;
 
-    let mustClearOldInverse = false; // Flag to clear currentCol.inverse_column_id's counterpart
-    let mustSetUpNewInverse = false; // Flag to set up a new bidirectional link
-
-    // 1. Handle changes that might clear existing inverse link or row links
-    if ((updateData.type !== undefined && currentCol.type === 'RELATION' && updateData.type !== 'RELATION') ||
-        (updateData.linked_database_id !== undefined && currentCol.type === 'RELATION' && currentCol.linked_database_id !== updateData.linked_database_id)) {
-
-      _clearInverseColumnLink(currentCol.inverse_column_id, db);
-      newInverseColId = null; // Column is no longer RELATION or points elsewhere one-way initially
-
-      // Clear all row links for this column as its fundamental relation nature changed
-      db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
-      console.log(`Cleared row links for column ${columnId} due to type/linked_database_id change.`);
-    }
-
-    // 2. Prepare fields for the main column update
     const fieldsToSet = new Map();
 
+    // Handle name, columnOrder first as they are simpler
     if (updateData.name !== undefined) fieldsToSet.set("name", updateData.name.trim());
-    if (updateData.type !== undefined) fieldsToSet.set("type", updateData.type);
     if (updateData.columnOrder !== undefined) fieldsToSet.set("column_order", updateData.columnOrder);
 
-    // Default value handling
-    if (newType === 'RELATION') fieldsToSet.set("default_value", null);
-    else if (updateData.default_value !== undefined) fieldsToSet.set("default_value", updateData.default_value);
+    // Type change logic
+    if (updateData.type !== undefined && updateData.type !== currentCol.type) {
+      if (!ALLOWED_COLUMN_TYPES.includes(updateData.type)) throw new Error(`Invalid new type: ${updateData.type}`);
+      fieldsToSet.set("type", updateData.type);
 
-    // Select options handling
-    if (newType === 'SELECT' || newType === 'MULTI_SELECT') {
-      let newSelectOpts = updateData.selectOptions !== undefined ? updateData.selectOptions : currentCol.select_options;
-      if (newSelectOpts === null && updateData.selectOptions !== undefined) newSelectOpts = JSON.stringify([]); // Allow explicit null to clear
-      else if (typeof newSelectOpts === 'string') { try { JSON.parse(newSelectOpts); } catch (e) { throw new Error("Invalid JSON for selectOptions."); } }
-      else if (Array.isArray(newSelectOpts)) newSelectOpts = JSON.stringify(newSelectOpts);
-      else if (newSelectOpts === undefined) newSelectOpts = JSON.stringify([]); // Default if type changed to SELECT/MULTI and not provided
-      fieldsToSet.set("select_options", newSelectOpts);
-    } else {
-      fieldsToSet.set("select_options", null);
+      // Clear fields from old type if switching from RELATION or to/from FORMULA
+      if (currentCol.type === 'RELATION' && newType !== 'RELATION') {
+        _clearInverseColumnLink(currentCol.inverse_column_id, db);
+        newInverseColId = null; // Will be set by fieldsToSet.set("inverse_column_id", null) later
+        db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
+      }
+      if (currentCol.type === 'FORMULA' && newType !== 'FORMULA') {
+         fieldsToSet.set("formula_definition", null);
+         fieldsToSet.set("formula_result_type", null);
+      }
     }
 
-    // linked_database_id handling
+    // Set type-specific fields based on the *final* type (newType)
     if (newType === 'RELATION') {
       if (newLinkedDbId === null || newLinkedDbId === undefined) throw new Error("linked_database_id is required for RELATION type.");
-      const targetDb = getDatabaseById(newLinkedDbId);
+      const targetDb = getDatabaseById(newLinkedDbId); // Validate newLinkedDbId
       if (!targetDb) throw new Error(`Update failed: Linked database ID ${newLinkedDbId} not found.`);
       fieldsToSet.set("linked_database_id", newLinkedDbId);
-    } else {
-      fieldsToSet.set("linked_database_id", null);
-    }
+      fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null); fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
 
-    // Initial inverse_column_id for ColA (might be temporary if bidirectional setup follows)
-    fieldsToSet.set("inverse_column_id", newInverseColId);
-
-
-    // 3. Determine if bidirectional setup is needed/changing
-    if (newType === 'RELATION') {
-        if (makeBidirectional === true) { // User wants to make/ensure it's bidirectional
-            if (currentCol.inverse_column_id && updateData.inverse_column_id === undefined && !existingTargetInverseColumnId) {
-                // Was bidirectional, user didn't specify a new inverse_column_id, keep it as is unless linked_db_id changed
-                 if (mustClearOldInverse) { // linked_db_id changed, old inverse was cleared
-                    newInverseColId = null; // Will need to set up new one
-                    mustSetUpNewInverse = true;
-                 } else {
-                    newInverseColId = currentCol.inverse_column_id; // Try to maintain current
-                 }
-            } else { // New setup or explicit change
-                mustSetUpNewInverse = true;
-            }
-             fieldsToSet.set("inverse_column_id", null); // Set to null first, then update with new B_id
-        } else if (makeBidirectional === false && currentCol.inverse_column_id !== null) { // User wants to remove bidirectionality
+      if (makeBidirectional === true) {
+        // If it was already linked, and linked_db_id changed, clear old inverse
+        if (currentCol.inverse_column_id && currentCol.linked_database_id !== newLinkedDbId) {
             _clearInverseColumnLink(currentCol.inverse_column_id, db);
-            newInverseColId = null;
-            fieldsToSet.set("inverse_column_id", null);
-        } else if (updateData.inverse_column_id !== undefined) { // Explicitly setting inverse_column_id
-             _clearInverseColumnLink(currentCol.inverse_column_id, db); // Clear old one
-             newInverseColId = updateData.inverse_column_id; // This will be set on ColA
-             if (newInverseColId !== null) { // If setting to a new ColB, update that ColB too
-                const validationResult = _validateTargetInverseColumn(newInverseColId, newLinkedDbId, currentCol.database_id, db);
-                if (typeof validationResult === 'string') throw new Error(validationResult);
-                 db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, newInverseColId);
-             }
-             fieldsToSet.set("inverse_column_id", newInverseColId);
+            newInverseColId = null; // Force new setup
         }
-    } else { // Not a RELATION type anymore
-        fieldsToSet.set("inverse_column_id", null); // Ensure it's null
-    }
-
-
-    // 4. Update ColA with determined fields (excluding inverse_column_id if it's being set up bidirectionally now)
-    if (fieldsToSet.size > 0) {
-        const fieldEntries = Array.from(fieldsToSet.entries());
-        const sqlSetParts = fieldEntries.map(([key]) => `${key} = ?`);
-        const sqlValues = fieldEntries.map(([, value]) => value);
-
-        sqlSetParts.push("updated_at = CURRENT_TIMESTAMP");
-        sqlValues.push(columnId);
-
-        const updateStmt = db.prepare(`UPDATE database_columns SET ${sqlSetParts.join(", ")} WHERE id = ?`);
-        updateStmt.run(...sqlValues);
-    }
-
-    // 5. Setup new inverse link if needed
-    let finalColAInverseId = newInverseColId; // Start with what was determined for ColA
-
-    if (mustSetUpNewInverse && newType === 'RELATION') {
+        // Logic for setting up new/existing inverse (ColB)
         let colBId;
         if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) {
             colBId = existingTargetInverseColumnId;
@@ -365,39 +302,91 @@ function updateColumn(args) {
             if (typeof validationResult === 'string') throw new Error(validationResult);
             const targetCol = validationResult;
             if (targetCol.inverse_column_id !== null && targetCol.inverse_column_id !== columnId) {
-                 throw new Error(`Target inverse column ${colBId} is already linked to another column (${targetCol.inverse_column_id}).`);
+                 throw new Error(`Target inverse column ${colBId} is already linked to another column.`);
             }
             db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, colBId);
-        } else { // Auto-create new inverse ColB
-            const currentDb = getDatabaseById(currentCol.database_id);
-            const invColName = targetInverseColumnName ? targetInverseColumnName.trim() : `Related ${currentDb ? currentDb.name : 'DB'} - ${fieldsToSet.get('name') || currentCol.name}`;
+        } else if (newInverseColId === null) { // Auto-create if no existing one specified AND current is null
+            const currentDbInfo = getDatabaseById(currentCol.database_id);
+            const invColName = targetInverseColumnName ? targetInverseColumnName.trim() : `Related ${currentDbInfo ? currentDbInfo.name : 'DB'} - ${fieldsToSet.get('name') || currentCol.name}`;
             if (!invColName) throw new Error("Generated inverse column name is empty.");
-
             const existingByName = db.prepare("SELECT id FROM database_columns WHERE database_id = ? AND name = ? COLLATE NOCASE").get(newLinkedDbId, invColName);
             if(existingByName) throw new Error(`Inverse column name "${invColName}" already exists in target database.`);
-
             const lastOrderStmt = db.prepare("SELECT MAX(column_order) as max_order FROM database_columns WHERE database_id = ?");
             const lastOrderResult = lastOrderStmt.get(newLinkedDbId);
             const colBOrder = (lastOrderResult && typeof lastOrderResult.max_order === 'number' ? lastOrderResult.max_order : 0) + 1;
-
             const colBStmt = db.prepare("INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id) VALUES (?, ?, 'RELATION', ?, ?, ?)");
             const colBInfo = colBStmt.run(newLinkedDbId, invColName, colBOrder, currentCol.database_id, columnId);
             colBId = colBInfo.lastInsertRowid;
-            if (!colBId) throw new Error("Failed to create inverse column.");
+            if (!colBId) throw new Error("Failed to create inverse column during update.");
+        } else { // Use newInverseColId if it was explicitly provided
+            colBId = newInverseColId;
+             const validationResult = _validateTargetInverseColumn(colBId, newLinkedDbId, currentCol.database_id, db);
+            if (typeof validationResult === 'string') throw new Error(validationResult);
+            db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, colBId);
         }
-        // Update ColA's inverse_column_id to point to the new/validated ColB
-        db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colBId, columnId);
-        finalColAInverseId = colBId;
+        newInverseColId = colBId; // This is the new inverse for ColA
+      } else if (makeBidirectional === false && currentCol.inverse_column_id !== null) {
+        _clearInverseColumnLink(currentCol.inverse_column_id, db);
+        newInverseColId = null;
+      } // If makeBidirectional is undefined, don't change existing bidirectionality unless inverse_column_id is explicitly set
+      fieldsToSet.set("inverse_column_id", newInverseColId);
+
+    } else if (newType === 'FORMULA') {
+      const newFormulaDef = updateData.formula_definition !== undefined ? updateData.formula_definition : currentCol.formula_definition;
+      if (!newFormulaDef || String(newFormulaDef).trim() === "") throw new Error("formula_definition cannot be empty for FORMULA type.");
+      fieldsToSet.set("formula_definition", newFormulaDef);
+      if (updateData.formula_result_type !== undefined) fieldsToSet.set("formula_result_type", updateData.formula_result_type);
+      else if (currentCol.type !== 'FORMULA') fieldsToSet.set("formula_result_type", null); // Default if changing to formula
+
+      fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null); fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null);
+    } else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
+      if (updateData.defaultValue !== undefined) fieldsToSet.set("default_value", updateData.defaultValue);
+      if (newType === 'SELECT' || newType === 'MULTI_SELECT') {
+        let newSelectOpts = updateData.selectOptions !== undefined ? updateData.selectOptions : currentCol.select_options;
+        if (newSelectOpts === null && updateData.selectOptions !== undefined) newSelectOpts = JSON.stringify([]);
+        else if (typeof newSelectOpts === 'string') { try { JSON.parse(newSelectOpts); } catch (e) { throw new Error("Invalid JSON for selectOptions."); }}
+        else if (Array.isArray(newSelectOpts)) newSelectOpts = JSON.stringify(newSelectOpts);
+        else if (newSelectOpts === undefined && (updateData.type && (updateData.type === 'SELECT' || updateData.type === 'MULTI_SELECT'))) newSelectOpts = JSON.stringify([]);
+        fieldsToSet.set("select_options", newSelectOpts);
+      } else {
+        fieldsToSet.set("select_options", null);
+      }
+      fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null); fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
     }
 
-    return { success: true, finalInverseId: finalColAInverseId }; // Return success
+    // Handle explicit update of inverse_column_id if not covered by makeBidirectional
+    if (updateData.inverse_column_id !== undefined && makeBidirectional === undefined && newType === 'RELATION') {
+        if (currentCol.inverse_column_id !== updateData.inverse_column_id) { // If it's actually changing
+            _clearInverseColumnLink(currentCol.inverse_column_id, db); // Clear old one
+            if (updateData.inverse_column_id !== null) { // If setting to a new ColB, update that ColB too
+                const validationResult = _validateTargetInverseColumn(updateData.inverse_column_id, newLinkedDbId, currentCol.database_id, db);
+                if (typeof validationResult === 'string') throw new Error(validationResult);
+                db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, updateData.inverse_column_id);
+            }
+        }
+        fieldsToSet.set("inverse_column_id", updateData.inverse_column_id);
+    }
+
+
+    if (fieldsToSet.size === 0) return { success: true, message: "No effective changes." };
+
+    const finalFieldsSql = Array.from(fieldsToSet.keys()).map(key => `${key} = ?`);
+    const finalValues = Array.from(fieldsToSet.values());
+
+    finalFieldsSql.push("updated_at = CURRENT_TIMESTAMP");
+    finalValues.push(columnId);
+
+    const updateStmt = db.prepare(`UPDATE database_columns SET ${finalFieldsSql.join(", ")} WHERE id = ?`);
+    const info = updateStmt.run(...finalValues);
+
+    return { success: info.changes > 0 };
   });
 
   try {
     return transaction();
   } catch (err) {
-    console.error(`Error updating column ID ${columnId} (transactional part):`, err.message);
-    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') { // From the main update to ColA if name/order conflicts
+    console.error(`Error updating column ID ${columnId}:`, err.message, err.stack);
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         if (err.message.includes('name')) return { success: false, error: "Column name already exists for this database." };
         if (err.message.includes('column_order')) return { success: false, error: "Column order already exists for this database." };
     }
@@ -408,20 +397,18 @@ function updateColumn(args) {
 function deleteColumn(columnId) {
   const db = getDb();
   const transaction = db.transaction(() => {
-    const columnToDelete = db.prepare("SELECT inverse_column_id FROM database_columns WHERE id = ?").get(columnId);
-    if (!columnToDelete) {
-      throw new Error("Column not found for deletion.");
+    const columnToDelete = db.prepare("SELECT type, inverse_column_id FROM database_columns WHERE id = ?").get(columnId);
+    if (!columnToDelete) throw new Error("Column not found for deletion.");
+
+    if (columnToDelete.type === 'RELATION' && columnToDelete.inverse_column_id !== null) {
+      _clearInverseColumnLink(columnToDelete.inverse_column_id, db);
     }
 
-    // Clear the link from its inverse column, if any
-    _clearInverseColumnLink(columnToDelete.inverse_column_id, db);
-
-    // ON DELETE CASCADE on database_row_links.source_column_id will handle actual link data.
-    // ON DELETE CASCADE on database_row_values.column_id will handle cell values.
+    // ON DELETE CASCADE on database_row_links.source_column_id and database_row_values.column_id handles cleanup.
     const stmt = db.prepare("DELETE FROM database_columns WHERE id = ?");
     const info = stmt.run(columnId);
 
-    if (info.changes === 0) throw new Error("Column not found during delete execution (should have been caught earlier).");
+    if (info.changes === 0) throw new Error("Column not found during delete execution."); // Should be caught by earlier check
     return { success: true };
   });
 

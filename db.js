@@ -135,17 +135,19 @@ function initializeDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         database_id INTEGER NOT NULL,
         name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION')), -- Added 'RELATION'
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA')), -- Added 'FORMULA'
         column_order INTEGER NOT NULL,
         default_value TEXT,
-        select_options TEXT, -- JSON string array for SELECT/MULTI_SELECT, e.g., '["Opt1", "Opt2"]'
+        select_options TEXT,
         linked_database_id INTEGER,
-        inverse_column_id INTEGER DEFAULT NULL, -- New column for bidirectional links
+        inverse_column_id INTEGER DEFAULT NULL,
+        formula_definition TEXT DEFAULT NULL, -- New column for formula definition
+        formula_result_type TEXT DEFAULT NULL, -- New column for formula's expected result type
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
         FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
-        FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL, -- New FK
+        FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         UNIQUE (database_id, name),
         UNIQUE (database_id, column_order)
     );
