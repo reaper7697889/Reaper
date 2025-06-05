@@ -16,7 +16,7 @@ function __restoreOriginalDb() {
 }
 // const noteService = require('./noteService'); // Example, if needed later for ownership checks
 
-const ALLOWED_OBJECT_TYPES = ['note', 'database', 'database_row', 'task', 'folder', 'workspace'];
+const ALLOWED_OBJECT_TYPES = ['note', 'database', 'database_row', 'task', 'folder', 'workspace', 'data_template']; // Added 'data_template'
 const PERMISSION_LEVEL_HIERARCHY = {
     read: 1,
     write: 2,
