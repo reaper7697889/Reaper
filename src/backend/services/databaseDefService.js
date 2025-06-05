@@ -1,37 +1,43 @@
 // src/backend/services/databaseDefService.js
 const { getDb } = require("../db");
 
-const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT'];
+// Updated to include 'RELATION'
+const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION'];
 
 // --- Database Management ---
 
 /**
  * Creates a new database definition.
  * @param {object} args - { name, noteId = null }
- * @returns {object|null} - The new database object { id, name, note_id, ... } or null on failure.
+ * @returns {object} - { success: boolean, database?: object, error?: string }
  */
 function createDatabase({ name, noteId = null }) {
   const db = getDb();
   if (!name || typeof name !== 'string' || name.trim() === "") {
-    console.error("Database name is required.");
-    return null;
+    return { success: false, error: "Database name is required." };
   }
   try {
     const stmt = db.prepare(
       "INSERT INTO note_databases (name, note_id) VALUES (?, ?)"
     );
     const info = stmt.run(name.trim(), noteId);
-    return getDatabaseById(info.lastInsertRowid);
+    const newDb = getDatabaseById(info.lastInsertRowid); // getDatabaseById itself returns the object or null
+    if (newDb) {
+        return { success: true, database: newDb };
+    } else {
+        // Should not happen if insert succeeded and getDatabaseById is robust
+        return { success: false, error: "Failed to retrieve newly created database."}
+    }
   } catch (err) {
     console.error("Error creating database:", err.message);
-    return null;
+    return { success: false, error: "Failed to create database." };
   }
 }
 
 /**
  * Retrieves a database by its ID.
  * @param {number} databaseId
- * @returns {object|null} - The database object or null if not found.
+ * @returns {object|null} - The database object or null if not found/error.
  */
 function getDatabaseById(databaseId) {
   const db = getDb();
@@ -108,10 +114,11 @@ function deleteDatabase(databaseId) {
 
 /**
  * Adds a new column to a database.
- * @param {object} args - { databaseId, name, type, columnOrder, defaultValue = null, selectOptions = null }
- * @returns {object|null} - The new column object or null on failure.
+ * @param {object} args - { databaseId, name, type, columnOrder, defaultValue = null, selectOptions = null, linkedDatabaseId = null }
+ * @returns {object} - { success: boolean, column?: object, error?: string }
  */
-function addColumn({ databaseId, name, type, columnOrder, defaultValue = null, selectOptions = null }) {
+function addColumn(args) {
+  const { databaseId, name, type, columnOrder, defaultValue: origDefaultValue, selectOptions: origSelectOptions, linkedDatabaseId: origLinkedDbId } = args;
   const db = getDb();
   const trimmedName = name ? name.trim() : "";
 
@@ -121,32 +128,55 @@ function addColumn({ databaseId, name, type, columnOrder, defaultValue = null, s
   }
   if (typeof columnOrder !== 'number') return { success: false, error: "Column order must be a number." };
 
-  if ((type === 'SELECT' || type === 'MULTI_SELECT') && selectOptions) {
-    try {
-      if (typeof selectOptions === 'string') JSON.parse(selectOptions); // Validate if string
-      else if (Array.isArray(selectOptions)) selectOptions = JSON.stringify(selectOptions); // Convert array to string
-      else return { success: false, error: "selectOptions must be a JSON string array for SELECT/MULTI_SELECT types."};
-    } catch (e) {
-      return { success: false, error: "Invalid JSON format for selectOptions." };
-    }
-  } else if (type === 'SELECT' || type === 'MULTI_SELECT') {
-    selectOptions = JSON.stringify([]); // Default to empty array if not provided
-  }
+  let defaultValue = origDefaultValue;
+  let selectOptions = origSelectOptions;
+  let linkedDatabaseId = origLinkedDbId;
 
+  if (type === 'RELATION') {
+    if (linkedDatabaseId === null || linkedDatabaseId === undefined) { // Check for null or undefined explicitly
+      return { success: false, error: "linkedDatabaseId is required for RELATION type columns." };
+    }
+    const targetDb = getDatabaseById(linkedDatabaseId);
+    if (!targetDb) {
+      return { success: false, error: `Linked database ID ${linkedDatabaseId} not found.` };
+    }
+    defaultValue = null;
+    selectOptions = null;
+  } else {
+    linkedDatabaseId = null;
+    if (type === 'SELECT' || type === 'MULTI_SELECT') {
+        if (selectOptions) {
+            try {
+                if (typeof selectOptions === 'string') { // Ensure it's valid JSON if string
+                    JSON.parse(selectOptions);
+                } else if (Array.isArray(selectOptions)) {
+                    selectOptions = JSON.stringify(selectOptions);
+                } else {
+                    return { success: false, error: "selectOptions must be a JSON string array for SELECT/MULTI_SELECT types."};
+                }
+            } catch (e) {
+                return { success: false, error: "Invalid JSON format for selectOptions." };
+            }
+        } else {
+             selectOptions = JSON.stringify([]);
+        }
+    } else {
+        selectOptions = null;
+    }
+  }
 
   try {
     const stmt = db.prepare(
-      "INSERT INTO database_columns (database_id, name, type, column_order, default_value, select_options) VALUES (?, ?, ?, ?, ?, ?)"
+      "INSERT INTO database_columns (database_id, name, type, column_order, default_value, select_options, linked_database_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
     );
-    const info = stmt.run(databaseId, trimmedName, type, columnOrder, defaultValue, selectOptions);
-    // Fetch the newly created column to return it
+    const info = stmt.run(databaseId, trimmedName, type, columnOrder, defaultValue, selectOptions, linkedDatabaseId);
     const newColumn = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(info.lastInsertRowid);
     return { success: true, column: newColumn };
   } catch (err) {
     console.error("Error adding column:", err.message);
      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        if (err.message.includes('database_id, name')) return { success: false, error: "Column name already exists for this database." };
-        if (err.message.includes('database_id, column_order')) return { success: false, error: "Column order already exists for this database." };
+        if (err.message.includes('name')) return { success: false, error: "Column name already exists for this database." };
+        if (err.message.includes('column_order')) return { success: false, error: "Column order already exists for this database." };
     }
     return { success: false, error: "Failed to add column." };
   }
@@ -160,7 +190,7 @@ function addColumn({ databaseId, name, type, columnOrder, defaultValue = null, s
 function getColumnsForDatabase(databaseId) {
   const db = getDb();
   try {
-    const stmt = db.prepare("SELECT * FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
+    const stmt = db.prepare("SELECT id, database_id, name, type, column_order, default_value, select_options, linked_database_id FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
     return stmt.all(databaseId);
   } catch (err) {
     console.error(`Error getting columns for database ${databaseId}:`, err.message);
@@ -170,8 +200,7 @@ function getColumnsForDatabase(databaseId) {
 
 /**
  * Updates an existing column.
- * @param {object} args - { columnId, name?, type?, columnOrder?, defaultValue?, selectOptions? }
- *                        Only provided fields will be updated.
+ * @param {object} args - { columnId, name?, type?, columnOrder?, defaultValue?, selectOptions?, linkedDatabaseId? }
  * @returns {object} - { success: boolean, error?: string }
  */
 function updateColumn(args) {
@@ -182,84 +211,149 @@ function updateColumn(args) {
     return { success: false, error: "No update data provided." };
   }
 
-  const fields = [];
-  const values = [];
+  const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
+  if (!currentCol) {
+    return { success: false, error: "Column not found." };
+  }
 
+  const fieldsToSet = new Map(); // Use a map to ensure each field is set only once
+
+  // Determine final type early
+  const finalType = updateData.type !== undefined ? updateData.type : currentCol.type;
+
+  // Name
   if (updateData.name !== undefined) {
     const trimmedName = updateData.name ? updateData.name.trim() : "";
     if (!trimmedName) return { success: false, error: "Column name cannot be empty." };
-    fields.push("name = ?");
-    values.push(trimmedName);
+    fieldsToSet.set("name", trimmedName);
   }
+
+  // Type and its consequences
+  let mustClearLinks = false;
   if (updateData.type !== undefined) {
     if (!ALLOWED_COLUMN_TYPES.includes(updateData.type)) {
-      return { success: false, error: `Invalid column type. Allowed types: ${ALLOWED_COLUMN_TYPES.join(', ')}` };
+      return { success: false, error: `Invalid column type: ${updateData.type}` };
     }
-    fields.push("type = ?");
-    values.push(updateData.type);
-     // If type is changed, ensure selectOptions are appropriate or cleared
-    if (updateData.type !== 'SELECT' && updateData.type !== 'MULTI_SELECT' && updateData.selectOptions === undefined) {
-        fields.push("select_options = ?");
-        values.push(null);
+    fieldsToSet.set("type", updateData.type);
+
+    if (currentCol.type === 'RELATION' && updateData.type !== 'RELATION') {
+      mustClearLinks = true;
+      fieldsToSet.set("linked_database_id", null);
+    }
+    if (updateData.type === 'RELATION') {
+      const newLinkedDbId = updateData.linkedDatabaseId !== undefined ? updateData.linkedDatabaseId : currentCol.linked_database_id;
+      if (newLinkedDbId === null || newLinkedDbId === undefined) {
+        return { success: false, error: "linkedDatabaseId is required when type is RELATION." };
+      }
+      const targetDb = getDatabaseById(newLinkedDbId);
+      if (!targetDb) return { success: false, error: `Linked database ID ${newLinkedDbId} not found.` };
+
+      fieldsToSet.set("linked_database_id", newLinkedDbId);
+      if (currentCol.type === 'RELATION' && currentCol.linked_database_id !== newLinkedDbId) {
+          mustClearLinks = true;
+      }
+      fieldsToSet.set("select_options", null);
+      fieldsToSet.set("default_value", null);
+    } else if (updateData.type === 'SELECT' || updateData.type === 'MULTI_SELECT') {
+      fieldsToSet.set("linked_database_id", null);
+      // selectOptions handled below if explicitly provided, or if type changes to this
+    } else { // TEXT, NUMBER, DATE, BOOLEAN
+      fieldsToSet.set("select_options", null);
+      fieldsToSet.set("linked_database_id", null);
     }
   }
+
+  // linkedDatabaseId (if type is not changing, or type is already RELATION)
+  if (updateData.linkedDatabaseId !== undefined && finalType === 'RELATION') {
+    if (updateData.linkedDatabaseId === null) return { success: false, error: "linkedDatabaseId cannot be null for a RELATION column."};
+    const targetDb = getDatabaseById(updateData.linkedDatabaseId);
+    if (!targetDb) return { success: false, error: `Linked database ID ${updateData.linkedDatabaseId} not found.` };
+
+    if (currentCol.linked_database_id !== updateData.linkedDatabaseId) {
+        mustClearLinks = true;
+    }
+    fieldsToSet.set("linked_database_id", updateData.linkedDatabaseId);
+  }
+
+
+  // selectOptions (if type is not changing, or type is already SELECT/MULTI_SELECT)
+  if (updateData.selectOptions !== undefined) {
+    if (finalType === 'SELECT' || finalType === 'MULTI_SELECT') {
+        let newSelectOptions = updateData.selectOptions;
+        if (newSelectOptions === null) { // Allow explicitly setting to null (empty array)
+            newSelectOptions = JSON.stringify([]);
+        } else if (typeof newSelectOptions === 'string') {
+            try { JSON.parse(newSelectOptions); } catch (e) { return { success: false, error: "Invalid JSON for selectOptions." }; }
+        } else if (Array.isArray(newSelectOptions)) {
+            newSelectOptions = JSON.stringify(newSelectOptions);
+        } else {
+            return { success: false, error: "selectOptions must be a JSON string array or null."};
+        }
+        fieldsToSet.set("select_options", newSelectOptions);
+    }
+  } else if (updateData.type !== undefined && (updateData.type === 'SELECT' || updateData.type === 'MULTI_SELECT') && !fieldsToSet.has('select_options')) {
+    // If type is changing to SELECT/MULTI_SELECT and selectOptions was not provided, default to empty array
+    fieldsToSet.set("select_options", JSON.stringify([]));
+  }
+
+
+  // defaultValue (only if type is not RELATION)
+  if (updateData.defaultValue !== undefined && finalType !== 'RELATION') {
+    fieldsToSet.set("default_value", updateData.defaultValue);
+  } else if (finalType === 'RELATION' && !fieldsToSet.has('default_value')) {
+    // Ensure defaultValue is null if type is RELATION (might have been set by type change logic already)
+    fieldsToSet.set("default_value", null);
+  }
+
+
+  // columnOrder
   if (updateData.columnOrder !== undefined) {
     if (typeof updateData.columnOrder !== 'number') return { success: false, error: "Column order must be a number." };
-    fields.push("column_order = ?");
-    values.push(updateData.columnOrder);
-  }
-  if (updateData.defaultValue !== undefined) { // Allows setting defaultValue to null
-    fields.push("default_value = ?");
-    values.push(updateData.defaultValue);
-  }
-  if (updateData.selectOptions !== undefined) { // Allows setting selectOptions to null
-    if ((updateData.type === 'SELECT' || updateData.type === 'MULTI_SELECT' || (updateData.type === undefined && (args.type === 'SELECT' || args.type === 'MULTI_SELECT'))) && updateData.selectOptions) {
-        try {
-            let currentType = updateData.type;
-            if(!currentType) { // if type is not part of this update, fetch current type
-                const currentCol = db.prepare("SELECT type FROM database_columns WHERE id = ?").get(columnId);
-                if(currentCol) currentType = currentCol.type;
-            }
-            if(currentType === 'SELECT' || currentType === 'MULTI_SELECT') {
-                 if (typeof updateData.selectOptions === 'string') JSON.parse(updateData.selectOptions);
-                 else if (Array.isArray(updateData.selectOptions)) updateData.selectOptions = JSON.stringify(updateData.selectOptions);
-                 else return { success: false, error: "selectOptions must be a JSON string array for SELECT/MULTI_SELECT types."};
-            } else { // type is changing away from select/multi-select or was never one
-                updateData.selectOptions = null;
-            }
-        } catch (e) {
-            return { success: false, error: "Invalid JSON format for selectOptions." };
-        }
-    } else if (updateData.type !== 'SELECT' && updateData.type !== 'MULTI_SELECT') {
-        // if type is not SELECT/MULTI_SELECT, ensure selectOptions is null
-        updateData.selectOptions = null;
-    }
-    fields.push("select_options = ?");
-    values.push(updateData.selectOptions);
+    fieldsToSet.set("column_order", updateData.columnOrder);
   }
 
-
-  if (fields.length === 0) {
-    return { success: false, error: "No valid fields to update." };
+  if (fieldsToSet.size === 0) {
+    return { success: true, message: "No effective changes provided." };
   }
 
-  fields.push("updated_at = CURRENT_TIMESTAMP");
-  values.push(columnId);
+  const finalFieldsSql = [];
+  const finalValues = [];
+  fieldsToSet.forEach((value, key) => {
+    finalFieldsSql.push(`${key} = ?`);
+    finalValues.push(value);
+  });
 
-  try {
-    const stmt = db.prepare(`UPDATE database_columns SET ${fields.join(", ")} WHERE id = ?`);
-    const info = stmt.run(...values);
-    if (info.changes > 0) {
+  finalFieldsSql.push("updated_at = CURRENT_TIMESTAMP");
+  finalValues.push(columnId); // For WHERE id = ?
+
+  const runUpdate = () => {
+    const stmt = db.prepare(`UPDATE database_columns SET ${finalFieldsSql.join(", ")} WHERE id = ?`);
+    const info = stmt.run(...finalValues);
+    if (info.changes > 0 || mustClearLinks) { // If links were cleared, it's a success even if other fields didn't change
       return { success: true };
     }
-    return { success: false, error: "Column not found or data unchanged." };
+    return { success: false, error: "Column not found or data effectively unchanged." };
+  };
+
+  try {
+    if (mustClearLinks) {
+      const transaction = db.transaction(() => {
+        const deleteLinksStmt = db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?");
+        deleteLinksStmt.run(columnId);
+        console.log(`Cleared row links for column ID ${columnId} due to type/linked_id change.`);
+        return runUpdate();
+      });
+      return transaction();
+    } else {
+      return runUpdate();
+    }
   } catch (err) {
     console.error(`Error updating column ID ${columnId}:`, err.message);
     if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         if (err.message.includes('name')) return { success: false, error: "Column name already exists for this database." };
         if (err.message.includes('column_order')) return { success: false, error: "Column order already exists for this database." };
     }
-    return { success: false, error: "Failed to update column." };
+    return { success: false, error: "Failed to update column due to an unexpected error." };
   }
 }
 
@@ -270,11 +364,9 @@ function updateColumn(args) {
  */
 function deleteColumn(columnId) {
   const db = getDb();
+  // FOREIGN KEY constraint on database_row_links.source_column_id is ON DELETE CASCADE,
+  // so related links will be deleted automatically by SQLite.
   try {
-    // Note: This does not automatically delete corresponding database_row_values for this column.
-    // Depending on requirements, those might need to be cleaned up too, or handled by application logic.
-    // For now, we rely on potential FK constraints or allow orphaned values if schema allows.
-    // The schema has ON DELETE CASCADE for database_row_values.column_id, so values will be deleted.
     const stmt = db.prepare("DELETE FROM database_columns WHERE id = ?");
     const info = stmt.run(columnId);
     if (info.changes > 0) {

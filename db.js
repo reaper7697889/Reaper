@@ -135,13 +135,15 @@ function initializeDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         database_id INTEGER NOT NULL,
         name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT')),
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION')), -- Added 'RELATION'
         column_order INTEGER NOT NULL,
         default_value TEXT,
         select_options TEXT, -- JSON string array for SELECT/MULTI_SELECT, e.g., '["Opt1", "Opt2"]'
+        linked_database_id INTEGER, -- New column
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
+        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL, -- New FK
         UNIQUE (database_id, name),
         UNIQUE (database_id, column_order)
     );
@@ -195,6 +197,31 @@ function initializeDatabase() {
     FOR EACH ROW
     BEGIN
         UPDATE database_row_values SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  // Table for links between rows in different (or same) databases (for RELATION type columns)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_row_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_row_id INTEGER NOT NULL,
+        source_column_id INTEGER NOT NULL, -- The 'RELATION' type column in the source table
+        target_row_id INTEGER NOT NULL,    -- The row in the linked_database_id table
+        link_order INTEGER NOT NULL DEFAULT 0, -- For ordered multi-links if needed
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (source_row_id) REFERENCES database_rows(id) ON DELETE CASCADE,
+        FOREIGN KEY (source_column_id) REFERENCES database_columns(id) ON DELETE CASCADE,
+        FOREIGN KEY (target_row_id) REFERENCES database_rows(id) ON DELETE CASCADE,
+        UNIQUE (source_row_id, source_column_id, target_row_id)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_row_links_updated_at
+    AFTER UPDATE ON database_row_links
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_row_links SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
     END;
   `);
 

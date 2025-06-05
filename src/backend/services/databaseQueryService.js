@@ -14,13 +14,7 @@ const { getColumnsForDatabase } = require("./databaseDefService"); // To get col
 async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
   const db = getDb();
   try {
-    const columnDefsRaw = getColumnsForDatabase(databaseId); // from databaseDefService
-    if (!columnDefsRaw || columnDefsRaw.length === 0) {
-        // If no columns, perhaps no rows or an issue, but query for rows might still be valid if columns are optional.
-        // For now, let's assume a database meant to be queried should have columns.
-        console.warn(`No column definitions found for database ID ${databaseId}. Returning empty rows.`);
-        // return []; // Or proceed to query rows if that makes sense.
-    }
+    const columnDefsRaw = getColumnsForDatabase(databaseId);
     const columnDefinitions = columnDefsRaw.reduce((acc, col) => {
       acc[col.id] = col;
       return acc;
@@ -34,7 +28,7 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
             case 'TEXT': case 'DATE': case 'SELECT': case 'MULTI_SELECT': return 'value_text';
             case 'NUMBER': return 'value_number';
             case 'BOOLEAN': return 'value_boolean';
-            default: return null; // Should not happen if colDef.type is validated
+            default: return null;
         }
     }
 
@@ -46,99 +40,131 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
         continue;
       }
 
-      const valueField = getValueFieldName(colDef.type);
-      if (!valueField) {
-        console.warn(`Unsupported column type ${colDef.type} for filtering (value field mapping). Skipping filter.`);
-        continue;
-      }
-
-      if (filter.operator === 'IS_NULL') {
-        sql += ` AND NOT EXISTS (SELECT 1 FROM database_row_values drv_checknull WHERE drv_checknull.row_id = dr.id AND drv_checknull.column_id = ? AND drv_checknull.${valueField} IS NOT NULL)`;
-        params.push(filter.columnId);
-      } else if (filter.operator === 'IS_NOT_NULL') {
-        sql += ` AND EXISTS (SELECT 1 FROM database_row_values drv_checknotnull WHERE drv_checknotnull.row_id = dr.id AND drv_checknotnull.column_id = ? AND drv_checknotnull.${valueField} IS NOT NULL)`;
-        params.push(filter.columnId);
-      } else {
-        // For operators that require a value
-        sql += ` AND EXISTS (SELECT 1 FROM database_row_values drv WHERE drv.row_id = dr.id AND drv.column_id = ? `;
-        params.push(filter.columnId);
-
-        let valueForParam = filter.value;
-        let conditionAdded = false;
-
-        switch (colDef.type) {
-          case 'TEXT':
-          case 'DATE': // Dates are stored as text
-          case 'SELECT':
-            switch (filter.operator) {
-              case 'EQUALS': sql += `AND drv.value_text = ?`; params.push(valueForParam); conditionAdded = true; break;
-              case 'NOT_EQUALS': sql += `AND (drv.value_text IS NULL OR drv.value_text != ?)`; params.push(valueForParam); conditionAdded = true; break;
-              case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%${valueForParam}%`); conditionAdded = true; break;
+      if (colDef.type === 'RELATION') {
+        switch (filter.operator) {
+          case 'RELATION_CONTAINS_ANY':
+            if (!Array.isArray(filter.value) || filter.value.length === 0) {
+              console.warn(`RELATION_CONTAINS_ANY requires a non-empty array value. Filter skipped for columnId ${filter.columnId}.`);
+              sql += ` AND 1=0`; // No match if value is invalid
+              continue;
             }
+            const placeholders = filter.value.map(() => '?').join(',');
+            sql += ` AND EXISTS (SELECT 1 FROM database_row_links drl WHERE drl.source_row_id = dr.id AND drl.source_column_id = ? AND drl.target_row_id IN (${placeholders}))`;
+            params.push(filter.columnId, ...filter.value);
             break;
-          case 'NUMBER':
-            valueForParam = parseFloat(filter.value);
-            if (isNaN(valueForParam)) { console.warn(`Invalid number value for filter: ${filter.value}`); break; } // Skips this filter by not setting conditionAdded = true
-            switch (filter.operator) {
-              case 'EQUALS': sql += `AND drv.value_number = ?`; params.push(valueForParam); conditionAdded = true; break;
-              case 'NOT_EQUALS': sql += `AND (drv.value_number IS NULL OR drv.value_number != ?)`; params.push(valueForParam); conditionAdded = true; break;
-              case 'GREATER_THAN': sql += `AND drv.value_number > ?`; params.push(valueForParam); conditionAdded = true; break;
-              case 'LESS_THAN': sql += `AND drv.value_number < ?`; params.push(valueForParam); conditionAdded = true; break;
+          case 'RELATION_CONTAINS_ALL':
+            if (!Array.isArray(filter.value) || filter.value.length === 0) {
+              console.warn(`RELATION_CONTAINS_ALL requires a non-empty array value. Filter skipped for columnId ${filter.columnId}.`);
+              sql += ` AND 1=0`; // No match if value is invalid
+              continue;
             }
+            filter.value.forEach((targetRowId, index) => {
+              // Need unique alias for each EXISTS subquery if they were more complex, but simple structure is fine here.
+              sql += ` AND EXISTS (SELECT 1 FROM database_row_links drl_${index} WHERE drl_${index}.source_row_id = dr.id AND drl_${index}.source_column_id = ? AND drl_${index}.target_row_id = ?)`;
+              params.push(filter.columnId, targetRowId);
+            });
             break;
-          case 'BOOLEAN':
-            valueForParam = filter.value ? 1 : 0;
-            switch (filter.operator) {
-              case 'EQUALS': sql += `AND drv.value_boolean = ?`; params.push(valueForParam); conditionAdded = true; break;
-            }
+          case 'RELATION_IS_EMPTY':
+            sql += ` AND NOT EXISTS (SELECT 1 FROM database_row_links drl WHERE drl.source_row_id = dr.id AND drl.source_column_id = ?)`;
+            params.push(filter.columnId);
             break;
-          case 'MULTI_SELECT': // Stored as JSON string array
-            switch (filter.operator) {
-              case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%"${valueForParam}"%`); conditionAdded = true; break;
-            }
+          case 'RELATION_IS_NOT_EMPTY':
+            sql += ` AND EXISTS (SELECT 1 FROM database_row_links drl WHERE drl.source_row_id = dr.id AND drl.source_column_id = ?)`;
+            params.push(filter.columnId);
             break;
+          default:
+            console.warn(`Unsupported operator "${filter.operator}" for RELATION type columnId ${filter.columnId}. Filter skipped.`);
+            sql += ` AND 1=0`; // Effectively skip filter
+        }
+      } else { // Logic for non-RELATION type columns
+        const valueField = getValueFieldName(colDef.type);
+        if (!valueField) {
+          console.warn(`Unsupported column type ${colDef.type} for filtering (value field mapping). Skipping filter.`);
+          continue;
         }
 
-        if (conditionAdded) {
-            sql += `)`; // Close the specific condition part of EXISTS
+        if (filter.operator === 'IS_NULL') {
+          sql += ` AND NOT EXISTS (SELECT 1 FROM database_row_values drv_checknull WHERE drv_checknull.row_id = dr.id AND drv_checknull.column_id = ? AND drv_checknull.${valueField} IS NOT NULL)`;
+          params.push(filter.columnId);
+        } else if (filter.operator === 'IS_NOT_NULL') {
+          sql += ` AND EXISTS (SELECT 1 FROM database_row_values drv_checknotnull WHERE drv_checknotnull.row_id = dr.id AND drv_checknotnull.column_id = ? AND drv_checknotnull.${valueField} IS NOT NULL)`;
+          params.push(filter.columnId);
         } else {
-            // Operator or type was unsupported for value-based filters, or value was invalid (e.g., NaN for number)
-            sql += `AND 1=0)`; // Make the EXISTS clause false to effectively skip this filter
+          sql += ` AND EXISTS (SELECT 1 FROM database_row_values drv WHERE drv.row_id = dr.id AND drv.column_id = ? `;
+          params.push(filter.columnId);
+
+          let valueForParam = filter.value;
+          let conditionAdded = false;
+
+          switch (colDef.type) {
+            case 'TEXT': case 'DATE': case 'SELECT':
+              switch (filter.operator) {
+                case 'EQUALS': sql += `AND drv.value_text = ?`; params.push(valueForParam); conditionAdded = true; break;
+                case 'NOT_EQUALS': sql += `AND (drv.value_text IS NULL OR drv.value_text != ?)`; params.push(valueForParam); conditionAdded = true; break;
+                case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%${valueForParam}%`); conditionAdded = true; break;
+              }
+              break;
+            case 'NUMBER':
+              valueForParam = parseFloat(filter.value);
+              if (isNaN(valueForParam)) { console.warn(`Invalid number value for filter: ${filter.value}`); break; }
+              switch (filter.operator) {
+                case 'EQUALS': sql += `AND drv.value_number = ?`; params.push(valueForParam); conditionAdded = true; break;
+                case 'NOT_EQUALS': sql += `AND (drv.value_number IS NULL OR drv.value_number != ?)`; params.push(valueForParam); conditionAdded = true; break;
+                case 'GREATER_THAN': sql += `AND drv.value_number > ?`; params.push(valueForParam); conditionAdded = true; break;
+                case 'LESS_THAN': sql += `AND drv.value_number < ?`; params.push(valueForParam); conditionAdded = true; break;
+              }
+              break;
+            case 'BOOLEAN':
+              valueForParam = filter.value ? 1 : 0;
+              switch (filter.operator) {
+                case 'EQUALS': sql += `AND drv.value_boolean = ?`; params.push(valueForParam); conditionAdded = true; break;
+              }
+              break;
+            case 'MULTI_SELECT':
+              switch (filter.operator) {
+                case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%"${valueForParam}"%`); conditionAdded = true; break;
+              }
+              break;
+          }
+
+          if (conditionAdded) {
+            sql += `)`;
+          } else {
+            sql += `AND 1=0)`;
             console.warn(`Unsupported operator "${filter.operator}" for type "${colDef.type}" or invalid value, for columnId ${filter.columnId}. Filter skipped.`);
+          }
         }
       }
     }
 
-    // Apply Sorting (Simplified: only ONE sort criteria)
+    // Apply Sorting
+    let sortApplied = false;
     if (sorts && sorts.length > 0) {
       const sort = sorts[0];
       const sortColDef = columnDefinitions[sort.columnId];
       if (sortColDef) {
-        // Add LEFT JOIN for the sorting column's values
-        // Alias is important to not conflict with potential filter joins on same table if we were to expand.
-        sql += ` LEFT JOIN database_row_values sort_drv ON dr.id = sort_drv.row_id AND sort_drv.column_id = ?`;
-        params.push(sort.columnId);
-
-        let sortField = "";
-        switch (sortColDef.type) {
-          case 'TEXT': case 'DATE': case 'SELECT': case 'MULTI_SELECT': sortField = "sort_drv.value_text"; break;
-          case 'NUMBER': sortField = "sort_drv.value_number"; break;
-          case 'BOOLEAN': sortField = "sort_drv.value_boolean"; break;
-          default: console.warn(`Unsupported column type ${sortColDef.type} for sorting. Sorting may be ineffective.`); break;
-        }
-
-        if (sortField) {
+        if (sortColDef.type === 'RELATION') {
+          console.warn(`Sorting by RELATION column type (columnId ${sort.columnId}) is not currently supported. Using default sort.`);
+        } else {
+          sql += ` LEFT JOIN database_row_values sort_drv ON dr.id = sort_drv.row_id AND sort_drv.column_id = ?`;
+          params.push(sort.columnId);
+          const sortField = getValueFieldName(sortColDef.type);
+          if (sortField) {
             const direction = sort.direction === 'DESC' ? 'DESC' : 'ASC';
-            sql += ` ORDER BY ${sortField} ${direction} NULLS LAST`; // NULLS LAST is a good default
+            sql += ` ORDER BY ${sortField} ${direction} NULLS LAST`;
+            sortApplied = true;
+          } else {
+            console.warn(`Unsupported column type ${sortColDef.type} for sorting. Using default sort.`);
+          }
         }
       } else {
-          console.warn(`Sort references unknown columnId ${sort.columnId}. Skipping sort.`);
+        console.warn(`Sort references unknown columnId ${sort.columnId}. Using default sort.`);
       }
-    } else {
-        // Default sort by row_order if available, then by ID, if no other sort specified
-        sql += ` ORDER BY dr.row_order ASC NULLS LAST, dr.id ASC`;
     }
 
+    if (!sortApplied) {
+      sql += ` ORDER BY dr.row_order ASC NULLS LAST, dr.id ASC`;
+    }
 
     // Execute Query for Row IDs
     const rowIdResults = db.prepare(sql).all(...params);
