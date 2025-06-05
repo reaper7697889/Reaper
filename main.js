@@ -15,7 +15,8 @@ const workspaceService = require("./src/backend/services/workspaceService");
 const graphService = require("./src/backend/services/graphService");
 const databaseDefService = require("./src/backend/services/databaseDefService");
 const databaseRowService = require("./src/backend/services/databaseRowService");
-const databaseQueryService = require("./src/backend/services/databaseQueryService"); // Added databaseQueryService
+const databaseQueryService = require("./src/backend/services/databaseQueryService");
+const smartRuleService = require("./src/backend/services/smartRuleService"); // Added smartRuleService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -111,6 +112,13 @@ ipcMain.handle("dbrow:deleteRow", (e, id) => databaseRowService.deleteRow(id));
 
 // Database Query Service
 ipcMain.handle("dbquery:getRowsForDatabase", (e, databaseId, options) => databaseQueryService.getRowsForDatabase(databaseId, options));
+
+// Smart Rule Service
+ipcMain.handle("rules:createRule", (e, args) => smartRuleService.createRule(args));
+ipcMain.handle("rules:getRuleById", (e, id) => smartRuleService.getRuleById(id));
+ipcMain.handle("rules:getRulesForDatabase", (e, dbId, options) => smartRuleService.getRulesForDatabase(dbId, options));
+ipcMain.handle("rules:updateRule", (e, id, updates) => smartRuleService.updateRule(id, updates));
+ipcMain.handle("rules:deleteRule", (e, id) => smartRuleService.deleteRule(id));
 
 // --- App Lifecycle ---
 

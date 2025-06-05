@@ -243,6 +243,33 @@ function initializeDatabase() {
     END;
   `);
 
+  // --- Smart Rules Table ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS smart_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        target_database_id INTEGER NOT NULL,
+        trigger_type TEXT NOT NULL CHECK(trigger_type IN ('ON_ROW_UPDATE')),
+        trigger_config TEXT, -- JSON: e.g., { "watched_column_ids": ["id1", "id2"] or null }
+        condition_formula TEXT, -- Formula string, evaluates to boolean
+        action_type TEXT NOT NULL CHECK(action_type IN ('UPDATE_SAME_ROW')),
+        action_config TEXT NOT NULL, -- JSON: e.g., { "set_values": { "col_id1": "value", "col_id2": "NOW()" } }
+        is_enabled BOOLEAN NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (target_database_id) REFERENCES note_databases(id) ON DELETE CASCADE
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_smart_rules_updated_at
+    AFTER UPDATE ON smart_rules
+    FOR EACH ROW
+    BEGIN
+        UPDATE smart_rules SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
   // --- Block-Based Workspace Specific Tables ---
   // Blocks (for Notion-style pages)
   db.exec(`
