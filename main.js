@@ -94,6 +94,42 @@ ipcMain.handle("db:deleteTask", (e, taskId) => taskService.deleteTask(taskId));
 ipcMain.handle("db:getTasksForNote", (e, noteId) => taskService.getTasksForNote(noteId));
 ipcMain.handle("db:getTasksForBlock", (e, blockId) => taskService.getTasksForBlock(blockId));
 
+ipcMain.handle("tasks:addTaskDependency", async (event, taskId, dependsOnTaskId) => {
+    try {
+        return await taskService.addTaskDependency(taskId, dependsOnTaskId);
+    } catch (error) {
+        console.error("Error in 'tasks:addTaskDependency' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to add task dependency." };
+    }
+});
+
+ipcMain.handle("tasks:removeTaskDependency", async (event, taskId, dependsOnTaskId) => {
+    try {
+        return await taskService.removeTaskDependency(taskId, dependsOnTaskId);
+    } catch (error) {
+        console.error("Error in 'tasks:removeTaskDependency' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to remove task dependency." };
+    }
+});
+
+ipcMain.handle("tasks:getTaskPrerequisites", async (event, taskId) => {
+    try {
+        return await taskService.getTaskPrerequisites(taskId);
+    } catch (error) {
+        console.error("Error in 'tasks:getTaskPrerequisites' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to get task prerequisites." };
+    }
+});
+
+ipcMain.handle("tasks:getTasksBlockedBy", async (event, taskId) => {
+    try {
+        return await taskService.getTasksBlockedBy(taskId);
+    } catch (error) {
+        console.error("Error in 'tasks:getTasksBlockedBy' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to get tasks blocked by." };
+    }
+});
+
 // Graph Service
 ipcMain.handle("graph:getGraphData", async () => {
   return graphService.getGraphData();

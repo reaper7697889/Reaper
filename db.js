@@ -94,6 +94,21 @@ function initializeDatabase() {
   db.exec(`CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, file_path TEXT NOT NULL, mime_type TEXT, original_filename TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, description TEXT NOT NULL, is_completed BOOLEAN DEFAULT 0, due_date DATETIME, reminder_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_task_timestamp AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
+  // Task Dependencies Table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_dependencies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL, -- The task that is dependent/blocked
+        depends_on_task_id INTEGER NOT NULL, -- The task it depends on (the blocker)
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (depends_on_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        UNIQUE (task_id, depends_on_task_id),
+        CHECK (task_id != depends_on_task_id) -- Prevent a task from depending on itself
+    );
+  `);
+
   db.exec(`CREATE TABLE IF NOT EXISTS note_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER NOT NULL, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
 
   // --- Placeholder Tables for Future Features ---
