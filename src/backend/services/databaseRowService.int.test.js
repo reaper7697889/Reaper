@@ -207,4 +207,125 @@ describe('Database Row Service Integration Tests', () => {
             expect(result.error).toContain('lacks admin permission');
         });
     });
+
+    describe('Validation in addRow and updateRow', () => {
+        let col_text_required_id, col_email_id, col_number_min_max_id, col_text_unique_id;
+
+        beforeEach(async () => {
+            // db1Id is already created and owned by ownerUser
+            const requiredRule = [{ type: 'not_empty', message: 'Name is required.' }];
+            const emailRule = [{ type: 'is_email', message: 'Invalid email.' }];
+            const numberRules = [{ type: 'min_value', value: 10, message: 'Min 10.' }, { type: 'max_value', value: 100, message: 'Max 100.' }];
+            const uniqueRule = [{ type: 'unique', message: 'Must be unique.' }];
+
+            col_text_required_id = (await databaseDefService.addColumn({ databaseId: db1Id, name: 'Name', type: 'TEXT', columnOrder: 2, validation_rules: requiredRule }, ownerUser.id)).column.id;
+            col_email_id = (await databaseDefService.addColumn({ databaseId: db1Id, name: 'Email', type: 'TEXT', columnOrder: 3, validation_rules: emailRule }, ownerUser.id)).column.id;
+            col_number_min_max_id = (await databaseDefService.addColumn({ databaseId: db1Id, name: 'Age', type: 'NUMBER', columnOrder: 4, validation_rules: numberRules }, ownerUser.id)).column.id;
+            col_text_unique_id = (await databaseDefService.addColumn({ databaseId: db1Id, name: 'UniqueCode', type: 'TEXT', columnOrder: 5, validation_rules: uniqueRule }, ownerUser.id)).column.id;
+        });
+
+        describe('addRow Validation', () => {
+            it('should add row with valid data', async () => {
+                const values = {
+                    [col_text_required_id]: 'Valid Name',
+                    [col_email_id]: 'test@example.com',
+                    [col_number_min_max_id]: 50,
+                    [col_text_unique_id]: 'unique1'
+                };
+                const result = await databaseRowService.addRow({ databaseId: db1Id, values, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(true);
+                expect(result.rowId).toBeGreaterThan(0);
+            });
+
+            it('should fail for single rule violation (not_empty)', async () => {
+                const values = { [col_text_required_id]: '' }; // Fails not_empty
+                const result = await databaseRowService.addRow({ databaseId: db1Id, values, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.error).toBe('Validation failed.');
+                expect(result.validationErrors.Name).toEqual(['Name is required.']);
+            });
+
+            it('should fail for multiple rule violations on same field (e.g. min_length & regex)', async () => {
+                // Setup a column with multiple rules that can both fail
+                const multiRule = [
+                    { type: 'min_length', value: 10, message: 'Min 10 chars.'},
+                    { type: 'regex', value: '^[a-zA-Z]+$', message: 'Only letters.'}
+                ];
+                const col_multi_id = (await databaseDefService.addColumn({ databaseId: db1Id, name: 'MultiRuleCol', type: 'TEXT', columnOrder: 6, validation_rules: multiRule }, ownerUser.id)).column.id;
+
+                const values = { [col_multi_id]: 'short123' }; // Fails both rules
+                const result = await databaseRowService.addRow({ databaseId: db1Id, values, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.validationErrors.MultiRuleCol).toContain('Min 10 chars.');
+                expect(result.validationErrors.MultiRuleCol).toContain('Only letters.');
+            });
+
+
+            it('should fail with violations on multiple fields', async () => {
+                const values = {
+                    [col_text_required_id]: '', // Fails not_empty
+                    [col_number_min_max_id]: 5 // Fails min_value
+                };
+                const result = await databaseRowService.addRow({ databaseId: db1Id, values, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.validationErrors.Name).toEqual(['Name is required.']);
+                expect(result.validationErrors.Age).toEqual(['Min 10.']);
+            });
+
+            it('should fail for unique constraint violation on add', async () => {
+                const initialValues = { [col_text_unique_id]: 'unique_val' };
+                await databaseRowService.addRow({ databaseId: db1Id, values: initialValues, requestingUserId: ownerUser.id });
+
+                const duplicateValues = { [col_text_unique_id]: 'unique_val' };
+                const result = await databaseRowService.addRow({ databaseId: db1Id, values: duplicateValues, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.validationErrors.UniqueCode).toEqual(['Must be unique.']);
+            });
+        });
+
+        describe('updateRow Validation', () => {
+            let rowIdToUpdate;
+            beforeEach(async () => {
+                const initialValues = {
+                    [col_text_required_id]: 'Initial Name',
+                    [col_email_id]: 'initial@example.com',
+                    [col_number_min_max_id]: 20,
+                    [col_text_unique_id]: 'initialUnique'
+                };
+                rowIdToUpdate = (await databaseRowService.addRow({ databaseId: db1Id, values: initialValues, requestingUserId: ownerUser.id })).rowId;
+            });
+
+            it('should update row with valid data', async () => {
+                const result = await databaseRowService.updateRow({ rowId: rowIdToUpdate, values: { [col_text_required_id]: 'Updated Name' }, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(true);
+            });
+
+            it('should fail update for single rule violation (is_email)', async () => {
+                const result = await databaseRowService.updateRow({ rowId: rowIdToUpdate, values: { [col_email_id]: 'not-an-email' }, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.validationErrors.Email).toEqual(['Invalid email.']);
+            });
+
+            it('should fail update for unique constraint violation', async () => {
+                // Add another row to create a value to clash with
+                const otherValues = { [col_text_unique_id]: 'existing_unique_value' };
+                await databaseRowService.addRow({ databaseId: db1Id, values: otherValues, requestingUserId: ownerUser.id });
+
+                // Attempt to update original row to this existing unique value
+                const result = await databaseRowService.updateRow({ rowId: rowIdToUpdate, values: { [col_text_unique_id]: 'existing_unique_value' }, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(false);
+                expect(result.validationErrors.UniqueCode).toEqual(['Must be unique.']);
+            });
+
+            it('should pass update if unique value is unchanged for the current row', async () => {
+                 const result = await databaseRowService.updateRow({ rowId: rowIdToUpdate, values: { [col_text_unique_id]: 'initialUnique' }, requestingUserId: ownerUser.id });
+                 expect(result.success).toBe(true); // No actual change, but validation passes
+            });
+
+            it('should pass update if changing to a new unique value', async () => {
+                const result = await databaseRowService.updateRow({ rowId: rowIdToUpdate, values: { [col_text_unique_id]: 'newUniqueForUpdate' }, requestingUserId: ownerUser.id });
+                expect(result.success).toBe(true);
+            });
+        });
+    });
 });

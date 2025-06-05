@@ -1,7 +1,8 @@
 // src/backend/services/databaseRowService.js
 const { getDb } = require("../db");
 const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
-const permissionService = require('./permissionService'); // Added
+const permissionService = require('./permissionService');
+const { validateFieldValue } = require('../services/validationService'); // Added
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');
 const smartRuleService = require('./smartRuleService');
@@ -103,14 +104,31 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
   // Check 'write' permission on the parent database
   await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow", 'write');
 
-  const columnDefsArray = await databaseDefService.getColumnsForDatabase(databaseId, null); // Get all columns for internal logic
+  const columnDefsArray = await databaseDefService.getColumnsForDatabase(databaseId, null);
   if (!columnDefsArray) throw new Error(`Could not retrieve column definitions for database ${databaseId}`);
   const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
+  // --- Validation Step ---
+  const validationErrors = {};
+  for (const [columnIdStr, fieldValue] of Object.entries(values)) {
+    const columnId = parseInt(columnIdStr, 10);
+    const colDef = columnDefsMap[columnId];
+    if (colDef && colDef.validation_rules && colDef.validation_rules.length > 0) {
+      // Pass `db` instance for 'unique' checks. `allRowData` is `values` for addRow context.
+      const errors = validateFieldValue(fieldValue, colDef.validation_rules, colDef, values, db);
+      if (errors.length > 0) {
+        validationErrors[colDef.name || columnIdStr] = errors;
+      }
+    }
+  }
+
+  if (Object.keys(validationErrors).length > 0) {
+    return { success: false, error: "Validation failed.", validationErrors };
+  }
+  // --- End Validation Step ---
+
   let newRowIdValue;
 
-  // IMPORTANT: database_rows table itself does not have a user_id column.
-  // Ownership is derived from the parent note_databases table.
   const transaction = db.transaction(() => {
     const rowStmt = db.prepare("INSERT INTO database_rows (database_id, row_order, recurrence_rule) VALUES (?, ?, ?)");
     const rowInfo = rowStmt.run(databaseId, rowOrder, recurrence_rule);
@@ -175,6 +193,9 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
     }
     return { success: false, error: "Row creation failed or newRowIdValue was not obtained." };
   } catch (err) {
+    if (err.isValidationError) { // Check for our custom validation error
+        return { success: false, error: "Validation failed.", validationErrors: err.validationErrors };
+    }
     console.error(`Error adding row to DB ${databaseId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to add row." };
   }
@@ -366,34 +387,65 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
     return { success: false, error: "Max trigger depth exceeded." };
   }
 
-  const transaction = db.transaction(async () => {
-    const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
-    if (!currentRowMeta) throw new Error("Row not found.");
+  // Fetch metadata and column definitions outside transaction for validation
+  const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
+  if (!currentRowMeta) {
+      // Throw an error that will be caught by the outer try/catch, or return structured error
+      // For consistency with how other errors are returned from this function:
+      return { success: false, error: "Row not found for update." };
+  }
 
-    // Check 'write' permission on parent DB OR explicit 'write' on the row
-    let canWriteParentDb = false;
-    try {
-        await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow", 'write');
-        canWriteParentDb = true;
-    } catch (dbAccessError) {
-        console.warn(`User ${requestingUserId} does not have write access to parent DB ${currentRowMeta.database_id} for row ${rowId}. Checking explicit row permission.`);
-    }
+  // Perform permission checks first
+  let canWriteParentDb = false;
+  try {
+      await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow", 'write');
+      canWriteParentDb = true;
+  } catch (dbAccessError) {
+      console.warn(`User ${requestingUserId} does not have write access to parent DB ${currentRowMeta.database_id} for row ${rowId}. Checking explicit row permission.`);
+  }
+  let hasExplicitRowWrite = false;
+  if (requestingUserId !== null) {
+      hasExplicitRowWrite = await permissionService.checkPermission(requestingUserId, 'database_row', rowId, 'write');
+  }
+  if (requestingUserId !== null && !canWriteParentDb && !hasExplicitRowWrite) {
+      return { success: false, error: `Authorization failed for updateRow: User ${requestingUserId} lacks write permission on DB ${currentRowMeta.database_id} and on row ${rowId}.`};
+  }
 
-    let hasExplicitRowWrite = false;
-    if (requestingUserId !== null) {
-        hasExplicitRowWrite = await permissionService.checkPermission(requestingUserId, 'database_row', rowId, 'write');
-    }
+  const columnDefsArray = await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null);
+  if (!columnDefsArray) {
+      // This should ideally not happen if DB access was confirmed
+      return { success: false, error: `Could not retrieve column definitions for database ${currentRowMeta.database_id}` };
+  }
+  const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
-    if (requestingUserId !== null && !canWriteParentDb && !hasExplicitRowWrite) {
-        throw new Error(`Authorization failed for updateRow: User ${requestingUserId} lacks write permission on DB ${currentRowMeta.database_id} and on row ${rowId}.`);
-    }
-    // If requestingUserId is null (system), it's allowed if DB check passed (which it would have if not erroring)
+  // --- Validation Step ---
+  const validationErrors = {};
+  for (const [columnIdStr, fieldValue] of Object.entries(values)) {
+      const columnId = parseInt(columnIdStr, 10);
+      const colDef = columnDefsMap[columnId];
+      if (colDef && colDef.validation_rules && colDef.validation_rules.length > 0) {
+          const errors = validateFieldValue(fieldValue, colDef.validation_rules, colDef, { id: rowId }, db);
+          if (errors.length > 0) {
+              validationErrors[colDef.name || columnIdStr] = errors;
+          }
+      }
+  }
+  if (Object.keys(validationErrors).length > 0) {
+      return { success: false, error: "Validation failed.", validationErrors };
+  }
+  // --- End Validation Step ---
 
-    const oldStoredValues = await _getStoredRowData(rowId, db);
-    if (oldStoredValues === null) throw new Error("Could not retrieve current stored values for history.");
-
-    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null)) // Use null to get all columns for processing
-        .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+  const transaction = db.transaction(() => {
+    // Re-fetch inside transaction if necessary or trust data if validation passed.
+    // For this structure, assuming validation has passed and we proceed.
+    const oldStoredValues = _getStoredRowData(rowId, db); // Made sync for transaction; _getStoredRowData needs to be sync or split.
+                                                        // This is a problem: _getStoredRowData is async due to getColumnsForDatabase.
+                                                        // For simplicity, let's assume we get a snapshot of old values *before* this transaction for history.
+                                                        // This means history might not be perfectly transactional with the update if it relies on async calls.
+                                                        // A better approach would be manual transaction management (BEGIN, COMMIT, ROLLBACK).
+                                                        // Given the constraint of using db.transaction(), we'll make a note of this limitation.
+                                                        // For now, we'll proceed as if oldStoredValues can be fetched or is passed.
+                                                        // Let's assume `oldStoredValues` is fetched before this sync transaction for history.
 
     const valueUpdateStmt = db.prepare("REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean) VALUES (?, ?, ?, ?, ?)");
     const linkDeleteStmt = db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?");
@@ -462,8 +514,84 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
   });
 
   try {
-    return await transaction(); // Ensure async operations within transaction are awaited
+    // Fetch old stored values *before* the synchronous transaction for history purposes
+    const oldStoredValuesForHistory = await _getStoredRowData(rowId, db);
+    if (oldStoredValuesForHistory === null && _triggerDepth === 0) { // Only critical if history needs to be recorded
+        // This means row doesn't exist or cannot get its data, which should have been caught earlier by permission/existence checks.
+        // However, if we reach here, it's an inconsistency.
+        console.warn(`Could not retrieve current stored values for history for row ${rowId} prior to update transaction.`);
+        // Depending on strictness, could throw or proceed without perfect history.
+    }
+
+    const result = db.transaction(() => { // Keep transaction synchronous
+        // ... (synchronous database update logic as before) ...
+        // The loop for Object.entries(values) and DB updates must be synchronous.
+        // SmartRules and History are problematic if they need async operations within this sync transaction.
+
+        let changedNonComputed = false;
+        for (const [columnIdStr, rawValue] of Object.entries(values)) {
+            const columnId = parseInt(columnIdStr, 10);
+            const colDef = columnDefsMap[columnId]; // Already fetched
+            if (!colDef) throw new Error(`Column ID ${columnId} not found in DB ${currentRowMeta.database_id}. Should have been caught by validation.`);
+            if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) continue;
+
+            if (colDef.type === 'RELATION') {
+                // ... (sync relation update logic) ...
+                db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?").run(rowId, columnId);
+                if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES' && oldStoredValuesForHistory && oldStoredValuesForHistory[columnId]) {
+                    const oldLinkedTargetIds = oldStoredValuesForHistory[columnId] || [];
+                     for(const oldTargetId of oldLinkedTargetIds){
+                        db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? AND target_row_id = ?")
+                          .run(oldTargetId, colDef.inverse_column_id, rowId);
+                    }
+                }
+                if (Array.isArray(rawValue)) {
+                    rawValue.forEach((targetRowId, index) => {
+                        db.prepare("INSERT INTO database_row_links (source_row_id, source_column_id, target_row_id, link_order) VALUES (?, ?, ?, ?)")
+                          .run(rowId, columnId, targetRowId, index);
+                        if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
+                           db.prepare("INSERT INTO database_row_links (source_row_id, source_column_id, target_row_id, link_order) VALUES (?, ?, ?, ?)")
+                             .run(targetRowId, colDef.inverse_column_id, rowId, 0);
+                        }
+                    });
+                }
+                changedNonComputed = true;
+            } else {
+                if (rawValue !== undefined) {
+                    const preparedValues = _prepareValueForStorage(colDef.type, rawValue);
+                    db.prepare("REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean) VALUES (?, ?, ?, ?, ?)")
+                      .run(rowId, columnId, preparedValues.value_text, preparedValues.value_number, preparedValues.value_boolean);
+                    changedNonComputed = true;
+                }
+            }
+        }
+        if (recurrence_rule !== undefined) {
+            db.prepare("UPDATE database_rows SET recurrence_rule = ? WHERE id = ?").run(recurrence_rule, rowId);
+            changedNonComputed = true;
+        }
+        if (changedNonComputed) {
+            db.prepare("UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(rowId);
+        }
+        return { success: true, changedNonComputed }; // Indicate if any direct value changed
+    })();
+
+    // Post-transaction async operations (History, Smart Rules)
+    if (result.success && _triggerDepth === 0) {
+        const newStoredValues = await _getStoredRowData(rowId, db); // Fetch fresh data after sync updates
+        const oldRowValuesJson = JSON.stringify(oldStoredValuesForHistory || {}); // Use pre-transaction snapshot
+        const newRowValuesJson = JSON.stringify(newStoredValues);
+        if (oldRowValuesJson !== newRowValuesJson) {
+            await recordRowHistory({rowId, oldRowValuesJson, newRowValuesJson, db});
+        }
+        await smartRuleService.runSmartRulesForRowChange(rowId, currentRowMeta.database_id, oldStoredValuesForHistory || {}, newStoredValues, db, _triggerDepth + 1, requestingUserId);
+    }
+    return result;
+
   } catch (err) {
+    // This will catch errors from pre-transaction async ops or if transaction itself throws an unhandled one.
+    if (err.isValidationError) {
+        return { success: false, error: "Validation failed.", validationErrors: err.validationErrors };
+    }
     console.error(`Error updating row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to update row." };
   }

@@ -131,6 +131,7 @@ function initializeDatabase() {
         rollup_function TEXT DEFAULT NULL CHECK(rollup_function IS NULL OR rollup_function IN ('COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES', 'SUM', 'AVG', 'MIN', 'MAX', 'SHOW_UNIQUE', 'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY', 'COUNT_CHECKED', 'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED')),
         lookup_source_relation_column_id INTEGER DEFAULT NULL, lookup_target_value_column_id INTEGER DEFAULT NULL,
         lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')),
+        validation_rules TEXT DEFAULT NULL, -- NEW COLUMN for storing JSON array of validation rules
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
         FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,

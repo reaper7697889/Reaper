@@ -34,6 +34,19 @@ function _validateTargetInverseColumn(targetColumnId, expectedTargetDbIdForColB,
     return targetCol;
 }
 
+function _parseValidationRules(rulesString) {
+    if (!rulesString) {
+        return []; // Or null, depending on preferred representation for "no rules"
+    }
+    try {
+        const parsed = JSON.parse(rulesString);
+        return Array.isArray(parsed) ? parsed : []; // Ensure it's an array
+    } catch (e) {
+        console.error("Failed to parse validation_rules JSON:", e.message, rulesString);
+        return [{ error: "parse_failed", original: rulesString }]; // Indicate error
+    }
+}
+
 function _validateRollupDefinition(rollupArgs, db, currentDatabaseId) { /* ... (as defined previously, unchanged) ... */
     const { rollup_source_relation_column_id, rollup_target_column_id, rollup_function } = rollupArgs;
     if (!rollup_source_relation_column_id) return "Rollup source relation column ID is required.";
@@ -285,7 +298,8 @@ async function addColumn(args, requestingUserId) { // Made async
     makeBidirectional = false, targetInverseColumnName, existingTargetInverseColumnId,
     formula_definition: origFormulaDefinition, formula_result_type: origFormulaResultType,
     rollup_source_relation_column_id: origRollupSrcRelId, rollup_target_column_id: origRollupTargetId, rollup_function: origRollupFunc,
-    lookup_source_relation_column_id: origLookupSrcRelId, lookup_target_value_column_id: origLookupTargetValId, lookup_multiple_behavior: origLookupMultiBehavior
+    lookup_source_relation_column_id: origLookupSrcRelId, lookup_target_value_column_id: origLookupTargetValId, lookup_multiple_behavior: origLookupMultiBehavior,
+    validation_rules: origValidationRules // Added
   } = args;
 
   const db = getDb();
@@ -317,8 +331,20 @@ async function addColumn(args, requestingUserId) { // Made async
       inverseColumnId: null, // Handled by bidirectional logic specifically
       formulaDefinition: origFormulaDefinition, formulaResultType: origFormulaResultType,
       rollupSourceRelId: origRollupSrcRelId, rollupTargetId: origRollupTargetId, rollupFunction: origRollupFunc,
-      lookupSourceRelId: origLookupSrcRelId, lookupTargetValId: origLookupTargetValId, lookupMultiBehavior: origLookupMultiBehavior
+      lookupSourceRelId: origLookupSrcRelId, lookupTargetValId: origLookupTargetValId, lookupMultiBehavior: origLookupMultiBehavior,
+      validationRules: null // Initialize
   };
+
+  if (origValidationRules !== undefined) {
+    if (!Array.isArray(origValidationRules)) {
+      return { success: false, error: "validation_rules must be an array." };
+    }
+    try {
+      finalValues.validationRules = JSON.stringify(origValidationRules);
+    } catch (e) {
+      return { success: false, error: "Failed to stringify validation_rules." };
+    }
+  }
 
   // Type-specific validation and field nullification/setup
   if (type === 'RELATION') {
@@ -358,8 +384,8 @@ async function addColumn(args, requestingUserId) { // Made async
   }
 
   const runTransaction = db.transaction(() => {
-    const colAStmt = db.prepare( `INSERT INTO database_columns ( database_id, name, type, column_order, default_value, select_options, linked_database_id, relation_target_entity_type, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)` );
-    const colAInfo = colAStmt.run( databaseId, trimmedName, type, columnOrder, finalValues.defaultValue, finalValues.selectOptions, finalValues.linkedDatabaseId, finalValues.relationTargetEntityType, finalValues.formulaDefinition, finalValues.formulaResultType, finalValues.rollupSourceRelId, finalValues.rollupTargetId, finalValues.rollupFunction, finalValues.lookupSourceRelId, finalValues.lookupTargetValId, finalValues.lookupMultiBehavior );
+    const colAStmt = db.prepare( `INSERT INTO database_columns ( database_id, name, type, column_order, default_value, select_options, linked_database_id, relation_target_entity_type, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, validation_rules ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)` );
+    const colAInfo = colAStmt.run( databaseId, trimmedName, type, columnOrder, finalValues.defaultValue, finalValues.selectOptions, finalValues.linkedDatabaseId, finalValues.relationTargetEntityType, finalValues.formulaDefinition, finalValues.formulaResultType, finalValues.rollupSourceRelId, finalValues.rollupTargetId, finalValues.rollupFunction, finalValues.lookupSourceRelId, finalValues.lookupTargetValId, finalValues.lookupMultiBehavior, finalValues.validationRules );
     const colAId = colAInfo.lastInsertRowid;
     if (!colAId) throw new Error("Failed to create primary column.");
 
@@ -377,7 +403,10 @@ async function addColumn(args, requestingUserId) { // Made async
 
   try {
     const colAId = runTransaction();
-    const finalColA = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(colAId);
+    let finalColA = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(colAId);
+    if (finalColA) {
+        finalColA.validation_rules = _parseValidationRules(finalColA.validation_rules);
+    }
     return { success: true, column: finalColA };
   } catch (err) {
     console.error(`Error adding column to DB ${databaseId} (user ${requestingUserId}):`, err.message, err.stack);
@@ -395,9 +424,12 @@ async function getColumnsForDatabase(databaseId, requestingUserId = null) { // M
   }
   // Read permission on parent DB (checked by getDatabaseById) implies permission to see its columns' definitions.
   try {
-    const stmt = db.prepare("SELECT *, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, relation_target_entity_type FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
-    // No need to map is_calendar here, it's a property of the database, not columns.
-    return stmt.all(databaseId);
+    const stmt = db.prepare("SELECT * FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
+    const columns = stmt.all(databaseId);
+    return columns.map(col => ({
+        ...col,
+        validation_rules: _parseValidationRules(col.validation_rules)
+    }));
   } catch (err) {
     console.error(`Error getting columns for database ${databaseId} (user ${requestingUserId}):`, err.message);
     return [];
@@ -441,17 +473,36 @@ async function updateColumn(args, requestingUserId) { // Made async
     if (updateData.name !== undefined) fieldsToSet.set("name", updateData.name.trim());
     if (updateData.columnOrder !== undefined) fieldsToSet.set("column_order", updateData.columnOrder);
 
+    // Validation Rules
+    if (updateData.hasOwnProperty('validation_rules')) { // Check explicitly for null vs undefined
+        if (updateData.validation_rules === null) {
+            fieldsToSet.set("validation_rules", null);
+        } else if (Array.isArray(updateData.validation_rules)) {
+            try {
+                fieldsToSet.set("validation_rules", JSON.stringify(updateData.validation_rules));
+            } catch (e) {
+                throw new Error("Failed to stringify validation_rules for update.");
+            }
+        } else {
+            throw new Error("validation_rules must be an array or null.");
+        }
+    }
+
     // Type change logic - if type changes, nullify all old type-specific fields first
     if (updateData.type !== undefined && updateData.type !== currentCol.type) {
       if (!ALLOWED_COLUMN_TYPES.includes(updateData.type)) throw new Error(`Invalid new type: ${updateData.type}`);
       fieldsToSet.set("type", updateData.type);
 
       // Nullify all potentially conflicting type-specific fields before setting new ones
+      // Note: validation_rules is handled above and will persist if not explicitly changed during type change.
+      // If type change should clear validation_rules, add it here. For now, it's preserved unless explicitly set to null.
       ["select_options", "linked_database_id", "relation_target_entity_type", "inverse_column_id",
        "formula_definition", "formula_result_type", "rollup_source_relation_column_id",
        "rollup_target_column_id", "rollup_function", "lookup_source_relation_column_id",
        "lookup_target_value_column_id", "lookup_multiple_behavior", "default_value"]
-      .forEach(key => fieldsToSet.set(key, null));
+      .forEach(key => {
+        if (!fieldsToSet.has(key)) fieldsToSet.set(key, null); // Only set to null if not already being updated by `updateData`
+      });
 
       if (currentCol.type === 'RELATION') {
         _clearInverseColumnLink(currentCol.inverse_column_id, db);
@@ -504,7 +555,10 @@ async function updateColumn(args, requestingUserId) { // Made async
     }
     if (mustClearRowLinksForRelationChange) db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
 
-    const updatedCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
+    let updatedCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
+    if (updatedCol) {
+        updatedCol.validation_rules = _parseValidationRules(updatedCol.validation_rules);
+    }
     return { success: true, column: updatedCol };
   });
 
