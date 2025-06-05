@@ -59,15 +59,27 @@ function getNoteById(id) {
  */
 function updateNote(id, updateData) {
   const db = getDb();
+  let oldTitle = null;
+  let newTitle = null;
+
+  // If title is part of the update, fetch the old title first
+  if (updateData.title) {
+    const currentNote = getNoteById(id);
+    if (!currentNote) {
+      console.error(`Error updating note ${id}: Note not found.`);
+      return false;
+    }
+    oldTitle = currentNote.title;
+    newTitle = updateData.title;
+  }
+
   const fields = [];
   const values = [];
 
   // Dynamically build the SET part of the query
   for (const [key, value] of Object.entries(updateData)) {
-    // Ensure only valid columns are updated (add more as needed)
     if (["title", "content", "folder_id", "workspace_id", "is_pinned", "is_archived"].includes(key)) {
       fields.push(`${key} = ?`);
-      // Handle boolean conversion for SQLite (0 or 1)
       values.push(typeof value === "boolean" ? (value ? 1 : 0) : value);
     }
   }
@@ -77,18 +89,46 @@ function updateNote(id, updateData) {
     return false;
   }
 
-  // Add updated_at manually since the trigger only works on actual UPDATE commands
-  // fields.push("updated_at = CURRENT_TIMESTAMP"); // Trigger handles this
+  // The updated_at field is handled by a trigger in the database schema (see migrations)
+  // fields.push("updated_at = CURRENT_TIMESTAMP");
 
-  const stmt = db.prepare(`UPDATE notes SET ${fields.join(", ")} WHERE id = ?`);
+  const updateQuery = `UPDATE notes SET ${fields.join(", ")} WHERE id = ?`;
+  const updateNoteStmt = db.prepare(updateQuery);
   values.push(id);
 
+  const shouldUpdateBacklinks = oldTitle !== null && newTitle !== null && newTitle !== oldTitle;
+
+  if (shouldUpdateBacklinks) {
+    db.prepare("BEGIN").run();
+  }
+
   try {
-    const info = stmt.run(...values);
+    const info = updateNoteStmt.run(...values);
     console.log(`Updated note ${id}. Rows affected: ${info.changes}`);
+
+    if (info.changes > 0 && shouldUpdateBacklinks) {
+      const updateLinksStmt = db.prepare(
+        "UPDATE links SET link_text = ? WHERE target_note_id = ? AND link_text = ?"
+      );
+      const linkUpdateInfo = updateLinksStmt.run(newTitle, id, oldTitle);
+      console.log(`Updated link texts for note ${id} from '${oldTitle}' to '${newTitle}'. Rows affected: ${linkUpdateInfo.changes}`);
+      // If linkUpdateInfo.changes is 0, it means no links matched, which is not an error itself.
+    }
+
+    if (shouldUpdateBacklinks) {
+      db.prepare("COMMIT").run();
+    }
     return info.changes > 0;
+
   } catch (err) {
-    console.error(`Error updating note ${id}:`, err.message);
+    console.error(`Error updating note ${id} (transaction active: ${shouldUpdateBacklinks}):`, err.message);
+    if (shouldUpdateBacklinks) {
+      try {
+        db.prepare("ROLLBACK").run();
+      } catch (rollbackErr) {
+        console.error(`Error rolling back transaction for note ${id}:`, rollbackErr.message);
+      }
+    }
     return false;
   }
 }
