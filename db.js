@@ -139,11 +139,13 @@ function initializeDatabase() {
         column_order INTEGER NOT NULL,
         default_value TEXT,
         select_options TEXT, -- JSON string array for SELECT/MULTI_SELECT, e.g., '["Opt1", "Opt2"]'
-        linked_database_id INTEGER, -- New column
+        linked_database_id INTEGER,
+        inverse_column_id INTEGER DEFAULT NULL, -- New column for bidirectional links
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
-        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL, -- New FK
+        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
+        FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL, -- New FK
         UNIQUE (database_id, name),
         UNIQUE (database_id, column_order)
     );
