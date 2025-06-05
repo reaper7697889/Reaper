@@ -21,7 +21,8 @@ const historyService = require("./src/backend/services/historyService");
 const exportService = require('./src/backend/services/exportService');
 const importService = require('./src/backend/services/importService');
 const searchService = require('./src/backend/services/searchService');
-const calendarService = require('./src/backend/services/calendarService'); // Added calendarService
+const calendarService = require('./src/backend/services/calendarService');
+const timelineService = require('./src/backend/services/timelineService'); // Added timelineService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -281,6 +282,11 @@ ipcMain.handle("search:all", async (event, searchText, options) => {
 // Calendar Service
 ipcMain.handle("calendar:getEvents", (e, databaseId, startStr, endStr, options) =>
     calendarService.getCalendarEvents(databaseId, startStr, endStr, options)
+);
+
+// Timeline Service
+ipcMain.handle("timeline:getTimelineDataForDatabase", (e, config) =>
+    timelineService.getTimelineDataForDatabase(config)
 );
 
 // --- App Lifecycle ---

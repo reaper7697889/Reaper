@@ -99,19 +99,23 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
           switch (colDef.type) {
             case 'TEXT': case 'DATE': case 'SELECT':
               switch (filter.operator) {
-                case 'EQUALS': sql += `AND drv.value_text = ?`; params.push(valueForParam); conditionAdded = true; break;
-                case 'NOT_EQUALS': sql += `AND (drv.value_text IS NULL OR drv.value_text != ?)`; params.push(valueForParam); conditionAdded = true; break;
-                case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%${valueForParam}%`); conditionAdded = true; break;
+              case 'EQUALS': sql += `AND drv.value_text = ?`; params.push(String(valueForParam)); conditionAdded = true; break;
+              case 'NOT_EQUALS': sql += `AND (drv.value_text IS NULL OR drv.value_text != ?)`; params.push(String(valueForParam)); conditionAdded = true; break;
+              case 'CONTAINS': sql += `AND drv.value_text LIKE ?`; params.push(`%${String(valueForParam)}%`); conditionAdded = true; break;
+              case 'LESS_THAN_OR_EQUAL_TO': sql += `AND drv.value_text <= ?`; params.push(String(valueForParam)); conditionAdded = true; break;
+              case 'GREATER_THAN_OR_EQUAL_TO': sql += `AND drv.value_text >= ?`; params.push(String(valueForParam)); conditionAdded = true; break;
               }
               break;
             case 'NUMBER':
               valueForParam = parseFloat(filter.value);
-              if (isNaN(valueForParam)) { console.warn(`Invalid number value for filter: ${filter.value}`); break; }
+            if (isNaN(valueForParam)) { console.warn(`Invalid number value for filter: ${filter.value}`); break; }
               switch (filter.operator) {
                 case 'EQUALS': sql += `AND drv.value_number = ?`; params.push(valueForParam); conditionAdded = true; break;
                 case 'NOT_EQUALS': sql += `AND (drv.value_number IS NULL OR drv.value_number != ?)`; params.push(valueForParam); conditionAdded = true; break;
                 case 'GREATER_THAN': sql += `AND drv.value_number > ?`; params.push(valueForParam); conditionAdded = true; break;
                 case 'LESS_THAN': sql += `AND drv.value_number < ?`; params.push(valueForParam); conditionAdded = true; break;
+              case 'LESS_THAN_OR_EQUAL_TO': sql += `AND drv.value_number <= ?`; params.push(valueForParam); conditionAdded = true; break;
+              case 'GREATER_THAN_OR_EQUAL_TO': sql += `AND drv.value_number >= ?`; params.push(valueForParam); conditionAdded = true; break;
               }
               break;
             case 'BOOLEAN':
