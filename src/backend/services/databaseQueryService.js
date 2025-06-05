@@ -1,20 +1,39 @@
 // src/backend/services/databaseQueryService.js
 const { getDb } = require("../db");
 const { getRow } = require("./databaseRowService"); // To fetch full row data
-const { getColumnsForDatabase } = require("./databaseDefService"); // To get column definitions
+// Import getDatabaseById as well for ownership check
+const { getColumnsForDatabase, getDatabaseById } = require("./databaseDefService");
 
 /**
  * Retrieves rows for a database with filtering and sorting.
  * @param {number} databaseId
- * * @param {object} options - { filters = [], sorts = [] }
+ * @param {object} options - { filters = [], sorts = [] }
  *   - filters: [{ columnId, operator, value }]
  *   - sorts: [{ columnId, direction ('ASC'|'DESC') }] (simplified to one sort criteria)
- * @returns {Promise<Array<object>>} - Array of full row objects, or empty array on error.
+ * @param {number | null} [requestingUserId=null] - Optional ID of the user making the request.
+ * @returns {Promise<Array<object>>} - Array of full row objects, or empty array on error/no access.
  */
-async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
+async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }, requestingUserId = null) {
   const db = getDb();
   try {
-    const columnDefsRaw = getColumnsForDatabase(databaseId);
+    // 1. Initial Ownership Check on databaseId
+    const parentDb = await getDatabaseById(databaseId, requestingUserId);
+    if (!parentDb) {
+      // Database not found or user does not have access
+      console.warn(`getRowsForDatabase: Database ${databaseId} not found or not accessible by user ${requestingUserId}.`);
+      return [];
+    }
+
+    // 2. Pass requestingUserId to getColumnsForDatabase
+    // getColumnsForDatabase is already async and handles its own auth check for the DB
+    const columnDefsRaw = await getColumnsForDatabase(databaseId, requestingUserId);
+    if (!columnDefsRaw || columnDefsRaw.length === 0) {
+        // This could mean no columns, or that getColumnsForDatabase returned [] due to its own auth failure (though parentDb check should catch direct DB access failure).
+        // If parentDb was accessible but no columns are (e.g. if columns had separate perms, which they don't), this is the spot.
+        console.warn(`getRowsForDatabase: No column definitions found or accessible for DB ${databaseId} by user ${requestingUserId}.`);
+        // Depending on desired behavior, could return all rows with no column-specific data, or empty. Empty is safer.
+        return [];
+    }
     const columnDefinitions = columnDefsRaw.reduce((acc, col) => {
       acc[col.id] = col;
       return acc;
@@ -176,13 +195,14 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }) {
 
     // Fetch Full Row Data for each ID
     // Using Promise.all to fetch them concurrently.
-    const fullRows = await Promise.all(rowIds.map(id => getRow(id)));
+    // 3. Pass requestingUserId to getRow
+    const fullRows = await Promise.all(rowIds.map(id => getRow(id, requestingUserId)));
 
-    // Filter out any null results from getRow (e.g., if a row was deleted between queries)
+    // Filter out any null results from getRow (e.g., if a row was deleted between queries or auth failed in getRow)
     return fullRows.filter(row => row !== null);
 
   } catch (err) {
-    console.error(`Error querying rows for database ${databaseId}:`, err.message, err.stack);
+    console.error(`Error querying rows for database ${databaseId} (user ${requestingUserId}):`, err.message, err.stack);
     return []; // Return empty array on error
   }
 }

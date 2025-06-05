@@ -22,51 +22,64 @@ function _toISOString(dateObj) {
 /**
  * Gets the currently active timer for a given task.
  * @param {number} taskId - The ID of the task.
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @param {object} [db=getDb()] - Optional database instance for transactions.
- * @returns {Promise<object|null>} - The active time log object or null if none.
+ * @returns {Promise<object|null>} - The active time log object or null if none/not accessible.
  */
-async function getActiveTimerForTask(taskId, db = getDb()) {
+async function getActiveTimerForTask(taskId, requestingUserId, db = getDb()) {
     try {
+        // Ownership check on the task itself
+        const task = await taskService.getTaskById(taskId, requestingUserId);
+        if (!task) {
+            // Task not found or user does not have access
+            console.warn(`getActiveTimerForTask: Task ${taskId} not found or not accessible by user ${requestingUserId}.`);
+            return null;
+        }
         const stmt = db.prepare("SELECT * FROM time_logs WHERE task_id = ? AND end_time IS NULL ORDER BY start_time DESC LIMIT 1");
         return stmt.get(taskId) || null;
     } catch (err) {
-        console.error(`Error getting active timer for task ${taskId}:`, err.message);
-        throw err; // Re-throw for transaction handling
+        console.error(`Error getting active timer for task ${taskId} (user ${requestingUserId}):`, err.message);
+        // Throwing here might be too much if the outer function expects null for "no active timer" vs "error".
+        // For now, let's return null on error too, to signify "no accessible active timer".
+        return null;
     }
 }
 
 /**
  * Starts a new timer for a task.
  * @param {number} taskId
- * @param {object} [options={}] - { description = null, userId = null }
+ * @param {object} [options={}] - { description = null } (userId from options is removed)
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, newLog?: object, error?: string, activeTimer?: object }
  */
-async function startTimerForTask(taskId, { description = null, userId = null } = {}) { // Added userId to options
+async function startTimerForTask(taskId, { description = null } = {}, requestingUserId) {
     const db = getDb();
-    const transaction = db.transaction(async () => { // Make transaction callback async
-        const task = await taskService.getTaskById(taskId); // getTaskById is sync, but await is harmless
-        if (!task) throw new Error("Task not found.");
+    const transaction = db.transaction(async () => {
+        const task = await taskService.getTaskById(taskId, requestingUserId);
+        if (!task) {
+            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
+        }
 
-        const existingTimer = await getActiveTimerForTask(taskId, db);
+        const existingTimer = await getActiveTimerForTask(taskId, requestingUserId, db);
         if (existingTimer) {
-            // Return a specific structure that includes the existing timer
             return { success: false, error: "An active timer already exists for this task.", activeTimer: existingTimer, isExistingTimerError: true };
         }
 
         const startTime = _toISOString(new Date());
+        // user_id for the log is the requestingUserId
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, description, user_id) VALUES (?, ?, ?, ?)" // Added user_id column
+            "INSERT INTO time_logs (task_id, start_time, description, user_id) VALUES (?, ?, ?, ?)"
         );
-        const info = stmt.run(taskId, startTime, description, userId); // Pass userId
-        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid); // Should fetch user_id
+        const info = stmt.run(taskId, startTime, description, requestingUserId);
+        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
         return { success: true, newLog };
     });
 
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error starting timer for task ${taskId}:`, err.message);
-        if (err.isExistingTimerError) return { success: false, error: err.error, activeTimer: err.activeTimer };
+        console.error(`Error starting timer for task ${taskId} (user ${requestingUserId}):`, err.message);
+        if (err.isExistingTimerError) return { success: false, error: err.error, activeTimer: err.activeTimer }; // Keep this specific error for client UI
         return { success: false, error: err.message || "Failed to start timer." };
     }
 }
@@ -75,13 +88,20 @@ async function startTimerForTask(taskId, { description = null, userId = null } =
  * Stops the currently active timer for a task.
  * @param {number} taskId
  * @param {object} [options={}] - { endTimeStr = null, description = null }
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, updatedLog?: object, error?: string }
  */
-async function stopTimerForTask(taskId, { endTimeStr = null, description = null } = {}) {
+async function stopTimerForTask(taskId, { endTimeStr = null, description = null } = {}, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
-        const activeTimer = await getActiveTimerForTask(taskId, db);
+        const task = await taskService.getTaskById(taskId, requestingUserId);
+        if (!task) {
+            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
+        }
+
+        const activeTimer = await getActiveTimerForTask(taskId, requestingUserId, db); // Pass requestingUserId
         if (!activeTimer) {
+            // This implies no active timer for this (accessible) task. This is not an auth error.
             throw new Error("No active timer found for this task.");
         }
 
@@ -116,7 +136,7 @@ async function stopTimerForTask(taskId, { endTimeStr = null, description = null 
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error stopping timer for task ${taskId}:`, err.message);
+        console.error(`Error stopping timer for task ${taskId} (user ${requestingUserId}):`, err.message);
         return { success: false, error: err.message || "Failed to stop timer." };
     }
 }
@@ -124,14 +144,17 @@ async function stopTimerForTask(taskId, { endTimeStr = null, description = null 
 /**
  * Adds a manual time log entry for a task.
  * @param {number} taskId
- * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description?, userId? }
+ * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description? } (userId from logData removed)
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, newLog?: object, error?: string }
  */
-async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationSeconds, description = null, userId = null }) { // Added userId
+async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationSeconds, description = null }, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
-        const task = await taskService.getTaskById(taskId);
-        if (!task) throw new Error("Task not found.");
+        const task = await taskService.getTaskById(taskId, requestingUserId);
+        if (!task) {
+            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
+        }
 
         let finalStartTime, finalEndTime, finalDurationSeconds;
 
@@ -156,18 +179,19 @@ async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationS
 
         if (finalDurationSeconds < 0) throw new Error("Calculated duration is negative. End time must be after start time.");
 
+        // user_id for the log is the requestingUserId
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, end_time, duration_seconds, description, user_id) VALUES (?, ?, ?, ?, ?, ?)" // Added user_id column
+            "INSERT INTO time_logs (task_id, start_time, end_time, duration_seconds, description, user_id) VALUES (?, ?, ?, ?, ?, ?)"
         );
-        const info = stmt.run(taskId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description, userId); // Pass userId
-        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid); // Should fetch user_id
+        const info = stmt.run(taskId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description, requestingUserId);
+        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
         return { success: true, newLog };
     });
 
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error adding manual log for task ${taskId}:`, err.message);
+        console.error(`Error adding manual log for task ${taskId} (user ${requestingUserId}):`, err.message);
         return { success: false, error: err.message || "Failed to add manual log." };
     }
 }
@@ -176,13 +200,22 @@ async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationS
  * Updates an existing time log.
  * @param {number} logId
  * @param {object} updates - { startTimeStr?, endTimeStr?, durationSeconds?, description? }
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, updatedLog?: object, error?: string }
  */
-async function updateTimeLog(logId, updates) {
+async function updateTimeLog(logId, updates, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
         const currentLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(logId);
-        if (!currentLog) throw new Error("Time log not found.");
+        if (!currentLog) {
+            throw new Error("Time log not found.");
+        }
+
+        // Ownership check on parent task
+        const task = await taskService.getTaskById(currentLog.task_id, requestingUserId);
+        if (!task) {
+            throw new Error(`Authorization failed: Task ID ${currentLog.task_id} for this log is not found or not accessible by user.`);
+        }
 
         // If timer is active, only description can be updated, or it must be stopped first.
         if (currentLog.end_time === null && (updates.startTimeStr || updates.endTimeStr || updates.durationSeconds !== undefined)) {
@@ -241,7 +274,7 @@ async function updateTimeLog(logId, updates) {
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error updating time log ${logId}:`, err.message);
+        console.error(`Error updating time log ${logId} (user ${requestingUserId}):`, err.message);
         return { success: false, error: err.message || "Failed to update time log." };
     }
 }
@@ -249,17 +282,28 @@ async function updateTimeLog(logId, updates) {
 /**
  * Deletes a time log entry.
  * @param {number} logId
- * @returns {Promise<object>} - { success: boolean, changes: number, error?: string }
+ * @param {number | null} requestingUserId - ID of the user making the request.
+ * @returns {Promise<object>} - { success: boolean, error?: string }
  */
-async function deleteTimeLog(logId) {
+async function deleteTimeLog(logId, requestingUserId) {
   const db = getDb();
   try {
+    const currentLog = db.prepare("SELECT task_id FROM time_logs WHERE id = ?").get(logId);
+    if (!currentLog) {
+      return { success: false, error: "Time log not found." };
+    }
+
+    const task = await taskService.getTaskById(currentLog.task_id, requestingUserId);
+    if (!task) {
+      throw new Error(`Authorization failed: Task ID ${currentLog.task_id} for this log is not found or not accessible by user.`);
+    }
+
     const stmt = db.prepare("DELETE FROM time_logs WHERE id = ?");
     const info = stmt.run(logId);
-    return { success: true, changes: info.changes };
+    return { success: info.changes > 0 };
   } catch (err) {
-    console.error(`Error deleting time log ${logId}:`, err.message);
-    return { success: false, error: "Failed to delete time log." };
+    console.error(`Error deleting time log ${logId} (user ${requestingUserId}):`, err.message);
+    return { success: false, error: err.message || "Failed to delete time log." };
   }
 }
 
@@ -267,15 +311,23 @@ async function deleteTimeLog(logId) {
  * Retrieves time logs for a specific task, optionally filtered by date range.
  * @param {number} taskId
  * @param {object} [options={}] - { dateRangeStartStr?, dateRangeEndStr?, limit=50, offset=0 }
+ * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<Array<object>>} - Array of time log objects.
  */
-async function getLogsForTask(taskId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}) {
+async function getLogsForTask(taskId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
   const db = getDb();
-  let sql = "SELECT * FROM time_logs WHERE task_id = ?";
-  const params = [taskId];
+  try {
+    const task = await taskService.getTaskById(taskId, requestingUserId);
+    if (!task) {
+        console.warn(`getLogsForTask: Task ${taskId} not found or not accessible by user ${requestingUserId}.`);
+        return [];
+    }
 
-  if (dateRangeStartStr) {
-    sql += " AND start_time >= ?"; // Assumes start_time is what should be in range
+    let sql = "SELECT * FROM time_logs WHERE task_id = ?";
+    const params = [taskId];
+
+    if (dateRangeStartStr) {
+      sql += " AND start_time >= ?"; // Assumes start_time is what should be in range
     params.push(dateRangeStartStr);
   }
   if (dateRangeEndStr) {

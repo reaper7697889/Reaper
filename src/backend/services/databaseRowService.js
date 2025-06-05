@@ -1,7 +1,6 @@
 // src/backend/services/databaseRowService.js
 const { getDb } = require("../db");
-const { getColumnsForDatabase }
-    = require("./databaseDefService");
+const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');
 const smartRuleService = require('./smartRuleService');
@@ -75,11 +74,32 @@ async function _getStoredRowData(rowId, dbInstance) {
     return storedRowData;
 }
 
-function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null }) {
+// Internal helper for ownership check
+async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInstance, operationNameForError) {
+  const db = dbInstance || getDb();
+  // Use the imported databaseDefService.getDatabaseById
+  const parentDb = await databaseDefService.getDatabaseById(databaseId, requestingUserId);
+  if (!parentDb) {
+    throw new Error(`Authorization failed for ${operationNameForError}: Database ID ${databaseId} not found or not accessible by user.`);
+  }
+  return parentDb;
+}
+
+async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, requestingUserId = null }) {
   const db = getDb();
-  const columnDefsMap = getColumnsForDatabase(databaseId).reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow");
+
+  // Fetch column definitions using the potentially user-filtered getColumnsForDatabase
+  // However, for internal consistency of adding a row, we might need all columns.
+  // The _getAccessibleDatabaseOrFail already confirmed user can access the DB container.
+  const columnDefsArray = await databaseDefService.getColumnsForDatabase(databaseId, null); // Get all columns for internal logic
+  if (!columnDefsArray) throw new Error(`Could not retrieve column definitions for database ${databaseId}`);
+  const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+
   let newRowIdValue;
 
+  // IMPORTANT: database_rows table itself does not have a user_id column.
+  // Ownership is derived from the parent note_databases table.
   const transaction = db.transaction(() => {
     const rowStmt = db.prepare("INSERT INTO database_rows (database_id, row_order, recurrence_rule) VALUES (?, ?, ?)");
     const rowInfo = rowStmt.run(databaseId, rowOrder, recurrence_rule);
@@ -124,27 +144,40 @@ function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null })
   try {
     transaction();
     if (newRowIdValue) {
+      // Use db instance from current scope for _getStoredRowData if it expects one.
       _getStoredRowData(newRowIdValue, db).then(newStoredData => {
         const newRowValuesJson = JSON.stringify(newStoredData);
         recordRowHistory({ rowId: newRowIdValue, oldRowValuesJson: null, newRowValuesJson, db });
-      }).catch(histErr => console.error(`Error recording history for new row ${newRowIdValue}:`, histErr.message));
-      console.log(`Added row with ID: ${newRowIdValue} to database ${databaseId}`);
+      }).catch(histErr => console.error(`Error recording history for new row ${newRowIdValue} (user ${requestingUserId}):`, histErr.message));
+      console.log(`Added row with ID: ${newRowIdValue} to database ${databaseId} (user ${requestingUserId})`);
       return { success: true, rowId: newRowIdValue };
     }
-    return { success: false, error: "Row creation succeeded but failed to get newRowIdValue for history." };
+    // This path should ideally not be reached if rowInfo.lastInsertRowid was falsy, as an error would have been thrown.
+    return { success: false, error: "Row creation failed or newRowIdValue was not obtained." };
   } catch (err) {
-    console.error("Error adding row:", err.message, err.stack);
+    console.error(`Error adding row to DB ${databaseId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to add row." };
   }
 }
 
-async function getRow(rowId) {
+async function getRow(rowId, requestingUserId = null) {
   const db = getDb();
   try {
-    const rowData = db.prepare("SELECT id, database_id, row_order, recurrence_rule, created_at, updated_at FROM database_rows WHERE id = ?").get(rowId);
-    if (!rowData) return null;
-    const allColumnDefinitions = getColumnsForDatabase(rowData.database_id);
-    if (!allColumnDefinitions || allColumnDefinitions.length === 0) return { ...rowData, values: {} };
+    const rowMetaData = db.prepare("SELECT id, database_id, row_order, recurrence_rule, created_at, updated_at FROM database_rows WHERE id = ?").get(rowId);
+    if (!rowMetaData) return null;
+
+    // Ownership check on parent database
+    await _getAccessibleDatabaseOrFail(rowMetaData.database_id, requestingUserId, db, "getRow");
+
+    // Fetch columns using the potentially user-filtered getColumnsForDatabase,
+    // or use an unfiltered version if needed for internal consistency.
+    // For getRow, using user-filtered columns seems fine as it's a read operation.
+    const allColumnDefinitions = await databaseDefService.getColumnsForDatabase(rowMetaData.database_id, requestingUserId);
+    if (!allColumnDefinitions) { // Should not happen if _getAccessibleDatabaseOrFail passed
+        console.warn(`getRow: Columns for DB ${rowMetaData.database_id} not found after successful DB access check for user ${requestingUserId}.`);
+        return { ...rowMetaData, values: {} }; // Or null
+    }
+    if (allColumnDefinitions.length === 0) return { ...rowMetaData, values: {} };
 
     const rowDataValues = {};
     const cellValuesStmt = db.prepare("SELECT value_text, value_number, value_boolean FROM database_row_values WHERE row_id = ? AND column_id = ?");
@@ -183,23 +216,26 @@ async function getRow(rowId) {
                 }
 
                 const targetDbId = sourceRelationColDef.linked_database_id;
-                const allColsInTargetDb = getColumnsForDatabase(targetDbId);
+                // Fetch target columns considering user access if recursive calls need it.
+                // For now, assume getColumnsForDatabase within getColumnValuesForRows handles this.
+                const allColsInTargetDb = await databaseDefService.getColumnsForDatabase(targetDbId, requestingUserId);
                 const targetColDefInLinkedDb = allColsInTargetDb.find(c => c.id === targetColId);
 
                 if (linkedTargetRowIds.length === 0) {
                     const emptyAgg = performAggregation([], func, targetColDefInLinkedDb || { type: 'UNKNOWN', name: 'unknown_target_col' });
                     rowDataValues[colDef.id] = emptyAgg.result; continue;
                 }
-                if (!targetColDefInLinkedDb) { rowDataValues[colDef.id] = "#TARGET_COL_ERROR!"; console.warn(`Rollup ${colDef.id} target col ${targetColId} not found in DB ${targetDbId}.`); continue; }
+                if (!targetColDefInLinkedDb) { rowDataValues[colDef.id] = "#TARGET_COL_ERROR!"; console.warn(`Rollup ${colDef.id} target col ${targetColId} not found in DB ${targetDbId} for user ${requestingUserId}.`); continue; }
 
                 let actualTargetValues = [];
                 if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetColDefInLinkedDb.type)) { // Target is computed
                     for (const targetRowId of linkedTargetRowIds) {
-                        const targetRowFullData = await getRow(targetRowId); // Recursive call
+                        // Pass requestingUserId for recursive calls
+                        const targetRowFullData = await getRow(targetRowId, requestingUserId);
                         actualTargetValues.push(targetRowFullData ? targetRowFullData.values[targetColId] : null);
                     }
                 } else { // Target is storable or simple relation
-                    actualTargetValues = await getColumnValuesForRows(targetDbId, linkedTargetRowIds, targetColId);
+                    actualTargetValues = await getColumnValuesForRows(targetDbId, linkedTargetRowIds, targetColId, requestingUserId);
                 }
                 const rollupResult = performAggregation(actualTargetValues, func, targetColDefInLinkedDb);
                 rowDataValues[colDef.id] = rollupResult.error ? "#ROLLUP_ERROR!" : rollupResult.result;
@@ -245,28 +281,30 @@ async function getRow(rowId) {
                 let lookedUpValues = [];
                 if (sourceRelationColDef.relation_target_entity_type === 'NOTE_DATABASES') {
                     const targetDbId = sourceRelationColDef.linked_database_id;
-                    if(!targetDbId) {rowDataValues[colDef.id] = "#CONFIG_ERROR!"; console.warn(`Lookup ${colDef.id} source relation linked_db_id missing.`); continue;}
+                    if(!targetDbId) {rowDataValues[colDef.id] = "#CONFIG_ERROR!"; console.warn(`Lookup ${colDef.id} (user ${requestingUserId}) source relation linked_db_id missing.`); continue;}
 
-                    const allColsInTargetDb = getColumnsForDatabase(targetDbId);
+                    const allColsInTargetDb = await databaseDefService.getColumnsForDatabase(targetDbId, requestingUserId);
                     const targetValueColDefInLinkedDb = allColsInTargetDb.find(c => c.id === targetValColId);
-                    if (!targetValueColDefInLinkedDb) { rowDataValues[colDef.id] = "#TARGET_COL_ERROR!";  console.warn(`Lookup ${colDef.id} target val col ${targetValColId} not found in DB ${targetDbId}.`); continue; }
+                    if (!targetValueColDefInLinkedDb) { rowDataValues[colDef.id] = "#TARGET_COL_ERROR!";  console.warn(`Lookup ${colDef.id} (user ${requestingUserId}) target val col ${targetValColId} not found in DB ${targetDbId}.`); continue; }
 
                     if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetValueColDefInLinkedDb.type)) { // Target value is computed
                          for (const targetRowId of rowsToFetchForLookup) {
-                            const targetRowFullData = await getRow(targetRowId); // Recursive call
+                            const targetRowFullData = await getRow(targetRowId, requestingUserId); // Recursive call with user context
                             lookedUpValues.push(targetRowFullData ? targetRowFullData.values[targetValColId] : null);
                         }
                     } else { // Target value is storable or simple relation
-                        lookedUpValues = await getColumnValuesForRows(targetDbId, rowsToFetchForLookup, targetValColId);
+                        lookedUpValues = await getColumnValuesForRows(targetDbId, rowsToFetchForLookup, targetValColId, requestingUserId);
                     }
                 } else { // NOTES_TABLE
                     const pseudoFieldName = String(targetValColId);
-                    const validNoteFields = ['id', 'title', 'content', 'type', 'created_at', 'updated_at', 'folder_id', 'workspace_id', 'is_pinned', 'is_archived'];
+                    // Use the imported noteService.getNoteById which now supports requestingUserId
+                    // For notes, the requestingUserId applies to the note itself.
+                    const validNoteFields = ['id', 'title', 'content', 'type', 'created_at', 'updated_at', 'folder_id', 'workspace_id', 'is_pinned', 'is_archived', 'user_id'];
                     if (!validNoteFields.includes(pseudoFieldName)) {
-                         rowDataValues[colDef.id] = "#TARGET_FIELD_ERROR!"; console.warn(`Invalid pseudo-field name '${pseudoFieldName}' for NOTES_TABLE lookup col ${colDef.id}.`); continue;
+                         rowDataValues[colDef.id] = "#TARGET_FIELD_ERROR!"; console.warn(`Invalid pseudo-field name '${pseudoFieldName}' for NOTES_TABLE lookup col ${colDef.id} (user ${requestingUserId}).`); continue;
                     }
                     for (const noteIdToFetch of rowsToFetchForLookup) {
-                        const noteData = await noteService.getNoteById(noteIdToFetch);
+                        const noteData = await noteService.getNoteById(noteIdToFetch, requestingUserId);
                         lookedUpValues.push(noteData && noteData.hasOwnProperty(pseudoFieldName) ? noteData[pseudoFieldName] : null);
                     }
                 }
@@ -279,11 +317,164 @@ async function getRow(rowId) {
         }
     }
     return { ...rowData, values: rowDataValues };
-  } catch (err) { console.error(`Error getting row ${rowId}:`, err.message, err.stack); return null; }
+  } catch (err) { console.error(`Error getting row ${rowId} (user ${requestingUserId}):`, err.message, err.stack); return null; }
 }
 
-async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0 }) { /* ... unchanged ... */ }
-function deleteRow(rowId) { /* ... unchanged ... */ }
-async function getColumnValuesForRows(databaseId, rowIds, columnId) { /* ... unchanged ... */ }
+async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, requestingUserId = null }) {
+  const db = getDb();
+  if (_triggerDepth > MAX_TRIGGER_DEPTH) {
+    console.error(`Max trigger depth (${MAX_TRIGGER_DEPTH}) exceeded for row ${rowId}. Aborting update.`);
+    return { success: false, error: "Max trigger depth exceeded." };
+  }
+
+  const transaction = db.transaction(async () => {
+    const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
+    if (!currentRowMeta) throw new Error("Row not found.");
+
+    await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow");
+
+    const oldStoredValues = await _getStoredRowData(rowId, db);
+    if (oldStoredValues === null) throw new Error("Could not retrieve current stored values for history.");
+
+    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null)) // Use null to get all columns for processing
+        .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+
+    const valueUpdateStmt = db.prepare("REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean) VALUES (?, ?, ?, ?, ?)");
+    const linkDeleteStmt = db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?");
+    const linkInsertStmt = db.prepare("INSERT INTO database_row_links (source_row_id, source_column_id, target_row_id, link_order) VALUES (?, ?, ?, ?)");
+
+    let changedNonComputed = false;
+    for (const [columnIdStr, rawValue] of Object.entries(values)) {
+      const columnId = parseInt(columnIdStr, 10);
+      const colDef = columnDefsMap[columnId];
+      if (!colDef) throw new Error(`Column ID ${columnId} not found in DB ${currentRowMeta.database_id}.`);
+      if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) continue;
+
+      if (colDef.type === 'RELATION') {
+        linkDeleteStmt.run(rowId, columnId);
+        if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
+            const oldLinkedTargetIds = oldStoredValues[columnId] || [];
+            for(const oldTargetId of oldLinkedTargetIds){
+                db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? AND target_row_id = ?")
+                  .run(oldTargetId, colDef.inverse_column_id, rowId);
+            }
+        }
+        if (Array.isArray(rawValue)) {
+          rawValue.forEach((targetRowId, index) => {
+            if (typeof targetRowId !== 'number') throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}.`);
+            // Validation of targetRowId existence and database belonging (as in addRow)
+            linkInsertStmt.run(rowId, columnId, targetRowId, index);
+            if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
+               linkInsertStmt.run(targetRowId, colDef.inverse_column_id, rowId, 0); // Order might need adjustment for inverse
+            }
+          });
+        }
+        changedNonComputed = true;
+      } else {
+        if (rawValue !== undefined) { // Allow clearing a value by passing null
+            const preparedValues = _prepareValueForStorage(colDef.type, rawValue);
+            valueUpdateStmt.run(rowId, columnId, preparedValues.value_text, preparedValues.value_number, preparedValues.value_boolean);
+            changedNonComputed = true;
+        }
+      }
+    }
+
+    if (recurrence_rule !== undefined) { // Could be null to clear it
+        db.prepare("UPDATE database_rows SET recurrence_rule = ? WHERE id = ?").run(recurrence_rule, rowId);
+        changedNonComputed = true;
+    }
+
+    if (changedNonComputed) {
+        db.prepare("UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(rowId);
+    }
+
+    // History Recording (only if _triggerDepth is 0, for user-initiated changes)
+    if (_triggerDepth === 0) {
+        const newStoredValues = await _getStoredRowData(rowId, db);
+        const oldRowValuesJson = JSON.stringify(oldStoredValues);
+        const newRowValuesJson = JSON.stringify(newStoredValues);
+        if (oldRowValuesJson !== newRowValuesJson) { // Only record if actual stored values changed
+             await recordRowHistory({rowId, oldRowValuesJson, newRowValuesJson, db});
+        }
+    }
+
+    // Run Smart Rules (only if _triggerDepth is 0 for user-initiated changes)
+    if (_triggerDepth === 0) {
+        await smartRuleService.runSmartRulesForRowChange(rowId, currentRowMeta.database_id, oldStoredValues, await _getStoredRowData(rowId, db), db, _triggerDepth + 1, requestingUserId);
+    }
+    return { success: true };
+  });
+
+  try {
+    return await transaction(); // Ensure async operations within transaction are awaited
+  } catch (err) {
+    console.error(`Error updating row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to update row." };
+  }
+}
+
+async function deleteRow(rowId, requestingUserId = null) {
+  const db = getDb();
+  try {
+    const rowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
+    if (!rowMeta) {
+      return { success: false, error: "Row not found." };
+    }
+    await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow");
+
+    // CASCADE should handle database_row_values and database_row_links.
+    // If not, manual deletion would be needed here, within a transaction.
+    const stmt = db.prepare("DELETE FROM database_rows WHERE id = ?");
+    const info = stmt.run(rowId);
+
+    if (info.changes > 0) {
+      console.log(`Deleted row ${rowId} by user ${requestingUserId}.`);
+      // History recording for deletion can be added if needed.
+      // For now, recordRowHistory is mainly for updates/creations.
+      // A simple way: recordRowHistory({rowId, oldRowValuesJson: JSON.stringify(await _getStoredRowData(rowId, db) || {}), newRowValuesJson: null, db});
+      // But _getStoredRowData won't work after delete. Fetch before delete if needed.
+      return { success: true, changes: info.changes };
+    }
+    return { success: false, error: "Row not found or delete failed." }; // Should be caught by pre-check
+  } catch (err) {
+    console.error(`Error deleting row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to delete row." };
+  }
+}
+
+async function getColumnValuesForRows(databaseId, rowIds, columnId, requestingUserId = null) {
+  const db = getDb();
+  if (!rowIds || rowIds.length === 0) return [];
+
+  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "getColumnValuesForRows");
+
+  const columnDefsMap = (await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId))
+      .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+  const targetColDef = columnDefsMap[columnId];
+
+  if (!targetColDef) throw new Error(`Column ID ${columnId} not found in database ${databaseId}.`);
+  if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetColDef.type)) {
+    // For computed columns, we need to fetch each row individually.
+    const values = [];
+    for (const rowId of rowIds) {
+      const fullRow = await getRow(rowId, requestingUserId); // Pass user context
+      values.push(fullRow ? fullRow.values[columnId] : null);
+    }
+    return values;
+  } else if (targetColDef.type === 'RELATION') {
+    const placeholder = rowIds.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT source_row_id, target_row_id FROM database_row_links WHERE source_column_id = ? AND source_row_id IN (${placeholder}) ORDER BY source_row_id, link_order ASC`);
+    const links = stmt.all(columnId, ...rowIds);
+    const resultsMap = new Map(rowIds.map(id => [id, []]));
+    links.forEach(link => resultsMap.get(link.source_row_id).push(link.target_row_id));
+    return rowIds.map(id => resultsMap.get(id));
+  } else {
+    const placeholder = rowIds.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT row_id, value_text, value_number, value_boolean FROM database_row_values WHERE column_id = ? AND row_id IN (${placeholder})`);
+    const rows = stmt.all(columnId, ...rowIds);
+    const valuesMap = new Map(rows.map(r => [r.row_id, _deserializeValue(targetColDef.type, r.value_text, r.value_number, r.value_boolean)]));
+    return rowIds.map(id => valuesMap.get(id) ?? null);
+  }
+}
 
 module.exports = { addRow, getRow, updateRow, deleteRow, getColumnValuesForRows };

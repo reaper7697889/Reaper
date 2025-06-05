@@ -46,20 +46,27 @@ function createTask(taskData) {
 /**
  * Retrieves a single task by its ID.
  * @param {number} id - The ID of the task.
- * @returns {object | null} - The task object (with is_completed as boolean) or null if not found.
+ * @param {number | null} [requestingUserId=null] - Optional ID of the user making the request.
+ * @returns {object | null} - The task object (with is_completed as boolean) or null if not found or not authorized.
  */
-function getTaskById(id) {
+function getTaskById(id, requestingUserId = null) {
   const db = getDb();
-  // Ensure all relevant fields, including user_id, are selected
-  const stmt = db.prepare("SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE id = ?");
+  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE id = ?";
+  const params = [id];
+
+  if (requestingUserId !== null) {
+    sql += " AND (user_id = ? OR user_id IS NULL)";
+    params.push(requestingUserId);
+  }
+
   try {
-    const task = stmt.get(id);
+    const task = db.prepare(sql).get(...params);
     if (task) {
       task.is_completed = !!task.is_completed;
     }
     return task || null;
   } catch (err) {
-    console.error(`Error getting task ${id}:`, err.message);
+    console.error(`Error getting task ${id} for user ${requestingUserId}:`, err.message);
     return null;
   }
 }
@@ -68,11 +75,20 @@ function getTaskById(id) {
  * Updates an existing task. user_id is not updatable via this general function.
  * @param {number} id - The ID of the task to update.
  * @param {object} updates - Object containing fields to update (e.g., description, is_completed, due_date).
+ * @param {number} requestingUserId - ID of the user making the request.
  * @returns {object} - { success: boolean, error?: string }
  */
-function updateTask(id, updates) {
+function updateTask(id, updates, requestingUserId) {
   const db = getDb();
-  // user_id is not included in allowedFields for general update
+
+  const taskFound = getTaskById(id, null); // Unfiltered fetch for ownership check
+  if (!taskFound) {
+    return { success: false, error: "Task not found." };
+  }
+  if (taskFound.user_id !== null && taskFound.user_id !== requestingUserId) {
+    return { success: false, error: "Authorization failed: You do not own this task." };
+  }
+
   const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id"];
   const fieldsToSet = [];
   const values = [];
@@ -85,74 +101,115 @@ function updateTask(id, updates) {
   }
 
   if (fieldsToSet.length === 0) {
-    return { success: false, error: "No valid fields provided for update." };
+    // No actual change, but ownership was verified, so consider it success.
+    return { success: true, message: "No effective changes to task fields." };
   }
 
   fieldsToSet.push("updated_at = CURRENT_TIMESTAMP");
   const sql = `UPDATE tasks SET ${fieldsToSet.join(", ")} WHERE id = ?`;
-  values.push(id);
+  values.push(id); // For the WHERE id = ?
 
   try {
     const info = db.prepare(sql).run(...values);
     return { success: info.changes > 0 };
   } catch (err) {
-    console.error(`Error updating task ${id}:`, err.message);
+    console.error(`Error updating task ${id} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to update task." };
   }
 }
 
-function deleteTask(id) {
+/**
+ * Deletes a task.
+ * @param {number} id - The ID of the task to delete.
+ * @param {number} requestingUserId - ID of the user making the request.
+ * @returns {object} - { success: boolean, error?: string }
+ */
+function deleteTask(id, requestingUserId) {
   const db = getDb();
+
+  const taskFound = getTaskById(id, null); // Unfiltered fetch for ownership check
+  if (!taskFound) {
+    return { success: false, error: "Task not found." };
+  }
+  if (taskFound.user_id !== null && taskFound.user_id !== requestingUserId) {
+    return { success: false, error: "Authorization failed: You do not own this task." };
+  }
+
   const stmt = db.prepare("DELETE FROM tasks WHERE id = ?");
   try {
     const info = stmt.run(id);
-    return { success: info.changes > 0 };
+    if (info.changes > 0) {
+      // Also remove associated dependencies
+      db.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(id, id);
+      return { success: true };
+    }
+    return { success: false, error: "Task found but delete operation failed."}; // Should not happen if taskFound
   } catch (err) {
-    console.error(`Error deleting task ${id}:`, err.message);
+    console.error(`Error deleting task ${id} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to delete task." };
   }
 }
 
-function getTasksForNote(noteId) {
+function getTasksForNote(noteId, requestingUserId = null) {
     const db = getDb();
-    // Ensure user_id is selected
-    const stmt = db.prepare("SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE note_id = ? ORDER BY created_at ASC");
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE note_id = ?";
+    const params = [noteId];
+
+    if (requestingUserId !== null) {
+        sql += " AND (user_id = ? OR user_id IS NULL)";
+        params.push(requestingUserId);
+    }
+    sql += " ORDER BY created_at ASC";
+
     try {
-        return stmt.all(noteId).map(task => ({...task, is_completed: !!task.is_completed}));
+        return db.prepare(sql).all(...params).map(task => ({...task, is_completed: !!task.is_completed}));
     } catch (err) {
-        console.error(`Error listing tasks for note ${noteId}:`, err.message);
+        console.error(`Error listing tasks for note ${noteId} (user ${requestingUserId}):`, err.message);
         return [];
     }
 }
 
-function getTasksForBlock(blockId) {
+function getTasksForBlock(blockId, requestingUserId = null) {
     const db = getDb();
-    // Ensure user_id is selected
-    const stmt = db.prepare("SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE block_id = ? ORDER BY created_at ASC");
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE block_id = ?";
+    const params = [blockId];
+
+    if (requestingUserId !== null) {
+        sql += " AND (user_id = ? OR user_id IS NULL)";
+        params.push(requestingUserId);
+    }
+    sql += " ORDER BY created_at ASC";
+
     try {
-        return stmt.all(blockId).map(task => ({...task, is_completed: !!task.is_completed}));
+        return db.prepare(sql).all(...params).map(task => ({...task, is_completed: !!task.is_completed}));
     } catch (err) {
-        console.error(`Error listing tasks for block ${blockId}:`, err.message);
+        console.error(`Error listing tasks for block ${blockId} (user ${requestingUserId}):`, err.message);
         return [];
     }
 }
 
 // --- Task Dependency Management Functions ---
-// These functions use SELECT t.* which will include user_id if present in tasks table.
 
-async function addTaskDependency(taskId, dependsOnTaskId) {
+async function addTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
   if (taskId === dependsOnTaskId) {
     return { success: false, error: "Task cannot depend on itself." };
   }
   const db = getDb();
-  try {
-    // getTaskById is synchronous
-    const task1Exists = getTaskById(taskId);
-    const task2Exists = getTaskById(dependsOnTaskId);
-    if (!task1Exists || !task2Exists) {
-      return { success: false, error: "One or both task IDs not found." };
-    }
 
+  const task1 = getTaskById(taskId, null); // Unfiltered fetch for ownership check
+  if (!task1) {
+    return { success: false, error: `Task with ID ${taskId} not found.` };
+  }
+  if (task1.user_id !== null && task1.user_id !== requestingUserId) {
+    return { success: false, error: `Authorization failed: You do not own task ${taskId}.` };
+  }
+
+  const task2Exists = getTaskById(dependsOnTaskId, null); // Check if dependent task exists (no ownership check needed for it)
+  if (!task2Exists) {
+    return { success: false, error: `Task with ID ${dependsOnTaskId} (to depend on) not found.` };
+  }
+
+  try {
     const stmt = db.prepare("INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)");
     const info = stmt.run(taskId, dependsOnTaskId);
     return {
@@ -160,45 +217,79 @@ async function addTaskDependency(taskId, dependsOnTaskId) {
       dependency: { id: info.lastInsertRowid, task_id: taskId, depends_on_task_id: dependsOnTaskId }
     };
   } catch (err) {
-    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return { success: true, alreadyExists: true, message: "Dependency already exists." };
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') return { success: true, alreadyExists: true, message: "Dependency already exists." }; // Or success:false if preferred
     if (err.code === 'SQLITE_CONSTRAINT_CHECK') return { success: false, error: "Task cannot depend on itself (CHECK constraint failed)." };
-    console.error(`Error adding dependency from task ${taskId} to ${dependsOnTaskId}:`, err.message);
+    console.error(`Error adding dependency from task ${taskId} to ${dependsOnTaskId} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to add task dependency." };
   }
 }
 
-async function removeTaskDependency(taskId, dependsOnTaskId) {
+async function removeTaskDependency(taskId, dependsOnTaskId, requestingUserId) {
   const db = getDb();
+
+  const task1 = getTaskById(taskId, null); // Unfiltered fetch for ownership check
+  if (!task1) {
+    return { success: false, error: `Task with ID ${taskId} not found.` };
+  }
+  if (task1.user_id !== null && task1.user_id !== requestingUserId) {
+    return { success: false, error: `Authorization failed: You do not own task ${taskId}.` };
+  }
+  // No need to check ownership of dependsOnTaskId for removal
+
   try {
     const stmt = db.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?");
     const info = stmt.run(taskId, dependsOnTaskId);
     return { success: true, removed: info.changes > 0 };
   } catch (err) {
-    console.error(`Error removing dependency from task ${taskId} to ${dependsOnTaskId}:`, err.message);
+    console.error(`Error removing dependency from task ${taskId} to ${dependsOnTaskId} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to remove task dependency." };
   }
 }
 
-async function getTaskPrerequisites(taskId) {
+async function getTaskPrerequisites(taskId, requestingUserId = null) {
   const db = getDb();
+  // First, check if the main task itself is accessible to the requesting user
+  const mainTask = getTaskById(taskId, requestingUserId);
+  if (!mainTask) {
+      // This means either the task doesn't exist or the user cannot access it.
+      // Depending on desired behavior, could be an empty array or an error.
+      // For consistency with "return null or empty array if auth fails", return empty array.
+      console.warn(`getTaskPrerequisites: Main task ${taskId} not found or not accessible by user ${requestingUserId}.`);
+      return [];
+  }
+
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.depends_on_task_id WHERE td.task_id = ? ORDER BY t.created_at ASC`;
   try {
-    const rows = db.prepare(sql).all(taskId);
+    let rows = db.prepare(sql).all(taskId);
+    if (requestingUserId !== null) {
+      // Filter prerequisites based on the requesting user's ownership or if they are public (user_id IS NULL)
+      rows = rows.filter(r => r.user_id === requestingUserId || r.user_id === null);
+    }
     return rows.map(task => ({ ...task, is_completed: !!task.is_completed }));
   } catch (err) {
-    console.error(`Error getting prerequisites for task ${taskId}:`, err.message);
+    console.error(`Error getting prerequisites for task ${taskId} (user ${requestingUserId}):`, err.message);
     return [];
   }
 }
 
-async function getTasksBlockedBy(taskId) {
+async function getTasksBlockedBy(taskId, requestingUserId = null) {
   const db = getDb();
+  // Check if the main task is accessible
+  const mainTask = getTaskById(taskId, requestingUserId);
+  if (!mainTask) {
+      console.warn(`getTasksBlockedBy: Main task ${taskId} not found or not accessible by user ${requestingUserId}.`);
+      return [];
+  }
+
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.task_id WHERE td.depends_on_task_id = ? ORDER BY t.created_at ASC`;
   try {
-    const rows = db.prepare(sql).all(taskId);
+    let rows = db.prepare(sql).all(taskId);
+    if (requestingUserId !== null) {
+      rows = rows.filter(r => r.user_id === requestingUserId || r.user_id === null);
+    }
     return rows.map(task => ({ ...task, is_completed: !!task.is_completed }));
   } catch (err) {
-    console.error(`Error getting tasks blocked by task ${taskId}:`, err.message);
+    console.error(`Error getting tasks blocked by task ${taskId} (user ${requestingUserId}):`, err.message);
     return [];
   }
 }
