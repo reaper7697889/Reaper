@@ -27,7 +27,7 @@ function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS database_columns (
         id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP', 'DATETIME')), -- Added 'DATETIME'
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP', 'DATETIME')),
         column_order INTEGER NOT NULL, default_value TEXT, select_options TEXT,
         linked_database_id INTEGER,
         relation_target_entity_type TEXT NOT NULL DEFAULT 'NOTE_DATABASES' CHECK(relation_target_entity_type IN ('NOTE_DATABASES', 'NOTES_TABLE')),
@@ -39,8 +39,7 @@ function initializeDatabase() {
         lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
-        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL, -- For relation_target_entity_type = 'NOTE_DATABASES'
-        -- No direct FK for linked_database_id if target is 'NOTES_TABLE', this is handled by application logic.
+        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
         FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_target_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
@@ -92,6 +91,8 @@ function initializeDatabase() {
 
   // --- Common Feature Tables ---
   db.exec(`CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, file_path TEXT NOT NULL, mime_type TEXT, original_filename TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
+
+  // Tasks Table and Trigger
   db.exec(`CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, description TEXT NOT NULL, is_completed BOOLEAN DEFAULT 0, due_date DATETIME, reminder_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_task_timestamp AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
@@ -109,6 +110,31 @@ function initializeDatabase() {
     );
   `);
 
+  // Time Logs Table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS time_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL, -- For this phase, strictly linked to tasks
+        user_id INTEGER, -- Placeholder for future multi-user
+        start_time TEXT NOT NULL, -- ISO 8601 DATETIME string (UTC)
+        end_time TEXT, -- ISO 8601 DATETIME string (UTC), NULL if timer is active
+        duration_seconds INTEGER, -- Calculated duration, NULL if timer is active
+        description TEXT, -- Optional user note for this time log
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_time_logs_updated_at
+    AFTER UPDATE ON time_logs
+    FOR EACH ROW
+    BEGIN
+        UPDATE time_logs SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  // Version History (Simple approach: store snapshots) - This is the old one, keep for now.
   db.exec(`CREATE TABLE IF NOT EXISTS note_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER NOT NULL, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
 
   // --- Placeholder Tables for Future Features ---
@@ -136,9 +162,6 @@ function initializeDatabase() {
       db.prepare("DELETE FROM tasks_fts").run();
       db.prepare("INSERT INTO tasks_fts (task_id, description) SELECT id, description FROM tasks").run();
       console.log("Finished populating tasks_fts table.");
-      // Initial population for database_content_fts will be handled by its triggers as rows/values are created/updated.
-      // Or, could add a similar population step here if desired for existing database_row_values.
-      // For now, relying on triggers for database_content_fts.
       db.prepare(`PRAGMA user_version = ${targetFtsPopulatedVersion}`).run();
       db.prepare("COMMIT").run();
       console.log(`Successfully populated FTS tables (notes, tasks) and set user_version to ${targetFtsPopulatedVersion}.`);
@@ -152,18 +175,16 @@ function initializeDatabase() {
   }
 
   // --- database_content_fts Initial Population Logic ---
-  // Re-fetch user_version as it might have been updated by the previous FTS step
   const dbContentViewRow = db.prepare("PRAGMA user_version").get();
   const currentDbContentViewUserVersion = dbContentViewRow.user_version;
-  const targetDbContentFtsVersion = 2; // Target version for this specific migration
+  const targetDbContentFtsVersion = 2;
 
   if (currentDbContentViewUserVersion < targetDbContentFtsVersion) {
     console.log(`Current DB user_version ${currentDbContentViewUserVersion}, attempting to populate database_content_fts for version ${targetDbContentFtsVersion}...`);
     try {
       db.prepare("BEGIN").run();
-
       console.log("Populating database_content_fts table...");
-      db.prepare("DELETE FROM database_content_fts").run(); // Clear existing data
+      db.prepare("DELETE FROM database_content_fts").run();
       const populateStmt = db.prepare(
         `INSERT INTO database_content_fts (row_id, database_id, content)
          SELECT dr.id, dr.database_id,
@@ -177,19 +198,13 @@ function initializeDatabase() {
       );
       populateStmt.run();
       console.log("Finished populating database_content_fts table.");
-
       db.prepare(`PRAGMA user_version = ${targetDbContentFtsVersion}`).run();
       db.prepare("COMMIT").run();
       console.log(`Successfully populated database_content_fts and set user_version to ${targetDbContentFtsVersion}.`);
-
     } catch (err) {
       console.error("Error during database_content_fts initial data population:", err.message, err.stack);
-      try {
-        db.prepare("ROLLBACK").run();
-        console.log("Rolled back database_content_fts population transaction.");
-      } catch (rollbackErr) {
-        console.error("Error rolling back database_content_fts population transaction:", rollbackErr.message);
-      }
+      try { db.prepare("ROLLBACK").run(); console.log("Rolled back database_content_fts population transaction."); }
+      catch (rollbackErr) { console.error("Error rolling back database_content_fts population transaction:", rollbackErr.message); }
     }
   } else {
     console.log(`DB user_version is ${currentDbContentViewUserVersion}. database_content_fts table presumed populated for version ${targetDbContentFtsVersion} or newer.`);

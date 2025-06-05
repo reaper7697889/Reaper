@@ -22,7 +22,8 @@ const exportService = require('./src/backend/services/exportService');
 const importService = require('./src/backend/services/importService');
 const searchService = require('./src/backend/services/searchService');
 const calendarService = require('./src/backend/services/calendarService');
-const timelineService = require('./src/backend/services/timelineService'); // Added timelineService
+const timelineService = require('./src/backend/services/timelineService');
+const timeLogService = require('./src/backend/services/timeLogService'); // Added timeLogService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -324,6 +325,70 @@ ipcMain.handle("calendar:getEvents", (e, databaseId, startStr, endStr, options) 
 ipcMain.handle("timeline:getTimelineDataForDatabase", (e, config) =>
     timelineService.getTimelineDataForDatabase(config)
 );
+
+// --- Time Log Service ---
+ipcMain.handle("timelogs:startTimerForTask", async (event, taskId, options) => {
+    try {
+        return await timeLogService.startTimerForTask(taskId, options);
+    } catch (error) {
+        console.error("Error in 'timelogs:startTimerForTask' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to start timer." };
+    }
+});
+
+ipcMain.handle("timelogs:stopTimerForTask", async (event, taskId, options) => {
+    try {
+        return await timeLogService.stopTimerForTask(taskId, options);
+    } catch (error) {
+        console.error("Error in 'timelogs:stopTimerForTask' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to stop timer." };
+    }
+});
+
+ipcMain.handle("timelogs:addManualLogForTask", async (event, taskId, logData) => {
+    try {
+        return await timeLogService.addManualLogForTask(taskId, logData);
+    } catch (error) {
+        console.error("Error in 'timelogs:addManualLogForTask' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to add manual log." };
+    }
+});
+
+ipcMain.handle("timelogs:updateTimeLog", async (event, logId, updates) => {
+    try {
+        return await timeLogService.updateTimeLog(logId, updates);
+    } catch (error) {
+        console.error("Error in 'timelogs:updateTimeLog' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to update time log." };
+    }
+});
+
+ipcMain.handle("timelogs:deleteTimeLog", async (event, logId) => {
+    try {
+        return await timeLogService.deleteTimeLog(logId);
+    } catch (error) {
+        console.error("Error in 'timelogs:deleteTimeLog' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to delete time log." };
+    }
+});
+
+ipcMain.handle("timelogs:getLogsForTask", async (event, taskId, options) => {
+    try {
+        return await timeLogService.getLogsForTask(taskId, options);
+    } catch (error) {
+        console.error("Error in 'timelogs:getLogsForTask' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to get time logs." };
+    }
+});
+
+ipcMain.handle("timelogs:getActiveTimerForTask", async (event, taskId) => {
+    try {
+        return await timeLogService.getActiveTimerForTask(taskId);
+    } catch (error) {
+        console.error("Error in 'timelogs:getActiveTimerForTask' IPC handler:", error);
+        return { success: false, error: error.message || "Failed to get active timer." };
+    }
+});
 
 // --- App Lifecycle ---
 
