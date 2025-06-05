@@ -1,6 +1,6 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog } = require("electron"); // Added dialog
 const path = require("path");
-const fs = require("fs");
+const fs = require('fs').promises; // Changed to fs.promises
 
 // Import backend services
 require("./src/backend/db"); // Initialize DB connection
@@ -17,7 +17,9 @@ const databaseDefService = require("./src/backend/services/databaseDefService");
 const databaseRowService = require("./src/backend/services/databaseRowService");
 const databaseQueryService = require("./src/backend/services/databaseQueryService");
 const smartRuleService = require("./src/backend/services/smartRuleService");
-const historyService = require("./src/backend/services/historyService"); // Added historyService
+const historyService = require("./src/backend/services/historyService");
+const exportService = require('./src/backend/services/exportService'); // Added exportService
+const importService = require('./src/backend/services/importService'); // Added importService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -126,6 +128,141 @@ ipcMain.handle("history:getNoteHistory", (e, noteId, options) => historyService.
 ipcMain.handle("history:getRowHistory", (e, rowId, options) => historyService.getRowHistory(rowId, options));
 ipcMain.handle("history:revertNoteToVersion", (e, noteId, versionNumber) => historyService.revertNoteToVersion(noteId, versionNumber));
 ipcMain.handle("history:revertRowToVersion", (e, rowId, versionNumber) => historyService.revertRowToVersion(rowId, versionNumber));
+
+// Export Service Handlers
+ipcMain.handle("export:note", async (event, noteId, format) => {
+  try {
+    const result = await exportService.getNoteExportData(noteId, format);
+    if (!result || result.success === false) { // Check for service error structure
+      return { success: false, error: result?.error || 'Failed to get note export data or note not found.' };
+    }
+    const saveDialogResult = await dialog.showSaveDialog({ defaultPath: result.filename });
+    if (saveDialogResult.canceled || !saveDialogResult.filePath) {
+      return { success: false, error: 'Export cancelled by user.' };
+    }
+    await fs.writeFile(saveDialogResult.filePath, result.data);
+    return { success: true, path: saveDialogResult.filePath };
+  } catch (error) {
+    console.error("Export note error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during note export." };
+  }
+});
+
+ipcMain.handle("export:notesCollection", async (event, filter, format) => {
+  try {
+    const result = await exportService.getNotesCollectionExportData({ filter, format });
+    if (!result || result.success === false) {
+      return { success: false, error: result?.error || 'Failed to get notes collection export data.' };
+    }
+
+    if (format === 'json') { // Single file
+      const saveDialogResult = await dialog.showSaveDialog({ defaultPath: result.filename });
+      if (saveDialogResult.canceled || !saveDialogResult.filePath) {
+        return { success: false, error: 'Export cancelled by user.' };
+      }
+      await fs.writeFile(saveDialogResult.filePath, result.data);
+      return { success: true, path: saveDialogResult.filePath };
+    } else if (format === 'markdown') { // Multiple files
+      const dirDialogResult = await dialog.showOpenDialog({
+        title: "Select Export Directory",
+        properties: ['openDirectory', 'createDirectory']
+      });
+      if (dirDialogResult.canceled || !dirDialogResult.filePaths || dirDialogResult.filePaths.length === 0) {
+        return { success: false, error: 'Export directory selection cancelled.' };
+      }
+      const chosenDir = dirDialogResult.filePaths[0];
+      for (const item of result) { // result is an array of {filename, data}
+        await fs.writeFile(path.join(chosenDir, item.filename), item.data);
+      }
+      return { success: true, directory: chosenDir, filesExported: result.length };
+    } else {
+        return { success: false, error: `Unsupported format for collection export: ${format}`};
+    }
+  } catch (error) {
+    console.error("Export notes collection error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during notes collection export." };
+  }
+});
+
+ipcMain.handle("export:tableToCsv", async (event, databaseId) => {
+  try {
+    const result = await exportService.getTableCsvData(databaseId);
+    if (!result || result.success === false) {
+      return { success: false, error: result?.error || 'Failed to get table CSV data.' };
+    }
+    const saveDialogResult = await dialog.showSaveDialog({
+      defaultPath: result.filename,
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }]
+    });
+    if (saveDialogResult.canceled || !saveDialogResult.filePath) {
+      return { success: false, error: 'Export cancelled by user.' };
+    }
+    await fs.writeFile(saveDialogResult.filePath, result.data);
+    return { success: true, path: saveDialogResult.filePath };
+  } catch (error) {
+    console.error("Export table to CSV error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during CSV export." };
+  }
+});
+
+// Import Service Handlers
+ipcMain.handle("import:markdownNote", async (event, targetFolderId = null) => {
+  try {
+    const dialogResult = await dialog.showOpenDialog({
+      title: "Import Markdown File",
+      properties: ['openFile'],
+      filters: [{ name: 'Markdown Files', extensions: ['md', 'markdown', 'txt'] }]
+    });
+    if (dialogResult.canceled || !dialogResult.filePaths || dialogResult.filePaths.length === 0) {
+      return { success: false, error: 'Import cancelled or no file selected.' };
+    }
+    const filePath = dialogResult.filePaths[0];
+    const markdownContent = await fs.readFile(filePath, 'utf-8');
+    const titleHint = path.basename(filePath);
+    return await importService.importMarkdownNoteFromString(markdownContent, titleHint, targetFolderId);
+  } catch (error) {
+    console.error("Import Markdown note error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during Markdown import." };
+  }
+});
+
+ipcMain.handle("import:jsonNotes", async (event, defaultFolderId = null) => {
+  try {
+    const dialogResult = await dialog.showOpenDialog({
+      title: "Import JSON Notes File",
+      properties: ['openFile'],
+      filters: [{ name: 'JSON Files', extensions: ['json'] }]
+    });
+    if (dialogResult.canceled || !dialogResult.filePaths || dialogResult.filePaths.length === 0) {
+      return { success: false, error: 'Import cancelled or no file selected.' };
+    }
+    const filePath = dialogResult.filePaths[0];
+    const jsonString = await fs.readFile(filePath, 'utf-8');
+    return await importService.importJsonNotesFromString(jsonString, defaultFolderId);
+  } catch (error) {
+    console.error("Import JSON notes error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during JSON import." };
+  }
+});
+
+ipcMain.handle("import:csvToTable", async (event, databaseId, columnMapping = {}, options = { skipHeader: true }) => {
+  try {
+    const dialogResult = await dialog.showOpenDialog({
+      title: "Import CSV into Table",
+      properties: ['openFile'],
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }]
+    });
+    if (dialogResult.canceled || !dialogResult.filePaths || dialogResult.filePaths.length === 0) {
+      return { success: false, error: 'Import cancelled or no file selected.' };
+    }
+    const filePath = dialogResult.filePaths[0];
+    const csvString = await fs.readFile(filePath, 'utf-8');
+    return await importService.importCsvToTableFromString(databaseId, csvString, columnMapping, options);
+  } catch (error) {
+    console.error("Import CSV to table error:", error);
+    return { success: false, error: error.message || "An unexpected error occurred during CSV import." };
+  }
+});
 
 // --- App Lifecycle ---
 
