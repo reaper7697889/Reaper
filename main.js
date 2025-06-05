@@ -16,7 +16,8 @@ const graphService = require("./src/backend/services/graphService");
 const databaseDefService = require("./src/backend/services/databaseDefService");
 const databaseRowService = require("./src/backend/services/databaseRowService");
 const databaseQueryService = require("./src/backend/services/databaseQueryService");
-const smartRuleService = require("./src/backend/services/smartRuleService"); // Added smartRuleService
+const smartRuleService = require("./src/backend/services/smartRuleService");
+const historyService = require("./src/backend/services/historyService"); // Added historyService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -119,6 +120,10 @@ ipcMain.handle("rules:getRuleById", (e, id) => smartRuleService.getRuleById(id))
 ipcMain.handle("rules:getRulesForDatabase", (e, dbId, options) => smartRuleService.getRulesForDatabase(dbId, options));
 ipcMain.handle("rules:updateRule", (e, id, updates) => smartRuleService.updateRule(id, updates));
 ipcMain.handle("rules:deleteRule", (e, id) => smartRuleService.deleteRule(id));
+
+// History Service
+ipcMain.handle("history:getNoteHistory", (e, noteId, options) => historyService.getNoteHistory(noteId, options));
+ipcMain.handle("history:getRowHistory", (e, rowId, options) => historyService.getRowHistory(rowId, options));
 
 // --- App Lifecycle ---
 

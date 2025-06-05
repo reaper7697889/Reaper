@@ -270,6 +270,38 @@ function initializeDatabase() {
     END;
   `);
 
+  // --- History Tables ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS notes_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER NOT NULL,
+        changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        version_number INTEGER NOT NULL,
+        title_before TEXT,
+        title_after TEXT,
+        content_before TEXT,
+        content_after TEXT,
+        type_before TEXT,
+        type_after TEXT,
+        changed_fields TEXT, -- JSON array of field names that changed
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        UNIQUE (note_id, version_number)
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_row_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        row_id INTEGER NOT NULL,
+        changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        version_number INTEGER NOT NULL,
+        row_values_before_json TEXT, -- JSON: { "col_id1": value1, "col_id2": value2 }
+        row_values_after_json TEXT,  -- JSON: { "col_id1": valueA, "col_id2": valueB }
+        FOREIGN KEY (row_id) REFERENCES database_rows(id) ON DELETE CASCADE,
+        UNIQUE (row_id, version_number)
+    );
+  `);
+
   // --- Block-Based Workspace Specific Tables ---
   // Blocks (for Notion-style pages)
   db.exec(`
