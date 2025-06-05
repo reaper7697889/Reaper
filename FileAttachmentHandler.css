@@ -1,0 +1,122 @@
+.file-attachment-handler {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 8px;
+}
+
+.theme-dark .file-attachment-handler {
+  background-color: rgba(0, 0, 0, 0.2);
+}
+
+.theme-light .file-attachment-handler {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.attachment-dropzone {
+  border: 2px dashed;
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  transition: all 0.3s ease;
+}
+
+.theme-dark .attachment-dropzone {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.theme-light .attachment-dropzone {
+  border-color: rgba(0, 0, 0, 0.2);
+}
+
+.attachment-dropzone.dragging {
+  background-color: rgba(74, 144, 226, 0.1);
+  border-color: #4a90e2;
+}
+
+.attachment-dropzone p {
+  margin: 0;
+}
+
+.attachment-dropzone button {
+  background: none;
+  border: none;
+  color: #4a90e2;
+  cursor: pointer;
+  font-weight: bold;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.attachments-list {
+  margin-top: 16px;
+}
+
+.attachments-list h4 {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
+.attachments-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.attachment-item {
+  display: flex;
+  align-items: center;
+  padding: 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  transition: background-color 0.2s ease;
+}
+
+.theme-dark .attachment-item:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.theme-light .attachment-item:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.attachment-icon {
+  font-size: 24px;
+  margin-right: 12px;
+  width: 24px;
+  text-align: center;
+}
+
+.attachment-details {
+  flex-grow: 1;
+}
+
+.attachment-name {
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.attachment-name:hover {
+  text-decoration: underline;
+  color: #4a90e2;
+}
+
+.attachment-meta {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.attachment-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 18px;
+  opacity: 0.5;
+  padding: 4px 8px;
+  transition: opacity 0.2s ease;
+}
+
+.attachment-remove:hover {
+  opacity: 1;
+  color: #ff6b6b;
+}

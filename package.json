@@ -1,0 +1,30 @@
+{
+  "name": "unified-notes-app",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "electron": "^36.3.2",
+    "file-type": "^21.0.0",
+    "pressure": "^2.2.0",
+    "quill": "^2.0.3",
+    "react": "^19.1.0",
+    "react-canvas-draw": "^1.2.1",
+    "react-dom": "^19.1.0",
+    "react-force-graph": "^1.47.6",
+    "react-markdown": "^10.1.0",
+    "react-mic": "^12.4.6",
+    "react-quill": "^2.0.0",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "uuid": "^11.1.0"
+  }
+}

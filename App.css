@@ -1,0 +1,257 @@
+:root {
+  --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* Dark Theme Colors (Default) */
+  --bg-primary-dark: #1a1d21; /* Main background */
+  --bg-secondary-dark: #25282d; /* Sidebar, panes background */
+  --bg-tertiary-dark: #30343a; /* Hover, active elements */
+  --text-primary-dark: #e0e0e0; /* Primary text */
+  --text-secondary-dark: #a0a0a0; /* Secondary text, placeholders */
+  --border-color-dark: #3a3f44;
+  --accent-color-dark: #4a90e2; /* Buttons, links */
+
+  /* Light Theme Colors (Optional) */
+  --bg-primary-light: #ffffff;
+  --bg-secondary-light: #f5f5f5;
+  --bg-tertiary-light: #e0e0e0;
+  --text-primary-light: #212121;
+  --text-secondary-light: #757575;
+  --border-color-light: #d1d1d1;
+  --accent-color-light: #1976d2;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  overflow: hidden; /* Prevent body scroll */
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+/* Theme Application */
+.theme-dark {
+  background-color: var(--bg-primary-dark);
+  color: var(--text-primary-dark);
+}
+
+.theme-light {
+  background-color: var(--bg-primary-light);
+  color: var(--text-primary-light);
+}
+
+/* Top Bar */
+.top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid;
+  flex-shrink: 0; /* Prevent shrinking */
+}
+.theme-dark .top-bar { border-color: var(--border-color-dark); background-color: var(--bg-secondary-dark); }
+.theme-light .top-bar { border-color: var(--border-color-light); background-color: var(--bg-secondary-light); }
+
+.top-bar-left, .top-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.top-bar-center input[type="search"] {
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid;
+    min-width: 300px;
+}
+.theme-dark .top-bar-center input[type="search"] {
+    background-color: var(--bg-primary-dark);
+    border-color: var(--border-color-dark);
+    color: var(--text-primary-dark);
+}
+.theme-light .top-bar-center input[type="search"] {
+    background-color: var(--bg-primary-light);
+    border-color: var(--border-color-light);
+    color: var(--text-primary-light);
+}
+
+/* Main Content Area (3 Panes) */
+.main-content {
+  display: flex;
+  flex-grow: 1; /* Take remaining height */
+  overflow: hidden; /* Prevent overflow */
+}
+
+/* Sidebar */
+.sidebar {
+  width: 240px; /* Adjust as needed */
+  flex-shrink: 0;
+  border-right: 1px solid;
+  padding: 16px;
+  overflow-y: auto;
+}
+.theme-dark .sidebar { background-color: var(--bg-secondary-dark); border-color: var(--border-color-dark); }
+.theme-light .sidebar { background-color: var(--bg-secondary-light); border-color: var(--border-color-light); }
+
+.sidebar h2 {
+    margin-top: 0;
+    font-size: 1.1em;
+    color: var(--text-secondary-dark);
+}
+.theme-light .sidebar h2 { color: var(--text-secondary-light); }
+
+.nav-section {
+    padding: 8px 0;
+    cursor: pointer;
+}
+.theme-dark .nav-section:hover { background-color: var(--bg-tertiary-dark); }
+.theme-light .nav-section:hover { background-color: var(--bg-tertiary-light); }
+
+/* Middle Pane */
+.middle-pane {
+  width: 300px; /* Adjust as needed */
+  flex-shrink: 0;
+  border-right: 1px solid;
+  padding: 16px;
+  overflow-y: auto;
+}
+.theme-dark .middle-pane { background-color: var(--bg-secondary-dark); border-color: var(--border-color-dark); }
+.theme-light .middle-pane { background-color: var(--bg-secondary-light); border-color: var(--border-color-light); }
+
+.middle-pane h3 {
+    margin-top: 0;
+    font-size: 1.1em;
+    color: var(--text-secondary-dark);
+}
+.theme-light .middle-pane h3 { color: var(--text-secondary-light); }
+
+.middle-pane ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.middle-pane li {
+    padding: 8px 4px;
+    cursor: pointer;
+    border-radius: 4px;
+}
+.theme-dark .middle-pane li:hover { background-color: var(--bg-tertiary-dark); }
+.theme-light .middle-pane li:hover { background-color: var(--bg-tertiary-light); }
+
+/* Right Pane */
+.right-pane {
+  flex-grow: 1; /* Take remaining width */
+  padding: 24px;
+  overflow-y: auto;
+}
+.theme-dark .right-pane { background-color: var(--bg-primary-dark); }
+.theme-light .right-pane { background-color: var(--bg-primary-light); }
+
+.right-pane h1 {
+    margin-top: 0;
+    font-size: 1.5em;
+}
+
+/* Bottom Bar */
+.bottom-bar {
+  padding: 8px 16px;
+  border-top: 1px solid;
+  flex-shrink: 0; /* Prevent shrinking */
+  display: flex;
+  gap: 8px;
+}
+.theme-dark .bottom-bar { border-color: var(--border-color-dark); background-color: var(--bg-secondary-dark); }
+.theme-light .bottom-bar { border-color: var(--border-color-light); background-color: var(--bg-secondary-light); }
+
+/* Basic Button Styling */
+button {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: var(--font-family);
+}
+.theme-dark button {
+    background-color: var(--accent-color-dark);
+    color: #ffffff;
+}
+.theme-dark button:hover {
+    opacity: 0.9;
+}
+.theme-light button {
+    background-color: var(--accent-color-light);
+    color: #ffffff;
+}
+.theme-light button:hover {
+    opacity: 0.9;
+}
+
+/* Add more specific styles based on reference images and requirements */
+
+
+.simple-note-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0 0 16px 0;
+}
+
+.note-title-input {
+  font-size: 24px;
+  font-weight: bold;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border: none;
+  border-bottom: 1px solid;
+  outline: none;
+  width: 100%;
+}
+
+.theme-dark .note-title-input {
+  background-color: var(--bg-primary-dark);
+  color: var(--text-primary-dark);
+  border-color: var(--border-color-dark);
+}
+
+.theme-light .note-title-input {
+  background-color: var(--bg-primary-light);
+  color: var(--text-primary-light);
+  border-color: var(--border-color-light);
+}
+
+.editor-container {
+  flex-grow: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.note-details-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid;
+}
+
+.theme-dark .note-details-section {
+  border-color: var(--border-color-dark);
+}
+
+.theme-light .note-details-section {
+  border-color: var(--border-color-light);
+}
+
+.tag {
+  display: inline-block;
+  padding: 4px 8px;
+  margin: 0 4px 4px 0;
+  border-radius: 4px;
+  font-size: 12px;
+  background-color: var(--accent-color-dark);
+  color: white;
+}

@@ -1,0 +1,86 @@
+.drawing-canvas-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+.drawing-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid;
+}
+
+.theme-dark .drawing-toolbar {
+  background-color: var(--bg-tertiary-dark);
+  border-color: var(--border-color-dark);
+}
+
+.theme-light .drawing-toolbar {
+  background-color: var(--bg-tertiary-light);
+  border-color: var(--border-color-light);
+}
+
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-group.actions {
+  margin-left: auto;
+}
+
+.tool-group button {
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.canvas-wrapper {
+  flex-grow: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.canvas-wrapper canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.pressure-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pressure-bar {
+  width: 100px;
+  height: 10px;
+  background-color: #e0e0e0;
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.pressure-level {
+  height: 100%;
+  background-color: var(--accent-color-dark);
+  transition: width 0.1s ease;
+}
+
+/* Input styling */
+.drawing-toolbar input[type="color"] {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.drawing-toolbar input[type="range"] {
+  width: 100px;
+}

@@ -1,0 +1,36 @@
+.block-workspace-editor {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+.block-workspace-editor .note-title-input {
+  font-size: 24px;
+  font-weight: bold;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border: none;
+  border-bottom: 1px solid;
+  outline: none;
+  width: 100%;
+}
+
+.theme-dark .block-workspace-editor .note-title-input {
+  background-color: var(--bg-primary-dark);
+  color: var(--text-primary-dark);
+  border-color: var(--border-color-dark);
+}
+
+.theme-light .block-workspace-editor .note-title-input {
+  background-color: var(--bg-primary-light);
+  color: var(--text-primary-light);
+  border-color: var(--border-color-light);
+}
+
+.block-workspace-editor .editor-container {
+  flex-grow: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
