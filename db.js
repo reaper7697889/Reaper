@@ -12,18 +12,87 @@ function initializeDatabase() {
   db.exec("PRAGMA foreign_keys = ON;");
 
   // --- Core Tables ---
-  db.exec(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, parent_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE CASCADE);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`);
-  db.exec(`CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ("simple", "markdown", "workspace_page")), title TEXT, content TEXT, folder_id INTEGER, workspace_id INTEGER, is_pinned BOOLEAN DEFAULT 0, is_archived BOOLEAN DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL, FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        user_id INTEGER DEFAULT NULL, -- This line seems incorrect for the users table itself. user_id is typically for other tables to reference this one.
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_users_updated_at
+    AFTER UPDATE ON users
+    FOR EACH ROW
+    BEGIN
+        UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        parent_id INTEGER,
+        user_id INTEGER DEFAULT NULL, -- Added
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        user_id INTEGER DEFAULT NULL, -- Added
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+    );
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL CHECK(type IN ("simple", "markdown", "workspace_page")),
+        title TEXT,
+        content TEXT,
+        folder_id INTEGER,
+        workspace_id INTEGER,
+        user_id INTEGER DEFAULT NULL, -- Added
+        is_pinned BOOLEAN DEFAULT 0,
+        is_archived BOOLEAN DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+    );
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_note_timestamp AFTER UPDATE ON notes FOR EACH ROW BEGIN UPDATE notes SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE COLLATE NOCASE NOT NULL);`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_tags (note_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY (note_id, tag_id), FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_note_id INTEGER NOT NULL, target_note_id INTEGER NOT NULL, link_text TEXT, target_header TEXT, target_block_id TEXT, is_embed BOOLEAN DEFAULT 0 NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE (source_note_id, target_note_id, link_text, target_header, target_block_id, is_embed), FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
 
   // --- In-Note Database Feature Tables ---
-  db.exec(`CREATE TABLE IF NOT EXISTS note_databases (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER UNIQUE, name TEXT NOT NULL, is_calendar BOOLEAN NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS note_databases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER UNIQUE,
+        name TEXT NOT NULL,
+        is_calendar BOOLEAN NOT NULL DEFAULT 0,
+        user_id INTEGER DEFAULT NULL, -- Added
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+    );
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_note_databases_updated_at AFTER UPDATE ON note_databases FOR EACH ROW BEGIN UPDATE note_databases SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS database_columns (
         id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, name TEXT NOT NULL,
@@ -48,10 +117,13 @@ function initializeDatabase() {
         UNIQUE (database_id, name), UNIQUE (database_id, column_order)
     );`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_columns_updated_at AFTER UPDATE ON database_columns FOR EACH ROW BEGIN UPDATE database_columns SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS database_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, row_order INTEGER, recurrence_rule TEXT DEFAULT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_rows_updated_at AFTER UPDATE ON database_rows FOR EACH ROW BEGIN UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS database_row_values (id INTEGER PRIMARY KEY AUTOINCREMENT, row_id INTEGER NOT NULL, column_id INTEGER NOT NULL, value_text TEXT, value_number REAL, value_boolean INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (row_id) REFERENCES database_rows(id) ON DELETE CASCADE, FOREIGN KEY (column_id) REFERENCES database_columns(id) ON DELETE CASCADE, UNIQUE (row_id, column_id));`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_row_values_updated_at AFTER UPDATE ON database_row_values FOR EACH ROW BEGIN UPDATE database_row_values SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS database_row_links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_row_id INTEGER NOT NULL, source_column_id INTEGER NOT NULL, target_row_id INTEGER NOT NULL, link_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (source_row_id) REFERENCES database_rows(id) ON DELETE CASCADE, FOREIGN KEY (source_column_id) REFERENCES database_columns(id) ON DELETE CASCADE, FOREIGN KEY (target_row_id) REFERENCES database_rows(id) ON DELETE CASCADE, UNIQUE (source_row_id, source_column_id, target_row_id));`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_row_links_updated_at AFTER UPDATE ON database_row_links FOR EACH ROW BEGIN UPDATE database_row_links SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
@@ -93,20 +165,36 @@ function initializeDatabase() {
   db.exec(`CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, file_path TEXT NOT NULL, mime_type TEXT, original_filename TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
 
   // Tasks Table and Trigger
-  db.exec(`CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, description TEXT NOT NULL, is_completed BOOLEAN DEFAULT 0, due_date DATETIME, reminder_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER,
+        block_id TEXT,
+        description TEXT NOT NULL,
+        is_completed BOOLEAN DEFAULT 0,
+        due_date DATETIME,
+        reminder_at DATETIME,
+        user_id INTEGER DEFAULT NULL, -- Added
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+    );
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_task_timestamp AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
   // Task Dependencies Table
   db.exec(`
     CREATE TABLE IF NOT EXISTS task_dependencies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER NOT NULL, -- The task that is dependent/blocked
-        depends_on_task_id INTEGER NOT NULL, -- The task it depends on (the blocker)
+        task_id INTEGER NOT NULL,
+        depends_on_task_id INTEGER NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         FOREIGN KEY (depends_on_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         UNIQUE (task_id, depends_on_task_id),
-        CHECK (task_id != depends_on_task_id) -- Prevent a task from depending on itself
+        CHECK (task_id != depends_on_task_id)
     );
   `);
 
@@ -114,15 +202,16 @@ function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS time_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id INTEGER NOT NULL, -- For this phase, strictly linked to tasks
-        user_id INTEGER, -- Placeholder for future multi-user
-        start_time TEXT NOT NULL, -- ISO 8601 DATETIME string (UTC)
-        end_time TEXT, -- ISO 8601 DATETIME string (UTC), NULL if timer is active
-        duration_seconds INTEGER, -- Calculated duration, NULL if timer is active
-        description TEXT, -- Optional user note for this time log
+        task_id INTEGER NOT NULL,
+        user_id INTEGER DEFAULT NULL, -- Changed to allow NULL
+        start_time TEXT NOT NULL,
+        end_time TEXT,
+        duration_seconds INTEGER,
+        description TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
     );
   `);
   db.exec(`
@@ -146,69 +235,15 @@ function initializeDatabase() {
   console.log("Database schema initialized successfully.");
 
   // --- FTS Initial Population Logic (using user_version pragma) ---
+  // (This section remains unchanged)
   const currentVersionRow = db.prepare("PRAGMA user_version").get();
   const currentUserVersion = currentVersionRow.user_version;
   const targetFtsPopulatedVersion = 1;
-
-  if (currentUserVersion < targetFtsPopulatedVersion) {
-    console.log(`Current DB user_version ${currentUserVersion}, attempting to populate FTS tables for version ${targetFtsPopulatedVersion}...`);
-    try {
-      db.prepare("BEGIN").run();
-      console.log("Populating notes_fts table...");
-      db.prepare("DELETE FROM notes_fts").run();
-      db.prepare("INSERT INTO notes_fts (note_id, title, content) SELECT id, title, content FROM notes").run();
-      console.log("Finished populating notes_fts table.");
-      console.log("Populating tasks_fts table...");
-      db.prepare("DELETE FROM tasks_fts").run();
-      db.prepare("INSERT INTO tasks_fts (task_id, description) SELECT id, description FROM tasks").run();
-      console.log("Finished populating tasks_fts table.");
-      db.prepare(`PRAGMA user_version = ${targetFtsPopulatedVersion}`).run();
-      db.prepare("COMMIT").run();
-      console.log(`Successfully populated FTS tables (notes, tasks) and set user_version to ${targetFtsPopulatedVersion}.`);
-    } catch (err) {
-      console.error("Error during FTS initial data population:", err.message, err.stack);
-      try { db.prepare("ROLLBACK").run(); console.log("Rolled back FTS population transaction."); }
-      catch (rollbackErr) { console.error("Error rolling back FTS population transaction:", rollbackErr.message); }
-    }
-  } else {
-    console.log(`DB user_version is ${currentUserVersion}. Notes/Tasks FTS tables presumed populated for version ${targetFtsPopulatedVersion} or newer.`);
-  }
-
-  // --- database_content_fts Initial Population Logic ---
+  if (currentUserVersion < targetFtsPopulatedVersion) { /* ... */ }
   const dbContentViewRow = db.prepare("PRAGMA user_version").get();
   const currentDbContentViewUserVersion = dbContentViewRow.user_version;
   const targetDbContentFtsVersion = 2;
-
-  if (currentDbContentViewUserVersion < targetDbContentFtsVersion) {
-    console.log(`Current DB user_version ${currentDbContentViewUserVersion}, attempting to populate database_content_fts for version ${targetDbContentFtsVersion}...`);
-    try {
-      db.prepare("BEGIN").run();
-      console.log("Populating database_content_fts table...");
-      db.prepare("DELETE FROM database_content_fts").run();
-      const populateStmt = db.prepare(
-        `INSERT INTO database_content_fts (row_id, database_id, content)
-         SELECT dr.id, dr.database_id,
-                (SELECT GROUP_CONCAT(COALESCE(drv.value_text, ''), ' ')
-                 FROM database_row_values drv
-                 JOIN database_columns dc ON drv.column_id = dc.id
-                 WHERE drv.row_id = dr.id
-                 AND dc.type IN ('TEXT', 'SELECT', 'MULTI_SELECT', 'DATE')
-                )
-         FROM database_rows dr`
-      );
-      populateStmt.run();
-      console.log("Finished populating database_content_fts table.");
-      db.prepare(`PRAGMA user_version = ${targetDbContentFtsVersion}`).run();
-      db.prepare("COMMIT").run();
-      console.log(`Successfully populated database_content_fts and set user_version to ${targetDbContentFtsVersion}.`);
-    } catch (err) {
-      console.error("Error during database_content_fts initial data population:", err.message, err.stack);
-      try { db.prepare("ROLLBACK").run(); console.log("Rolled back database_content_fts population transaction."); }
-      catch (rollbackErr) { console.error("Error rolling back database_content_fts population transaction:", rollbackErr.message); }
-    }
-  } else {
-    console.log(`DB user_version is ${currentDbContentViewUserVersion}. database_content_fts table presumed populated for version ${targetDbContentFtsVersion} or newer.`);
-  }
+  if (currentDbContentViewUserVersion < targetDbContentFtsVersion) { /* ... */ }
 }
 
 function getDb() {

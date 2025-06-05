@@ -81,13 +81,15 @@ function _validateLookupDefinition(lookupArgs, db, currentDatabaseId) { /* ... (
 }
 
 // --- Database Management ---
-function createDatabase({ name, noteId = null, is_calendar = 0 }) {
+function createDatabase(args) {
   const db = getDb();
+  const { name, noteId = null, is_calendar = 0, userId = null } = args; // Extract userId from args
+
   if (!name || typeof name !== 'string' || name.trim() === "") return { success: false, error: "Database name is required." };
   try {
-    const stmt = db.prepare("INSERT INTO note_databases (name, note_id, is_calendar) VALUES (?, ?, ?)");
-    const info = stmt.run(name.trim(), noteId, is_calendar ? 1 : 0);
-    const newDb = getDatabaseById(info.lastInsertRowid);
+    const stmt = db.prepare("INSERT INTO note_databases (name, note_id, is_calendar, user_id) VALUES (?, ?, ?, ?)"); // Add user_id to SQL
+    const info = stmt.run(name.trim(), noteId, is_calendar ? 1 : 0, userId); // Pass userId
+    const newDb = getDatabaseById(info.lastInsertRowid); // This should fetch the object including user_id
     if (newDb) return { success: true, database: newDb };
     return { success: false, error: "Failed to retrieve newly created database."};
   } catch (err) { console.error("Error creating database:", err.message); return { success: false, error: "Failed to create database." }; }
@@ -96,6 +98,7 @@ function createDatabase({ name, noteId = null, is_calendar = 0 }) {
 function getDatabaseById(databaseId) {
   const db = getDb();
   try {
+    // Ensure user_id is selected if the column exists on note_databases
     const row = db.prepare("SELECT * FROM note_databases WHERE id = ?").get(databaseId);
     if (row) row.is_calendar = !!row.is_calendar; // Parse to boolean
     return row || null;

@@ -38,10 +38,10 @@ async function getActiveTimerForTask(taskId, db = getDb()) {
 /**
  * Starts a new timer for a task.
  * @param {number} taskId
- * @param {object} [options={}] - { description = null }
+ * @param {object} [options={}] - { description = null, userId = null }
  * @returns {Promise<object>} - { success, newLog?: object, error?: string, activeTimer?: object }
  */
-async function startTimerForTask(taskId, { description = null } = {}) {
+async function startTimerForTask(taskId, { description = null, userId = null } = {}) { // Added userId to options
     const db = getDb();
     const transaction = db.transaction(async () => { // Make transaction callback async
         const task = await taskService.getTaskById(taskId); // getTaskById is sync, but await is harmless
@@ -55,10 +55,10 @@ async function startTimerForTask(taskId, { description = null } = {}) {
 
         const startTime = _toISOString(new Date());
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, description) VALUES (?, ?, ?)"
+            "INSERT INTO time_logs (task_id, start_time, description, user_id) VALUES (?, ?, ?, ?)" // Added user_id column
         );
-        const info = stmt.run(taskId, startTime, description);
-        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
+        const info = stmt.run(taskId, startTime, description, userId); // Pass userId
+        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid); // Should fetch user_id
         return { success: true, newLog };
     });
 
@@ -124,10 +124,10 @@ async function stopTimerForTask(taskId, { endTimeStr = null, description = null 
 /**
  * Adds a manual time log entry for a task.
  * @param {number} taskId
- * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description? }
+ * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description?, userId? }
  * @returns {Promise<object>} - { success, newLog?: object, error?: string }
  */
-async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationSeconds, description = null }) {
+async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationSeconds, description = null, userId = null }) { // Added userId
     const db = getDb();
     const transaction = db.transaction(async () => {
         const task = await taskService.getTaskById(taskId);
@@ -157,10 +157,10 @@ async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationS
         if (finalDurationSeconds < 0) throw new Error("Calculated duration is negative. End time must be after start time.");
 
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, end_time, duration_seconds, description) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO time_logs (task_id, start_time, end_time, duration_seconds, description, user_id) VALUES (?, ?, ?, ?, ?, ?)" // Added user_id column
         );
-        const info = stmt.run(taskId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description);
-        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
+        const info = stmt.run(taskId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description, userId); // Pass userId
+        const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid); // Should fetch user_id
         return { success: true, newLog };
     });
 

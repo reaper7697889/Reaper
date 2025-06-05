@@ -8,7 +8,8 @@ const linkService = require('./linkService');
 
 function createNote(noteData) {
   const db = getDb();
-  const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0 } = noteData;
+  // Ensure userId is destructured, defaulting to null if not provided
+  const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0, userId = null } = noteData;
 
   if (!type || !["simple", "markdown", "workspace_page"].includes(type)) {
     console.error("Invalid note type provided.");
@@ -18,27 +19,29 @@ function createNote(noteData) {
   let newNoteId;
   const transaction = db.transaction(() => {
     const stmt = db.prepare(`
-      INSERT INTO notes (type, title, content, folder_id, workspace_id, is_pinned, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO notes (type, title, content, folder_id, workspace_id, user_id, is_pinned, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    const info = stmt.run(type, title, content, folder_id, workspace_id, is_pinned ? 1 : 0);
+    // Pass userId to the SQL execution
+    const info = stmt.run(type, title, content, folder_id, workspace_id, userId, is_pinned ? 1 : 0);
     newNoteId = info.lastInsertRowid;
     if (!newNoteId) {
       throw new Error("Failed to create note or retrieve newNoteId.");
     }
-    // History will be recorded outside main transaction for now to keep createNote sync if possible
-    // or if createNote is async, this should be inside transaction and awaited.
   });
 
   try {
-    transaction(); // Execute transaction
+    transaction();
     if (newNoteId) {
         console.log(`Created note with ID: ${newNoteId}`);
-        // Fire-and-forget history for creation to keep createNote synchronous for now
-        // A more robust system would make createNote async and include history in its transaction.
-        const newValuesForHistory = { title, content, type };
-        const oldValuesForHistory = { title: null, content: null, type: null };
-        const changedFieldsArray = Object.keys(newValuesForHistory).filter(k => newValuesForHistory[k] !== null && newValuesForHistory[k] !== undefined);
+        // Ensure userId is part of the newValues for history if available
+        const newValuesForHistory = { title, content, type, folder_id, workspace_id, is_pinned, userId };
+        const oldValuesForHistory = { title: null, content: null, type: null, folder_id: null, workspace_id: null, is_pinned: null, userId: null };
+        // Determine changed fields more comprehensively for history
+        const changedFieldsArray = Object.keys(newValuesForHistory).filter(k =>
+            newValuesForHistory[k] !== undefined && newValuesForHistory[k] !== oldValuesForHistory[k]
+        );
+
         recordNoteHistory({
             noteId: newNoteId,
             oldValues: oldValuesForHistory,
@@ -46,6 +49,7 @@ function createNote(noteData) {
             changedFields: changedFieldsArray
         }).catch(err => console.error(`Async history recording failed for new note ${newNoteId}:`, err.message));
     }
+    // The function returns the ID. The caller can use getNoteById to get the full object including user_id.
     return newNoteId;
   } catch (err) {
     console.error("Error creating note:", err.message, err.stack);
@@ -55,9 +59,14 @@ function createNote(noteData) {
 
 function getNoteById(id) {
   const db = getDb();
-  const stmt = db.prepare("SELECT * FROM notes WHERE id = ?");
+  // Ensure user_id is selected if it exists on the table
+  const stmt = db.prepare("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?");
   try {
-    return stmt.get(id) || null;
+    const note = stmt.get(id);
+    if (note) {
+        // No boolean conversion needed here as it's done by consumer or specific getters
+    }
+    return note || null;
   } catch (err) {
     console.error(`Error getting note ${id}:`, err.message);
     return null;
@@ -67,15 +76,21 @@ function getNoteById(id) {
 async function updateNote(noteId, updateData) {
   const db = getDb();
 
-  const oldNote = getNoteById(noteId);
+  const oldNote = getNoteById(noteId); // This will now include user_id if selected by getNoteById
   if (!oldNote) {
     console.error(`Error updating note ${noteId}: Note not found.`);
     return false;
   }
 
-  const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type };
+  // Include user_id in history tracking if it can be changed via updateNote (though not typical for ownership)
+  // For this phase, user_id is set at creation. If it were updatable, it'd be in updatableNoteFields.
+  const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type /*, user_id: oldNote.user_id */ };
   const newValuesForHistory = { ...oldValuesForHistory };
   const changedFieldsArray = [];
+
+  // user_id is generally not in updatableNoteFields by typical user actions, but rather set at creation or by specific ownership transfer logic.
+  // If user_id can be part of updateData, it needs to be added to updatableNoteFields.
+  // For now, assuming user_id is NOT changed via general updateNote.
   const updatableNoteFields = ["title", "content", "type", "folder_id", "workspace_id", "is_pinned", "is_archived"];
   const versionedFields = ["title", "content", "type"];
   const fieldsToUpdateInNotes = [];
@@ -133,9 +148,6 @@ async function updateNote(noteId, updateData) {
     }
 
     if (shouldUpdateBacklinks) {
-      // This was the previous logic for updating links based on title change.
-      // linkService.updateLinksFromContent(noteId, newValuesForHistory.content);
-      // The above is too broad if only title changed. The one below is more specific.
       const updateLinksStmt = db.prepare("UPDATE links SET link_text = ? WHERE target_note_id = ? AND link_text = ?");
       updateLinksStmt.run(newValuesForHistory.title, noteId, oldValuesForHistory.title);
       console.log(`Updated link texts for note ${noteId} from '${oldValuesForHistory.title}' to '${newValuesForHistory.title}'.`);
@@ -153,14 +165,11 @@ async function updateNote(noteId, updateData) {
 function deleteNote(noteId) {
   const db = getDb();
   const transaction = db.transaction(() => {
-    // Delete the note itself
     const stmt = db.prepare("DELETE FROM notes WHERE id = ?");
     const info = stmt.run(noteId);
 
     if (info.changes > 0) {
       console.log(`Deleted note ${noteId}. Rows affected: ${info.changes}`);
-
-      // Clean up links in database_row_links targeting this note
       const cleanupStmt = db.prepare(`
         DELETE FROM database_row_links
         WHERE target_row_id = ?
@@ -172,17 +181,15 @@ function deleteNote(noteId) {
       `);
       const cleanupInfo = cleanupStmt.run(noteId);
       console.log(`Cleaned up ${cleanupInfo.changes} 'NOTES_TABLE' relation links targeting deleted note ${noteId}.`);
-      return true; // Note deletion was successful
+      return true;
     }
-    return false; // Note not found or not deleted
+    return false;
   });
 
   try {
     return transaction();
   } catch (err) {
     console.error(`Error deleting note ${noteId} or its related links:`, err.message, err.stack);
-    // Attempt to rollback if any part of the transaction threw an error not caught by db.transaction itself
-    // This is belt-and-suspenders as db.transaction should handle it.
     try { db.prepare("ROLLBACK").run(); } catch (e) { /* ignore rollback error */ }
     return false;
   }
@@ -190,7 +197,8 @@ function deleteNote(noteId) {
 
 function listNotesByFolder(folderId) {
     const db = getDb();
-    const stmt = db.prepare("SELECT id, type, title, is_pinned, updated_at FROM notes WHERE folder_id = ? AND is_archived = 0 ORDER BY is_pinned DESC, updated_at DESC");
+    // Ensure user_id is selected if needed by frontend for display/filtering
+    const stmt = db.prepare("SELECT id, type, title, user_id, is_pinned, updated_at FROM notes WHERE folder_id = ? AND is_archived = 0 ORDER BY is_pinned DESC, updated_at DESC");
     try { return stmt.all(folderId); }
     catch (err) { console.error(`Error listing notes for folder ${folderId}:`, err.message); return []; }
 }

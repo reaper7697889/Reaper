@@ -23,7 +23,8 @@ const importService = require('./src/backend/services/importService');
 const searchService = require('./src/backend/services/searchService');
 const calendarService = require('./src/backend/services/calendarService');
 const timelineService = require('./src/backend/services/timelineService');
-const timeLogService = require('./src/backend/services/timeLogService'); // Added timeLogService
+const timeLogService = require('./src/backend/services/timeLogService');
+const userService = require('./src/backend/services/userService'); // Added userService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -387,6 +388,25 @@ ipcMain.handle("timelogs:getActiveTimerForTask", async (event, taskId) => {
     } catch (error) {
         console.error("Error in 'timelogs:getActiveTimerForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get active timer." };
+    }
+});
+
+// --- User Service ---
+ipcMain.handle("user:register", async (event, username, password) => {
+    try {
+        return await userService.registerUser(username, password);
+    } catch (error) {
+        console.error("Error in 'user:register' IPC handler:", error);
+        return { success: false, error: error.message || "User registration failed." };
+    }
+});
+
+ipcMain.handle("user:login", async (event, username, password) => {
+    try {
+        return await userService.loginUser(username, password);
+    } catch (error) {
+        console.error("Error in 'user:login' IPC handler:", error);
+        return { success: false, error: error.message || "User login failed." };
     }
 });
 
