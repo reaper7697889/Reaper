@@ -12,7 +12,10 @@ const linkService = require("./src/backend/services/linkService");
 const taskService = require("./src/backend/services/taskService");
 const folderService = require("./src/backend/services/folderService");
 const workspaceService = require("./src/backend/services/workspaceService");
-const graphService = require("./src/backend/services/graphService"); // Added graphService
+const graphService = require("./src/backend/services/graphService");
+const databaseDefService = require("./src/backend/services/databaseDefService");
+const databaseRowService = require("./src/backend/services/databaseRowService");
+const databaseQueryService = require("./src/backend/services/databaseQueryService"); // Added databaseQueryService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -88,6 +91,26 @@ ipcMain.handle("db:getTasksForBlock", (e, blockId) => taskService.getTasksForBlo
 ipcMain.handle("graph:getGraphData", async () => {
   return graphService.getGraphData();
 });
+
+// Database Definition Service
+ipcMain.handle("dbdef:createDatabase", (e, args) => databaseDefService.createDatabase(args));
+ipcMain.handle("dbdef:getDatabaseById", (e, id) => databaseDefService.getDatabaseById(id));
+ipcMain.handle("dbdef:getDatabasesForNote", (e, noteId) => databaseDefService.getDatabasesForNote(noteId));
+ipcMain.handle("dbdef:updateDatabaseName", (e, args) => databaseDefService.updateDatabaseName(args));
+ipcMain.handle("dbdef:deleteDatabase", (e, id) => databaseDefService.deleteDatabase(id));
+ipcMain.handle("dbdef:addColumn", (e, args) => databaseDefService.addColumn(args));
+ipcMain.handle("dbdef:getColumnsForDatabase", (e, dbId) => databaseDefService.getColumnsForDatabase(dbId));
+ipcMain.handle("dbdef:updateColumn", (e, args) => databaseDefService.updateColumn(args));
+ipcMain.handle("dbdef:deleteColumn", (e, id) => databaseDefService.deleteColumn(id));
+
+// Database Row Service
+ipcMain.handle("dbrow:addRow", (e, args) => databaseRowService.addRow(args));
+ipcMain.handle("dbrow:getRow", (e, id) => databaseRowService.getRow(id));
+ipcMain.handle("dbrow:updateRow", (e, args) => databaseRowService.updateRow(args));
+ipcMain.handle("dbrow:deleteRow", (e, id) => databaseRowService.deleteRow(id));
+
+// Database Query Service
+ipcMain.handle("dbquery:getRowsForDatabase", (e, databaseId, options) => databaseQueryService.getRowsForDatabase(databaseId, options));
 
 // --- App Lifecycle ---
 

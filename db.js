@@ -110,6 +110,94 @@ function initializeDatabase() {
     );
   `);
 
+  // --- In-Note Database Feature Tables ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS note_databases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER UNIQUE, -- Each note can have at most one database directly associated
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_note_databases_updated_at
+    AFTER UPDATE ON note_databases
+    FOR EACH ROW
+    BEGIN
+        UPDATE note_databases SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_columns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        database_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT')),
+        column_order INTEGER NOT NULL,
+        default_value TEXT,
+        select_options TEXT, -- JSON string array for SELECT/MULTI_SELECT, e.g., '["Opt1", "Opt2"]'
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
+        UNIQUE (database_id, name),
+        UNIQUE (database_id, column_order)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_columns_updated_at
+    AFTER UPDATE ON database_columns
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_columns SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_rows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        database_id INTEGER NOT NULL,
+        row_order INTEGER, -- Nullable, can be used for manual sort order
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_rows_updated_at
+    AFTER UPDATE ON database_rows
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_row_values (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        row_id INTEGER NOT NULL,
+        column_id INTEGER NOT NULL,
+        value_text TEXT,    -- For TEXT, DATE, SELECT, MULTI_SELECT (JSON array)
+        value_number REAL,  -- For NUMBER
+        value_boolean INTEGER, -- For BOOLEAN (0 or 1)
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (row_id) REFERENCES database_rows(id) ON DELETE CASCADE,
+        FOREIGN KEY (column_id) REFERENCES database_columns(id) ON DELETE CASCADE,
+        UNIQUE (row_id, column_id)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_row_values_updated_at
+    AFTER UPDATE ON database_row_values
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_row_values SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
   // --- Block-Based Workspace Specific Tables ---
   // Blocks (for Notion-style pages)
   db.exec(`
