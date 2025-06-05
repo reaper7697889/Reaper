@@ -124,6 +124,8 @@ ipcMain.handle("rules:deleteRule", (e, id) => smartRuleService.deleteRule(id));
 // History Service
 ipcMain.handle("history:getNoteHistory", (e, noteId, options) => historyService.getNoteHistory(noteId, options));
 ipcMain.handle("history:getRowHistory", (e, rowId, options) => historyService.getRowHistory(rowId, options));
+ipcMain.handle("history:revertNoteToVersion", (e, noteId, versionNumber) => historyService.revertNoteToVersion(noteId, versionNumber));
+ipcMain.handle("history:revertRowToVersion", (e, rowId, versionNumber) => historyService.revertRowToVersion(rowId, versionNumber));
 
 // --- App Lifecycle ---
 
