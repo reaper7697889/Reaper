@@ -1,34 +1,28 @@
 // src/backend/services/databaseDefService.js
 const { getDb } = require("../db");
 
-// Updated to include 'FORMULA'
-const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA'];
+// Updated to include 'ROLLUP'
+const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP'];
+const ALLOWED_ROLLUP_FUNCTIONS = [
+    'COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES',
+    'SUM', 'AVG', 'MIN', 'MAX',
+    'SHOW_UNIQUE', // Primarily for text/select, might show as comma-separated string or array
+    'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY',
+    'COUNT_CHECKED', 'COUNT_UNCHECKED',
+    'PERCENT_CHECKED', 'PERCENT_UNCHECKED'
+];
 
 // --- Helper Functions ---
-/**
- * Clears the inverse link of a given column.
- * @param {number} inverseColumnId - The ID of the column whose inverse_column_id needs to be nulled.
- * @param {object} db - The database instance.
- */
 function _clearInverseColumnLink(inverseColumnId, db) {
     if (inverseColumnId === null || inverseColumnId === undefined) return;
     try {
-        const stmt = db.prepare("UPDATE database_columns SET inverse_column_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-        stmt.run(inverseColumnId);
+        db.prepare("UPDATE database_columns SET inverse_column_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(inverseColumnId);
         console.log(`Cleared inverse_column_id for column ${inverseColumnId}`);
     } catch (err) {
         console.error(`Error clearing inverse_column_id for column ${inverseColumnId}:`, err.message);
     }
 }
 
-/**
- * Validates a target column for establishing a bidirectional link.
- * @param {number} targetColumnId - The ID of the potential inverse column.
- * @param {number} expectedDbId - The database_id where targetColumnId should exist.
- * @param {number} expectedBacklinkDbId - The linked_database_id targetColumnId should point to.
- * @param {object} db - The database instance.
- * @returns {object|string} - The target column object if valid, or an error string.
- */
 function _validateTargetInverseColumn(targetColumnId, expectedDbId, expectedBacklinkDbId, db) {
     const targetCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(targetColumnId);
     if (!targetCol) return "Target inverse column not found.";
@@ -38,12 +32,49 @@ function _validateTargetInverseColumn(targetColumnId, expectedDbId, expectedBack
     return targetCol;
 }
 
+function _validateRollupDefinition(rollupArgs, db, currentDatabaseId) {
+    const { rollup_source_relation_column_id, rollup_target_column_id, rollup_function } = rollupArgs;
+
+    if (rollup_source_relation_column_id === null || rollup_source_relation_column_id === undefined) return "Rollup source relation column ID is required.";
+    if (rollup_target_column_id === null || rollup_target_column_id === undefined) return "Rollup target column ID is required.";
+    if (!rollup_function) return "Rollup function is required.";
+    if (!ALLOWED_ROLLUP_FUNCTIONS.includes(rollup_function)) return `Invalid rollup function: ${rollup_function}.`;
+
+    const sourceCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(rollup_source_relation_column_id);
+    if (!sourceCol) return `Rollup source relation column ID ${rollup_source_relation_column_id} not found.`;
+    if (sourceCol.database_id !== currentDatabaseId) return "Rollup source relation column must be in the same database as the rollup column.";
+    if (sourceCol.type !== 'RELATION') return "Rollup source column must be of type RELATION.";
+    if (sourceCol.linked_database_id === null) return "Rollup source relation column does not have a linked database.";
+
+    const targetCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(rollup_target_column_id);
+    if (!targetCol) return `Rollup target column ID ${rollup_target_column_id} not found.`;
+    if (targetCol.database_id !== sourceCol.linked_database_id) return "Rollup target column is not in the database linked by the source relation column.";
+
+    // Type Compatibility Checks
+    const targetType = targetCol.type === 'FORMULA' ? targetCol.formula_result_type : targetCol.type;
+    if (!targetType) { // Could happen if formula_result_type is null for a formula target
+        return `Rollup target column (ID: ${targetCol.id}) is a FORMULA with an undefined result type. Cannot perform rollup.`;
+    }
+
+    if (['SUM', 'AVG'].includes(rollup_function) && targetType !== 'NUMBER') {
+      return `Rollup function ${rollup_function} requires the target column ('${targetCol.name}') to be of type NUMBER (or a FORMULA resulting in NUMBER). Actual type: ${targetType}.`;
+    }
+    if (['COUNT_CHECKED', 'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED'].includes(rollup_function) && targetType !== 'BOOLEAN') {
+      return `Rollup function ${rollup_function} requires the target column ('${targetCol.name}') to be of type BOOLEAN (or a FORMULA resulting in BOOLEAN). Actual type: ${targetType}.`;
+    }
+    if (['MIN', 'MAX'].includes(rollup_function) && !['NUMBER', 'DATE'].includes(targetType)) {
+         return `Rollup function ${rollup_function} requires the target column ('${targetCol.name}') to be of type NUMBER or DATE. Actual type: ${targetType}.`;
+    }
+    // SHOW_UNIQUE, COUNT_ALL, COUNT_VALUES, COUNT_UNIQUE_VALUES, PERCENT_EMPTY, PERCENT_NOT_EMPTY are generally compatible with most types.
+
+    return null; // No error
+}
+
+
 // --- Database Management ---
 function createDatabase({ name, noteId = null }) {
   const db = getDb();
-  if (!name || typeof name !== 'string' || name.trim() === "") {
-    return { success: false, error: "Database name is required." };
-  }
+  if (!name || typeof name !== 'string' || name.trim() === "") return { success: false, error: "Database name is required." };
   try {
     const stmt = db.prepare("INSERT INTO note_databases (name, note_id) VALUES (?, ?)");
     const info = stmt.run(name.trim(), noteId);
@@ -114,7 +145,10 @@ function addColumn(args) {
     targetInverseColumnName,
     existingTargetInverseColumnId,
     formula_definition: origFormulaDefinition,
-    formula_result_type: origFormulaResultType
+    formula_result_type: origFormulaResultType,
+    rollup_source_relation_column_id: origRollupSrcRelId,
+    rollup_target_column_id: origRollupTargetId,
+    rollup_function: origRollupFunc
   } = args;
 
   const db = getDb();
@@ -129,56 +163,55 @@ function addColumn(args) {
   let defaultValue = origDefaultValue;
   let selectOptions = origSelectOptions;
   let linkedDatabaseId = origLinkedDbId;
-  let inverseColumnId = null; // Will be set by bidirectional logic if applicable
   let formulaDefinition = origFormulaDefinition;
   let formulaResultType = origFormulaResultType;
+  let rollupSourceRelId = origRollupSrcRelId;
+  let rollupTargetId = origRollupTargetId;
+  let rollupFunction = origRollupFunc;
 
-  // Type-specific validation and field nullification
+  // Nullify fields not applicable to the chosen type
+  if (type !== 'RELATION') { linkedDatabaseId = null; /* inverseColumnId is handled by bidirectional logic */ }
+  if (type !== 'FORMULA') { formulaDefinition = null; formulaResultType = null; }
+  if (type !== 'ROLLUP') { rollupSourceRelId = null; rollupTargetId = null; rollupFunction = null; }
+  if (type !== 'SELECT' && type !== 'MULTI_SELECT') { selectOptions = null; }
+  if (type === 'RELATION' || type === 'FORMULA' || type === 'ROLLUP') { defaultValue = null; }
+
+
+  // Type-specific validation and field setup
   if (type === 'RELATION') {
-    if (linkedDatabaseId === null || linkedDatabaseId === undefined) {
-      return { success: false, error: "linkedDatabaseId is required for RELATION type columns." };
-    }
+    if (linkedDatabaseId === null || linkedDatabaseId === undefined) return { success: false, error: "linkedDatabaseId is required for RELATION type columns." };
     const targetDbInfo = getDatabaseById(linkedDatabaseId);
     if (!targetDbInfo) return { success: false, error: `Linked database ID ${linkedDatabaseId} not found.` };
-    defaultValue = null; selectOptions = null; formulaDefinition = null; formulaResultType = null;
   } else if (type === 'FORMULA') {
-    if (!formulaDefinition || String(formulaDefinition).trim() === "") {
-        return { success: false, error: "formula_definition is required for FORMULA type columns."};
-    }
-    // formula_result_type is optional
-    defaultValue = null; selectOptions = null; linkedDatabaseId = null; /* inverseColumnId already null */
-  } else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
-    linkedDatabaseId = null; /* inverseColumnId already null */
-    formulaDefinition = null; formulaResultType = null;
-    if (makeBidirectional) return { success: false, error: "Bidirectional links can only be made for RELATION type columns."};
-    if (type === 'SELECT' || type === 'MULTI_SELECT') {
-      if (selectOptions) {
-        try {
-          if (typeof selectOptions === 'string') JSON.parse(selectOptions);
-          else if (Array.isArray(selectOptions)) selectOptions = JSON.stringify(selectOptions);
-          else return { success: false, error: "selectOptions must be a JSON string array."};
-        } catch (e) { return { success: false, error: "Invalid JSON for selectOptions." }; }
-      } else {
-        selectOptions = JSON.stringify([]);
-      }
+    if (!formulaDefinition || String(formulaDefinition).trim() === "") return { success: false, error: "formula_definition is required for FORMULA type columns."};
+  } else if (type === 'ROLLUP') {
+    const rollupValidationError = _validateRollupDefinition({ rollup_source_relation_column_id: rollupSourceRelId, rollup_target_column_id: rollupTargetId, rollup_function: rollupFunction }, db, databaseId);
+    if (rollupValidationError) return { success: false, error: rollupValidationError };
+  } else if (type === 'SELECT' || type === 'MULTI_SELECT') {
+    if (selectOptions) {
+      try {
+        if (typeof selectOptions === 'string') JSON.parse(selectOptions);
+        else if (Array.isArray(selectOptions)) selectOptions = JSON.stringify(selectOptions);
+        else return { success: false, error: "selectOptions must be a JSON string array."};
+      } catch (e) { return { success: false, error: "Invalid JSON for selectOptions." }; }
     } else {
-      selectOptions = null;
+      selectOptions = JSON.stringify([]);
     }
   }
 
   const transaction = db.transaction(() => {
     const colAStmt = db.prepare(
       `INSERT INTO database_columns (
-        database_id, name, type, column_order,
-        default_value, select_options, linked_database_id, inverse_column_id,
-        formula_definition, formula_result_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        database_id, name, type, column_order, default_value, select_options,
+        linked_database_id, inverse_column_id,
+        formula_definition, formula_result_type,
+        rollup_source_relation_column_id, rollup_target_column_id, rollup_function
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
     );
-    // inverse_column_id is initially NULL, will be updated if bidirectional
     const colAInfo = colAStmt.run(
-        databaseId, trimmedName, type, columnOrder,
-        defaultValue, selectOptions, linkedDatabaseId, null,
-        formulaDefinition, formulaResultType
+        databaseId, trimmedName, type, columnOrder, defaultValue, selectOptions,
+        linkedDatabaseId, formulaDefinition, formulaResultType,
+        rollupSourceRelId, rollupTargetId, rollupFunction
     );
     const colAId = colAInfo.lastInsertRowid;
     if (!colAId) throw new Error("Failed to create primary column.");
@@ -203,10 +236,9 @@ function addColumn(args) {
         const lastOrderStmt = db.prepare("SELECT MAX(column_order) as max_order FROM database_columns WHERE database_id = ?");
         const lastOrderResult = lastOrderStmt.get(linkedDatabaseId);
         const colBOrder = (lastOrderResult && typeof lastOrderResult.max_order === 'number' ? lastOrderResult.max_order : 0) + 1;
-
         const colBStmt = db.prepare(
-          "INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id, formula_definition, formula_result_type) VALUES (?, ?, 'RELATION', ?, ?, ?, NULL, NULL)"
-        );
+          "INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id) VALUES (?, ?, 'RELATION', ?, ?, ?)"
+        ); // Other fields default to NULL for ColB
         const colBInfo = colBStmt.run(linkedDatabaseId, invColName, colBOrder, databaseId, colAId);
         colBId = colBInfo.lastInsertRowid;
         if (!colBId) throw new Error("Failed to create inverse column.");
@@ -221,7 +253,7 @@ function addColumn(args) {
     const finalColA = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(colAId);
     return { success: true, column: finalColA };
   } catch (err) {
-    console.error("Error adding column (transactional part):", err.message);
+    console.error("Error adding column (transactional part):", err.message, err.stack);
      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         if (err.message.includes('name')) return { success: false, error: "Column name already exists for this database." };
         if (err.message.includes('column_order')) return { success: false, error: "Column order already exists for this database." };
@@ -233,7 +265,7 @@ function addColumn(args) {
 function getColumnsForDatabase(databaseId) {
   const db = getDb();
   try {
-    const stmt = db.prepare("SELECT id, database_id, name, type, column_order, default_value, select_options, linked_database_id, inverse_column_id, formula_definition, formula_result_type FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
+    const stmt = db.prepare("SELECT id, database_id, name, type, column_order, default_value, select_options, linked_database_id, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
     return stmt.all(databaseId);
   } catch (err) {
     console.error(`Error getting columns for database ${databaseId}:`, err.message);
@@ -253,13 +285,20 @@ function updateColumn(args) {
     const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
     if (!currentCol) throw new Error("Column not found.");
 
-    let newType = updateData.type !== undefined ? updateData.type : currentCol.type;
-    let newLinkedDbId = updateData.linked_database_id !== undefined ? updateData.linked_database_id : currentCol.linked_database_id;
-    let newInverseColId = updateData.inverse_column_id !== undefined ? updateData.inverse_column_id : currentCol.inverse_column_id;
-
     const fieldsToSet = new Map();
+    let mustClearRowLinks = false;
 
-    // Handle name, columnOrder first as they are simpler
+    // Determine final characteristics of the column after update
+    const finalType = updateData.type !== undefined ? updateData.type : currentCol.type;
+    let finalLinkedDbId = updateData.linked_database_id !== undefined ? updateData.linked_database_id : currentCol.linked_database_id;
+    let finalInverseColId = updateData.inverse_column_id !== undefined ? updateData.inverse_column_id : currentCol.inverse_column_id;
+
+    let finalRollupSourceRelId = updateData.rollup_source_relation_column_id !== undefined ? updateData.rollup_source_relation_column_id : currentCol.rollup_source_relation_column_id;
+    let finalRollupTargetId = updateData.rollup_target_column_id !== undefined ? updateData.rollup_target_column_id : currentCol.rollup_target_column_id;
+    let finalRollupFunc = updateData.rollup_function !== undefined ? updateData.rollup_function : currentCol.rollup_function;
+
+
+    // Name & Column Order
     if (updateData.name !== undefined) fieldsToSet.set("name", updateData.name.trim());
     if (updateData.columnOrder !== undefined) fieldsToSet.set("column_order", updateData.columnOrder);
 
@@ -268,70 +307,82 @@ function updateColumn(args) {
       if (!ALLOWED_COLUMN_TYPES.includes(updateData.type)) throw new Error(`Invalid new type: ${updateData.type}`);
       fieldsToSet.set("type", updateData.type);
 
-      // Clear fields from old type if switching from RELATION or to/from FORMULA
-      if (currentCol.type === 'RELATION' && newType !== 'RELATION') {
+      // Cleanup from old type
+      if (currentCol.type === 'RELATION') {
         _clearInverseColumnLink(currentCol.inverse_column_id, db);
-        newInverseColId = null; // Will be set by fieldsToSet.set("inverse_column_id", null) later
-        db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
+        finalInverseColId = null; // Reset for the new type unless it's also RELATION and sets it
+        mustClearRowLinks = true; // Row links are specific to this RELATION column
       }
-      if (currentCol.type === 'FORMULA' && newType !== 'FORMULA') {
-         fieldsToSet.set("formula_definition", null);
-         fieldsToSet.set("formula_result_type", null);
-      }
+      if (currentCol.type === 'FORMULA') { fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null); }
+      if (currentCol.type === 'ROLLUP') { fieldsToSet.set("rollup_source_relation_column_id", null); fieldsToSet.set("rollup_target_column_id", null); fieldsToSet.set("rollup_function", null); }
+      if (currentCol.type === 'SELECT' || currentCol.type === 'MULTI_SELECT') { fieldsToSet.set("select_options", null); }
+      if (currentCol.type !== 'RELATION' && currentCol.type !== 'FORMULA' && currentCol.type !== 'ROLLUP') { /*defaultValue cleared below if new type needs it*/ }
     }
 
-    // Set type-specific fields based on the *final* type (newType)
-    if (newType === 'RELATION') {
-      if (newLinkedDbId === null || newLinkedDbId === undefined) throw new Error("linked_database_id is required for RELATION type.");
-      const targetDb = getDatabaseById(newLinkedDbId); // Validate newLinkedDbId
-      if (!targetDb) throw new Error(`Update failed: Linked database ID ${newLinkedDbId} not found.`);
-      fieldsToSet.set("linked_database_id", newLinkedDbId);
-      fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null); fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
+    // Set fields based on finalType
+    if (finalType === 'RELATION') {
+      if (finalLinkedDbId === null || finalLinkedDbId === undefined) throw new Error("linked_database_id is required for RELATION type.");
+      const targetDb = getDatabaseById(finalLinkedDbId);
+      if (!targetDb) throw new Error(`Update failed: Linked database ID ${finalLinkedDbId} not found.`);
+      fieldsToSet.set("linked_database_id", finalLinkedDbId);
 
+      // Nullify fields not applicable to RELATION
+      fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null);
+      fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
+      fieldsToSet.set("rollup_source_relation_column_id", null); fieldsToSet.set("rollup_target_column_id", null); fieldsToSet.set("rollup_function", null);
+
+      // Bidirectional logic
       if (makeBidirectional === true) {
-        // If it was already linked, and linked_db_id changed, clear old inverse
-        if (currentCol.inverse_column_id && currentCol.linked_database_id !== newLinkedDbId) {
+        if (currentCol.inverse_column_id && currentCol.linked_database_id !== finalLinkedDbId) { // Linked DB changed, old inverse is invalid
             _clearInverseColumnLink(currentCol.inverse_column_id, db);
-            newInverseColId = null; // Force new setup
+            finalInverseColId = null;
         }
-        // Logic for setting up new/existing inverse (ColB)
-        let colBId;
+        let colBIdToSet;
         if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) {
-            colBId = existingTargetInverseColumnId;
-            const validationResult = _validateTargetInverseColumn(colBId, newLinkedDbId, currentCol.database_id, db);
+            colBIdToSet = existingTargetInverseColumnId;
+            const validationResult = _validateTargetInverseColumn(colBIdToSet, finalLinkedDbId, currentCol.database_id, db);
             if (typeof validationResult === 'string') throw new Error(validationResult);
             const targetCol = validationResult;
-            if (targetCol.inverse_column_id !== null && targetCol.inverse_column_id !== columnId) {
-                 throw new Error(`Target inverse column ${colBId} is already linked to another column.`);
-            }
-            db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, colBId);
-        } else if (newInverseColId === null) { // Auto-create if no existing one specified AND current is null
+            if (targetCol.inverse_column_id !== null && targetCol.inverse_column_id !== columnId) throw new Error(`Target inverse column ${colBIdToSet} is already linked to another column.`);
+            db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, colBIdToSet);
+        } else if (finalInverseColId === null) { // Auto-create if no existing one specified AND current is null (or became null due to linked_db_id change)
             const currentDbInfo = getDatabaseById(currentCol.database_id);
             const invColName = targetInverseColumnName ? targetInverseColumnName.trim() : `Related ${currentDbInfo ? currentDbInfo.name : 'DB'} - ${fieldsToSet.get('name') || currentCol.name}`;
-            if (!invColName) throw new Error("Generated inverse column name is empty.");
-            const existingByName = db.prepare("SELECT id FROM database_columns WHERE database_id = ? AND name = ? COLLATE NOCASE").get(newLinkedDbId, invColName);
+            if (!invColName) throw new Error("Generated inverse column name for update is empty.");
+            const existingByName = db.prepare("SELECT id FROM database_columns WHERE database_id = ? AND name = ? COLLATE NOCASE").get(finalLinkedDbId, invColName);
             if(existingByName) throw new Error(`Inverse column name "${invColName}" already exists in target database.`);
             const lastOrderStmt = db.prepare("SELECT MAX(column_order) as max_order FROM database_columns WHERE database_id = ?");
-            const lastOrderResult = lastOrderStmt.get(newLinkedDbId);
+            const lastOrderResult = lastOrderStmt.get(finalLinkedDbId);
             const colBOrder = (lastOrderResult && typeof lastOrderResult.max_order === 'number' ? lastOrderResult.max_order : 0) + 1;
             const colBStmt = db.prepare("INSERT INTO database_columns (database_id, name, type, column_order, linked_database_id, inverse_column_id) VALUES (?, ?, 'RELATION', ?, ?, ?)");
-            const colBInfo = colBStmt.run(newLinkedDbId, invColName, colBOrder, currentCol.database_id, columnId);
-            colBId = colBInfo.lastInsertRowid;
-            if (!colBId) throw new Error("Failed to create inverse column during update.");
-        } else { // Use newInverseColId if it was explicitly provided
-            colBId = newInverseColId;
-             const validationResult = _validateTargetInverseColumn(colBId, newLinkedDbId, currentCol.database_id, db);
-            if (typeof validationResult === 'string') throw new Error(validationResult);
-            db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, colBId);
+            const colBInfo = colBStmt.run(finalLinkedDbId, invColName, colBOrder, currentCol.database_id, columnId);
+            colBIdToSet = colBInfo.lastInsertRowid;
+            if (!colBIdToSet) throw new Error("Failed to create inverse column during update.");
+        } else { // Use existing/provided finalInverseColId
+            colBIdToSet = finalInverseColId;
+            // If finalInverseColId was explicitly provided in updateData, ensure its counterpart is updated.
+            if (updateData.inverse_column_id !== undefined && updateData.inverse_column_id !== null) {
+                 const validationResult = _validateTargetInverseColumn(updateData.inverse_column_id, finalLinkedDbId, currentCol.database_id, db);
+                 if (typeof validationResult === 'string') throw new Error(validationResult);
+                 db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, updateData.inverse_column_id);
+            }
         }
-        newInverseColId = colBId; // This is the new inverse for ColA
-      } else if (makeBidirectional === false && currentCol.inverse_column_id !== null) {
+        finalInverseColId = colBIdToSet;
+      } else if (makeBidirectional === false && currentCol.inverse_column_id !== null) { // Explicitly removing bidirectionality
         _clearInverseColumnLink(currentCol.inverse_column_id, db);
-        newInverseColId = null;
-      } // If makeBidirectional is undefined, don't change existing bidirectionality unless inverse_column_id is explicitly set
-      fieldsToSet.set("inverse_column_id", newInverseColId);
+        finalInverseColId = null;
+      } else if (updateData.inverse_column_id !== undefined && finalType === 'RELATION') { // Explicitly setting inverse_column_id without makeBidirectional flag
+         _clearInverseColumnLink(currentCol.inverse_column_id, db); // Clear old one first
+         if (updateData.inverse_column_id !== null) {
+            const validationResult = _validateTargetInverseColumn(updateData.inverse_column_id, finalLinkedDbId, currentCol.database_id, db);
+            if (typeof validationResult === 'string') throw new Error(validationResult);
+            db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, updateData.inverse_column_id);
+         }
+         finalInverseColId = updateData.inverse_column_id;
+      }
+      fieldsToSet.set("inverse_column_id", finalInverseColId);
 
-    } else if (newType === 'FORMULA') {
+    } else if (finalType === 'FORMULA') {
       const newFormulaDef = updateData.formula_definition !== undefined ? updateData.formula_definition : currentCol.formula_definition;
       if (!newFormulaDef || String(newFormulaDef).trim() === "") throw new Error("formula_definition cannot be empty for FORMULA type.");
       fieldsToSet.set("formula_definition", newFormulaDef);
@@ -339,9 +390,27 @@ function updateColumn(args) {
       else if (currentCol.type !== 'FORMULA') fieldsToSet.set("formula_result_type", null); // Default if changing to formula
 
       fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null); fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null);
+      fieldsToSet.set("rollup_source_relation_column_id", null); fieldsToSet.set("rollup_target_column_id", null); fieldsToSet.set("rollup_function", null);
+
+    } else if (finalType === 'ROLLUP') {
+        const rollupArgs = {
+            rollup_source_relation_column_id: finalRollupSourceRelId,
+            rollup_target_column_id: finalRollupTargetId,
+            rollup_function: finalRollupFunc
+        };
+        const rollupValidationError = _validateRollupDefinition(rollupArgs, db, currentCol.database_id);
+        if (rollupValidationError) throw new Error(rollupValidationError);
+
+        fieldsToSet.set("rollup_source_relation_column_id", finalRollupSourceRelId);
+        fieldsToSet.set("rollup_target_column_id", finalRollupTargetId);
+        fieldsToSet.set("rollup_function", finalRollupFunc);
+
+        fieldsToSet.set("default_value", null); fieldsToSet.set("select_options", null); fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null);
+        fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
+
     } else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
       if (updateData.defaultValue !== undefined) fieldsToSet.set("default_value", updateData.defaultValue);
-      if (newType === 'SELECT' || newType === 'MULTI_SELECT') {
+      if (finalType === 'SELECT' || finalType === 'MULTI_SELECT') {
         let newSelectOpts = updateData.selectOptions !== undefined ? updateData.selectOptions : currentCol.select_options;
         if (newSelectOpts === null && updateData.selectOptions !== undefined) newSelectOpts = JSON.stringify([]);
         else if (typeof newSelectOpts === 'string') { try { JSON.parse(newSelectOpts); } catch (e) { throw new Error("Invalid JSON for selectOptions."); }}
@@ -351,22 +420,10 @@ function updateColumn(args) {
       } else {
         fieldsToSet.set("select_options", null);
       }
-      fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null); fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
+      fieldsToSet.set("linked_database_id", null); fieldsToSet.set("inverse_column_id", null);
+      fieldsToSet.set("formula_definition", null); fieldsToSet.set("formula_result_type", null);
+      fieldsToSet.set("rollup_source_relation_column_id", null); fieldsToSet.set("rollup_target_column_id", null); fieldsToSet.set("rollup_function", null);
     }
-
-    // Handle explicit update of inverse_column_id if not covered by makeBidirectional
-    if (updateData.inverse_column_id !== undefined && makeBidirectional === undefined && newType === 'RELATION') {
-        if (currentCol.inverse_column_id !== updateData.inverse_column_id) { // If it's actually changing
-            _clearInverseColumnLink(currentCol.inverse_column_id, db); // Clear old one
-            if (updateData.inverse_column_id !== null) { // If setting to a new ColB, update that ColB too
-                const validationResult = _validateTargetInverseColumn(updateData.inverse_column_id, newLinkedDbId, currentCol.database_id, db);
-                if (typeof validationResult === 'string') throw new Error(validationResult);
-                db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(columnId, updateData.inverse_column_id);
-            }
-        }
-        fieldsToSet.set("inverse_column_id", updateData.inverse_column_id);
-    }
-
 
     if (fieldsToSet.size === 0) return { success: true, message: "No effective changes." };
 
@@ -375,6 +432,11 @@ function updateColumn(args) {
 
     finalFieldsSql.push("updated_at = CURRENT_TIMESTAMP");
     finalValues.push(columnId);
+
+    if (mustClearRowLinks) {
+      db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
+      console.log(`Cleared row links for column ${columnId} due to type/linked_database_id change during update.`);
+    }
 
     const updateStmt = db.prepare(`UPDATE database_columns SET ${finalFieldsSql.join(", ")} WHERE id = ?`);
     const info = updateStmt.run(...finalValues);
@@ -404,11 +466,10 @@ function deleteColumn(columnId) {
       _clearInverseColumnLink(columnToDelete.inverse_column_id, db);
     }
 
-    // ON DELETE CASCADE on database_row_links.source_column_id and database_row_values.column_id handles cleanup.
     const stmt = db.prepare("DELETE FROM database_columns WHERE id = ?");
     const info = stmt.run(columnId);
 
-    if (info.changes === 0) throw new Error("Column not found during delete execution."); // Should be caught by earlier check
+    if (info.changes === 0) throw new Error("Column not found during delete execution.");
     return { success: true };
   });
 
