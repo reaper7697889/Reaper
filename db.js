@@ -73,6 +73,31 @@ function initializeDatabase() {
   `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_note_timestamp AFTER UPDATE ON notes FOR EACH ROW BEGIN UPDATE notes SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
+  // Note Permissions Table (Added for sharing)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS note_permissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL, -- User being granted permission
+        permission_level TEXT NOT NULL CHECK(permission_level IN ('READ', 'WRITE')),
+        granted_by_user_id INTEGER NOT NULL, -- User who granted the permission
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (granted_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+        UNIQUE (note_id, user_id)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_note_permissions_updated_at
+    AFTER UPDATE ON note_permissions
+    FOR EACH ROW
+    BEGIN
+        UPDATE note_permissions SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
   db.exec(`CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE COLLATE NOCASE NOT NULL);`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_tags (note_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY (note_id, tag_id), FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_note_id INTEGER NOT NULL, target_note_id INTEGER NOT NULL, link_text TEXT, target_header TEXT, target_block_id TEXT, is_embed BOOLEAN DEFAULT 0 NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE (source_note_id, target_note_id, link_text, target_header, target_block_id, is_embed), FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
