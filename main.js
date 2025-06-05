@@ -45,11 +45,11 @@ function createWindow() {
 // --- IPC Handlers ---
 
 // Note Service
-ipcMain.handle("db:getNotesByFolder", (e, folderId) => noteService.listNotesByFolder(folderId));
-ipcMain.handle("db:getNoteById", (e, noteId) => noteService.getNoteById(noteId));
-ipcMain.handle("db:createNote", (e, noteData) => noteService.createNote(noteData));
-ipcMain.handle("db:updateNote", (e, noteId, updateData) => noteService.updateNote(noteId, updateData));
-ipcMain.handle("db:deleteNote", (e, noteId) => noteService.deleteNote(noteId));
+ipcMain.handle("db:getNotesByFolder", (e, folderId, requestingUserId) => noteService.listNotesByFolder(folderId, requestingUserId));
+ipcMain.handle("db:getNoteById", (e, noteId, requestingUserId) => noteService.getNoteById(noteId, requestingUserId));
+ipcMain.handle("db:createNote", (e, noteData) => noteService.createNote(noteData)); // createNote expects userId in noteData
+ipcMain.handle("db:updateNote", (e, noteId, updateData, requestingUserId) => noteService.updateNote(noteId, updateData, requestingUserId));
+ipcMain.handle("db:deleteNote", (e, noteId, requestingUserId) => noteService.deleteNote(noteId, requestingUserId));
 
 // Tag Service
 ipcMain.handle("db:findOrCreateTag", (e, tagName) => tagService.findOrCreateTag(tagName));
@@ -89,43 +89,43 @@ ipcMain.handle("db:deleteLinksFromSource", (e, sourceNoteId) => linkService.dele
 ipcMain.handle("db:updateLinksFromContent", (e, noteId, content) => linkService.updateLinksFromContent(noteId, content));
 
 // Task Service
-ipcMain.handle("db:createTask", (e, taskData) => taskService.createTask(taskData));
-ipcMain.handle("db:getTaskById", (e, taskId) => taskService.getTaskById(taskId));
-ipcMain.handle("db:updateTask", (e, taskId, updateData) => taskService.updateTask(taskId, updateData));
-ipcMain.handle("db:deleteTask", (e, taskId) => taskService.deleteTask(taskId));
-ipcMain.handle("db:getTasksForNote", (e, noteId) => taskService.getTasksForNote(noteId));
-ipcMain.handle("db:getTasksForBlock", (e, blockId) => taskService.getTasksForBlock(blockId));
+ipcMain.handle("db:createTask", (e, taskData) => taskService.createTask(taskData)); // createTask expects userId in taskData
+ipcMain.handle("db:getTaskById", (e, taskId, requestingUserId) => taskService.getTaskById(taskId, requestingUserId));
+ipcMain.handle("db:updateTask", (e, taskId, updateData, requestingUserId) => taskService.updateTask(taskId, updateData, requestingUserId));
+ipcMain.handle("db:deleteTask", (e, taskId, requestingUserId) => taskService.deleteTask(taskId, requestingUserId));
+ipcMain.handle("db:getTasksForNote", (e, noteId, requestingUserId) => taskService.getTasksForNote(noteId, requestingUserId));
+ipcMain.handle("db:getTasksForBlock", (e, blockId, requestingUserId) => taskService.getTasksForBlock(blockId, requestingUserId));
 
-ipcMain.handle("tasks:addTaskDependency", async (event, taskId, dependsOnTaskId) => {
+ipcMain.handle("tasks:addTaskDependency", async (event, taskId, dependsOnTaskId, requestingUserId) => {
     try {
-        return await taskService.addTaskDependency(taskId, dependsOnTaskId);
+        return await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
     } catch (error) {
         console.error("Error in 'tasks:addTaskDependency' IPC handler:", error);
         return { success: false, error: error.message || "Failed to add task dependency." };
     }
 });
 
-ipcMain.handle("tasks:removeTaskDependency", async (event, taskId, dependsOnTaskId) => {
+ipcMain.handle("tasks:removeTaskDependency", async (event, taskId, dependsOnTaskId, requestingUserId) => {
     try {
-        return await taskService.removeTaskDependency(taskId, dependsOnTaskId);
+        return await taskService.removeTaskDependency(taskId, dependsOnTaskId, requestingUserId);
     } catch (error) {
         console.error("Error in 'tasks:removeTaskDependency' IPC handler:", error);
         return { success: false, error: error.message || "Failed to remove task dependency." };
     }
 });
 
-ipcMain.handle("tasks:getTaskPrerequisites", async (event, taskId) => {
+ipcMain.handle("tasks:getTaskPrerequisites", async (event, taskId, requestingUserId) => {
     try {
-        return await taskService.getTaskPrerequisites(taskId);
+        return await taskService.getTaskPrerequisites(taskId, requestingUserId);
     } catch (error) {
         console.error("Error in 'tasks:getTaskPrerequisites' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get task prerequisites." };
     }
 });
 
-ipcMain.handle("tasks:getTasksBlockedBy", async (event, taskId) => {
+ipcMain.handle("tasks:getTasksBlockedBy", async (event, taskId, requestingUserId) => {
     try {
-        return await taskService.getTasksBlockedBy(taskId);
+        return await taskService.getTasksBlockedBy(taskId, requestingUserId);
     } catch (error) {
         console.error("Error in 'tasks:getTasksBlockedBy' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get tasks blocked by." };
@@ -138,24 +138,27 @@ ipcMain.handle("graph:getGraphData", async () => {
 });
 
 // Database Definition Service
-ipcMain.handle("dbdef:createDatabase", (e, args) => databaseDefService.createDatabase(args));
-ipcMain.handle("dbdef:getDatabaseById", (e, id) => databaseDefService.getDatabaseById(id));
-ipcMain.handle("dbdef:getDatabasesForNote", (e, noteId) => databaseDefService.getDatabasesForNote(noteId));
-ipcMain.handle("dbdef:updateDatabaseMetadata", (e, databaseId, updates) => databaseDefService.updateDatabaseMetadata(databaseId, updates));
-ipcMain.handle("dbdef:deleteDatabase", (e, id) => databaseDefService.deleteDatabase(id));
-ipcMain.handle("dbdef:addColumn", (e, args) => databaseDefService.addColumn(args));
-ipcMain.handle("dbdef:getColumnsForDatabase", (e, dbId) => databaseDefService.getColumnsForDatabase(dbId));
-ipcMain.handle("dbdef:updateColumn", (e, args) => databaseDefService.updateColumn(args));
-ipcMain.handle("dbdef:deleteColumn", (e, id) => databaseDefService.deleteColumn(id));
+// createDatabase expects userId in args
+ipcMain.handle("dbdef:createDatabase", (e, argsWithUserId) => databaseDefService.createDatabase(argsWithUserId));
+ipcMain.handle("dbdef:getDatabaseById", (e, id, requestingUserId) => databaseDefService.getDatabaseById(id, requestingUserId));
+ipcMain.handle("dbdef:getDatabasesForNote", (e, noteId, requestingUserId) => databaseDefService.getDatabasesForNote(noteId, requestingUserId));
+ipcMain.handle("dbdef:updateDatabaseMetadata", (e, databaseId, updates, requestingUserId) => databaseDefService.updateDatabaseMetadata(databaseId, updates, requestingUserId));
+ipcMain.handle("dbdef:deleteDatabase", (e, id, requestingUserId) => databaseDefService.deleteDatabase(id, requestingUserId));
+// addColumn and updateColumn service functions take (args, requestingUserId)
+ipcMain.handle("dbdef:addColumn", (e, args, requestingUserId) => databaseDefService.addColumn(args, requestingUserId));
+ipcMain.handle("dbdef:getColumnsForDatabase", (e, dbId, requestingUserId) => databaseDefService.getColumnsForDatabase(dbId, requestingUserId));
+ipcMain.handle("dbdef:updateColumn", (e, args, requestingUserId) => databaseDefService.updateColumn(args, requestingUserId));
+ipcMain.handle("dbdef:deleteColumn", (e, id, requestingUserId) => databaseDefService.deleteColumn(id, requestingUserId));
 
 // Database Row Service
-ipcMain.handle("dbrow:addRow", (e, args) => databaseRowService.addRow(args));
-ipcMain.handle("dbrow:getRow", (e, id) => databaseRowService.getRow(id));
-ipcMain.handle("dbrow:updateRow", (e, args) => databaseRowService.updateRow(args));
-ipcMain.handle("dbrow:deleteRow", (e, id) => databaseRowService.deleteRow(id));
+// addRow, updateRow expect requestingUserId within the args object passed from frontend
+ipcMain.handle("dbrow:addRow", (e, argsWithUserId) => databaseRowService.addRow(argsWithUserId));
+ipcMain.handle("dbrow:getRow", (e, id, requestingUserId) => databaseRowService.getRow(id, requestingUserId));
+ipcMain.handle("dbrow:updateRow", (e, argsWithUserId) => databaseRowService.updateRow(argsWithUserId));
+ipcMain.handle("dbrow:deleteRow", (e, id, requestingUserId) => databaseRowService.deleteRow(id, requestingUserId));
 
 // Database Query Service
-ipcMain.handle("dbquery:getRowsForDatabase", (e, databaseId, options) => databaseQueryService.getRowsForDatabase(databaseId, options));
+ipcMain.handle("dbquery:getRowsForDatabase", (e, databaseId, options, requestingUserId) => databaseQueryService.getRowsForDatabase(databaseId, options, requestingUserId));
 
 // Smart Rule Service
 ipcMain.handle("rules:createRule", (e, args) => smartRuleService.createRule(args));
@@ -165,10 +168,10 @@ ipcMain.handle("rules:updateRule", (e, id, updates) => smartRuleService.updateRu
 ipcMain.handle("rules:deleteRule", (e, id) => smartRuleService.deleteRule(id));
 
 // History Service
-ipcMain.handle("history:getNoteHistory", (e, noteId, options) => historyService.getNoteHistory(noteId, options));
-ipcMain.handle("history:getRowHistory", (e, rowId, options) => historyService.getRowHistory(rowId, options));
-ipcMain.handle("history:revertNoteToVersion", (e, noteId, versionNumber) => historyService.revertNoteToVersion(noteId, versionNumber));
-ipcMain.handle("history:revertRowToVersion", (e, rowId, versionNumber) => historyService.revertRowToVersion(rowId, versionNumber));
+ipcMain.handle("history:getNoteHistory", (e, noteId, options) => historyService.getNoteHistory(noteId, options)); // Read-only, no user ID needed for filtering history itself
+ipcMain.handle("history:getRowHistory", (e, rowId, options) => historyService.getRowHistory(rowId, options)); // Read-only
+ipcMain.handle("history:revertNoteToVersion", (e, noteId, versionNumber, requestingUserId) => historyService.revertNoteToVersion(noteId, versionNumber, requestingUserId));
+ipcMain.handle("history:revertRowToVersion", (e, rowId, versionNumber, requestingUserId) => historyService.revertRowToVersion(rowId, versionNumber, requestingUserId));
 
 // Export Service Handlers
 ipcMain.handle("export:note", async (event, noteId, format) => {
@@ -328,63 +331,65 @@ ipcMain.handle("timeline:getTimelineDataForDatabase", (e, config) =>
 );
 
 // --- Time Log Service ---
-ipcMain.handle("timelogs:startTimerForTask", async (event, taskId, options) => {
+// startTimerForTask and addManualLogForTask take (taskId, options/logData, requestingUserId)
+// options/logData should NOT contain userId anymore for these, it's taken from requestingUserId
+ipcMain.handle("timelogs:startTimerForTask", async (event, taskId, options, requestingUserId) => {
     try {
-        return await timeLogService.startTimerForTask(taskId, options);
+        return await timeLogService.startTimerForTask(taskId, options, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:startTimerForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to start timer." };
     }
 });
 
-ipcMain.handle("timelogs:stopTimerForTask", async (event, taskId, options) => {
+ipcMain.handle("timelogs:stopTimerForTask", async (event, taskId, options, requestingUserId) => {
     try {
-        return await timeLogService.stopTimerForTask(taskId, options);
+        return await timeLogService.stopTimerForTask(taskId, options, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:stopTimerForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to stop timer." };
     }
 });
 
-ipcMain.handle("timelogs:addManualLogForTask", async (event, taskId, logData) => {
+ipcMain.handle("timelogs:addManualLogForTask", async (event, taskId, logData, requestingUserId) => {
     try {
-        return await timeLogService.addManualLogForTask(taskId, logData);
+        return await timeLogService.addManualLogForTask(taskId, logData, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:addManualLogForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to add manual log." };
     }
 });
 
-ipcMain.handle("timelogs:updateTimeLog", async (event, logId, updates) => {
+ipcMain.handle("timelogs:updateTimeLog", async (event, logId, updates, requestingUserId) => {
     try {
-        return await timeLogService.updateTimeLog(logId, updates);
+        return await timeLogService.updateTimeLog(logId, updates, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:updateTimeLog' IPC handler:", error);
         return { success: false, error: error.message || "Failed to update time log." };
     }
 });
 
-ipcMain.handle("timelogs:deleteTimeLog", async (event, logId) => {
+ipcMain.handle("timelogs:deleteTimeLog", async (event, logId, requestingUserId) => {
     try {
-        return await timeLogService.deleteTimeLog(logId);
+        return await timeLogService.deleteTimeLog(logId, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:deleteTimeLog' IPC handler:", error);
         return { success: false, error: error.message || "Failed to delete time log." };
     }
 });
 
-ipcMain.handle("timelogs:getLogsForTask", async (event, taskId, options) => {
+ipcMain.handle("timelogs:getLogsForTask", async (event, taskId, options, requestingUserId) => {
     try {
-        return await timeLogService.getLogsForTask(taskId, options);
+        return await timeLogService.getLogsForTask(taskId, options, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:getLogsForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get time logs." };
     }
 });
 
-ipcMain.handle("timelogs:getActiveTimerForTask", async (event, taskId) => {
+ipcMain.handle("timelogs:getActiveTimerForTask", async (event, taskId, requestingUserId) => {
     try {
-        return await timeLogService.getActiveTimerForTask(taskId);
+        return await timeLogService.getActiveTimerForTask(taskId, requestingUserId);
     } catch (error) {
         console.error("Error in 'timelogs:getActiveTimerForTask' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get active timer." };

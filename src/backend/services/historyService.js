@@ -129,11 +129,21 @@ async function recordRowHistory({ rowId, oldRowValuesJson, newRowValuesJson, db:
  * Reverts a note to a specific historical version.
  * @param {number} noteId - The ID of the note to revert.
  * @param {number} versionNumber - The version number to revert to.
+ * @param {number} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success: boolean, error?: string }
  */
-async function revertNoteToVersion(noteId, versionNumber) {
+async function revertNoteToVersion(noteId, versionNumber, requestingUserId) {
   const db = getDb();
   try {
+    // First, ensure the requesting user can even access the note they are trying to revert.
+    // noteService.getNoteById will return null if not found or not accessible.
+    const noteToRevert = await noteService.getNoteById(noteId, requestingUserId);
+    if (!noteToRevert) {
+      return { success: false, error: "Note not found or not accessible by user." };
+    }
+    // Note: getNoteById might not be strictly necessary here if updateNote handles its own auth fully,
+    // but it's a good pre-check. The critical part is passing requestingUserId to updateNote.
+
     const historyRecord = db.prepare(
       "SELECT * FROM notes_history WHERE note_id = ? AND version_number = ?"
     ).get(noteId, versionNumber);
@@ -156,11 +166,12 @@ async function revertNoteToVersion(noteId, versionNumber) {
     }
 
     // noteService.updateNote is async and will handle its own history recording for this revert action.
-    const updateResult = await noteService.updateNote(noteId, updateData);
-    return updateResult; // This will be { success: boolean, error?: string }
+    // It also requires requestingUserId for ownership check.
+    const updateResult = await noteService.updateNote(noteId, updateData, requestingUserId);
+    return updateResult;
 
   } catch (err) {
-    console.error(`Error reverting note ${noteId} to version ${versionNumber}:`, err.message);
+    console.error(`Error reverting note ${noteId} to version ${versionNumber} (user ${requestingUserId}):`, err.message);
     return { success: false, error: err.message || "Failed to revert note." };
   }
 }
@@ -169,11 +180,20 @@ async function revertNoteToVersion(noteId, versionNumber) {
  * Reverts a database row to a specific historical version.
  * @param {number} rowId - The ID of the row to revert.
  * @param {number} versionNumber - The version number to revert to.
+ * @param {number} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success: boolean, error?: string }
  */
-async function revertRowToVersion(rowId, versionNumber) {
+async function revertRowToVersion(rowId, versionNumber, requestingUserId) {
   const db = getDb();
   try {
+    // Before fetching history, check if user can access the row (via its parent DB)
+    // This requires getting the row's database_id first.
+    const currentRow = await databaseRowService.getRow(rowId, requestingUserId);
+    if (!currentRow) {
+        return { success: false, error: "Row not found or not accessible by user."};
+    }
+    // If getRow succeeded, user has access to the DB, so they can attempt revert.
+
     const historyRecord = db.prepare(
       "SELECT row_values_after_json FROM database_row_history WHERE row_id = ? AND version_number = ?"
     ).get(rowId, versionNumber);
@@ -182,33 +202,24 @@ async function revertRowToVersion(rowId, versionNumber) {
       return { success: false, error: "Row version not found." };
     }
 
-    if (historyRecord.row_values_after_json === null) {
-        // This means the 'after' state was explicitly null (e.g. row created then immediately deleted, or values cleared)
-        // Or, if it means "no changes to specific values", updateRow might need an empty values object.
-        // For now, assume if it's null, it means "revert to a state where all values are default/cleared".
-        // This might mean passing an empty object or specific nulls to updateRow.
-        // Let's assume it means "no specific values to set from this history record".
-        // This case might need more nuanced handling based on how `databaseRowService.updateRow` treats empty `values`.
-        // For now, if row_values_after_json is null, we'll try to pass an empty object,
-        // effectively clearing any values not set by defaults or relations.
-        // A more robust approach might be to store an empty object "{}" for "all values cleared".
-         console.warn(`Row version ${versionNumber} for row ${rowId} has null for row_values_after_json. Reverting to effectively empty state for stored values.`);
-         const updateResult = await databaseRowService.updateRow({ rowId, values: {} });
-         return updateResult;
+    let valuesToRevertTo = {};
+    if (historyRecord.row_values_after_json !== null) {
+        valuesToRevertTo = _parseJsonString(historyRecord.row_values_after_json, `row ${rowId} version ${versionNumber} row_values_after_json`);
+        if (valuesToRevertTo === undefined) { // _parseJsonString might throw or return undefined on error
+            return { success: false, error: "Failed to parse historical row data for revert." };
+        }
+    } else {
+        // If row_values_after_json is null, means revert to "empty" state for stored values.
+        console.warn(`Row version ${versionNumber} for row ${rowId} (user ${requestingUserId}) has null for row_values_after_json. Reverting to effectively empty state for stored values.`);
     }
 
-    const valuesToRevertTo = _parseJsonString(historyRecord.row_values_after_json, `row ${rowId} version ${versionNumber} row_values_after_json`);
-    if (!valuesToRevertTo) { // Should be caught by _parseJsonString throwing
-        return { success: false, error: "Failed to parse historical row data for revert." };
-    }
-
-    // databaseRowService.updateRow is async and will handle its own history recording for this revert action.
-    const updateResult = await databaseRowService.updateRow({ rowId, values: valuesToRevertTo });
+    // databaseRowService.updateRow is async and will handle its own history recording.
+    // It also requires requestingUserId for its own ownership checks.
+    const updateResult = await databaseRowService.updateRow({ rowId, values: valuesToRevertTo, requestingUserId });
     return updateResult;
 
   } catch (err) {
-    console.error(`Error reverting row ${rowId} to version ${versionNumber}:`, err.message);
-    // If _parseJsonString threw, err.message would be "Corrupted JSON..."
+    console.error(`Error reverting row ${rowId} to version ${versionNumber} (user ${requestingUserId}):`, err.message);
     return { success: false, error: err.message || "Failed to revert row." };
   }
 }
