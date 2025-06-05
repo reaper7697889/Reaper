@@ -22,21 +22,25 @@ function initializeDatabase() {
   db.exec(`CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_note_id INTEGER NOT NULL, target_note_id INTEGER NOT NULL, link_text TEXT, target_header TEXT, target_block_id TEXT, is_embed BOOLEAN DEFAULT 0 NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE (source_note_id, target_note_id, link_text, target_header, target_block_id, is_embed), FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
 
   // --- In-Note Database Feature Tables ---
-  db.exec(`CREATE TABLE IF NOT EXISTS note_databases (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER UNIQUE, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
+  db.exec(`CREATE TABLE IF NOT EXISTS note_databases (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER UNIQUE, name TEXT NOT NULL, is_calendar BOOLEAN NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_note_databases_updated_at AFTER UPDATE ON note_databases FOR EACH ROW BEGIN UPDATE note_databases SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
   db.exec(`
     CREATE TABLE IF NOT EXISTS database_columns (
         id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP')),
-        column_order INTEGER NOT NULL, default_value TEXT, select_options TEXT, linked_database_id INTEGER,
-        inverse_column_id INTEGER DEFAULT NULL, formula_definition TEXT DEFAULT NULL, formula_result_type TEXT DEFAULT NULL,
+        type TEXT NOT NULL CHECK(type IN ('TEXT', 'NUMBER', 'DATE', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP', 'DATETIME')), -- Added 'DATETIME'
+        column_order INTEGER NOT NULL, default_value TEXT, select_options TEXT,
+        linked_database_id INTEGER,
+        relation_target_entity_type TEXT NOT NULL DEFAULT 'NOTE_DATABASES' CHECK(relation_target_entity_type IN ('NOTE_DATABASES', 'NOTES_TABLE')),
+        inverse_column_id INTEGER DEFAULT NULL,
+        formula_definition TEXT DEFAULT NULL, formula_result_type TEXT DEFAULT NULL,
         rollup_source_relation_column_id INTEGER DEFAULT NULL, rollup_target_column_id INTEGER DEFAULT NULL,
         rollup_function TEXT DEFAULT NULL CHECK(rollup_function IS NULL OR rollup_function IN ('COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES', 'SUM', 'AVG', 'MIN', 'MAX', 'SHOW_UNIQUE', 'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY', 'COUNT_CHECKED', 'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED')),
         lookup_source_relation_column_id INTEGER DEFAULT NULL, lookup_target_value_column_id INTEGER DEFAULT NULL,
         lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
-        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
+        FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL, -- For relation_target_entity_type = 'NOTE_DATABASES'
+        -- No direct FK for linked_database_id if target is 'NOTES_TABLE', this is handled by application logic.
         FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_target_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
@@ -45,7 +49,7 @@ function initializeDatabase() {
         UNIQUE (database_id, name), UNIQUE (database_id, column_order)
     );`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_columns_updated_at AFTER UPDATE ON database_columns FOR EACH ROW BEGIN UPDATE database_columns SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
-  db.exec(`CREATE TABLE IF NOT EXISTS database_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, row_order INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
+  db.exec(`CREATE TABLE IF NOT EXISTS database_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, row_order INTEGER, recurrence_rule TEXT DEFAULT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_rows_updated_at AFTER UPDATE ON database_rows FOR EACH ROW BEGIN UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
   db.exec(`CREATE TABLE IF NOT EXISTS database_row_values (id INTEGER PRIMARY KEY AUTOINCREMENT, row_id INTEGER NOT NULL, column_id INTEGER NOT NULL, value_text TEXT, value_number REAL, value_boolean INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (row_id) REFERENCES database_rows(id) ON DELETE CASCADE, FOREIGN KEY (column_id) REFERENCES database_columns(id) ON DELETE CASCADE, UNIQUE (row_id, column_id));`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_row_values_updated_at AFTER UPDATE ON database_row_values FOR EACH ROW BEGIN UPDATE database_row_values SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);

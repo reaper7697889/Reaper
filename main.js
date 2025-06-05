@@ -20,7 +20,8 @@ const smartRuleService = require("./src/backend/services/smartRuleService");
 const historyService = require("./src/backend/services/historyService");
 const exportService = require('./src/backend/services/exportService');
 const importService = require('./src/backend/services/importService');
-const searchService = require('./src/backend/services/searchService'); // Added searchService
+const searchService = require('./src/backend/services/searchService');
+const calendarService = require('./src/backend/services/calendarService'); // Added calendarService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -101,7 +102,7 @@ ipcMain.handle("graph:getGraphData", async () => {
 ipcMain.handle("dbdef:createDatabase", (e, args) => databaseDefService.createDatabase(args));
 ipcMain.handle("dbdef:getDatabaseById", (e, id) => databaseDefService.getDatabaseById(id));
 ipcMain.handle("dbdef:getDatabasesForNote", (e, noteId) => databaseDefService.getDatabasesForNote(noteId));
-ipcMain.handle("dbdef:updateDatabaseName", (e, args) => databaseDefService.updateDatabaseName(args));
+ipcMain.handle("dbdef:updateDatabaseMetadata", (e, databaseId, updates) => databaseDefService.updateDatabaseMetadata(databaseId, updates));
 ipcMain.handle("dbdef:deleteDatabase", (e, id) => databaseDefService.deleteDatabase(id));
 ipcMain.handle("dbdef:addColumn", (e, args) => databaseDefService.addColumn(args));
 ipcMain.handle("dbdef:getColumnsForDatabase", (e, dbId) => databaseDefService.getColumnsForDatabase(dbId));
@@ -276,6 +277,11 @@ ipcMain.handle("search:all", async (event, searchText, options) => {
         return { success: false, error: error.message || "An unexpected error occurred during search." };
     }
 });
+
+// Calendar Service
+ipcMain.handle("calendar:getEvents", (e, databaseId, startStr, endStr, options) =>
+    calendarService.getCalendarEvents(databaseId, startStr, endStr, options)
+);
 
 // --- App Lifecycle ---
 
