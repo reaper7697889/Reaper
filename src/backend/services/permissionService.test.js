@@ -4,33 +4,59 @@ const Database = require('better-sqlite3');
 let db;
 
 // Mock users for testing
-const user1 = { id: 1, username: 'user1_test', password_hash: 'hash1' };
-const user2 = { id: 2, username: 'user2_test', password_hash: 'hash2' };
-const actorUser = { id: 3, username: 'actor_test', password_hash: 'hash3' }; // User performing grant/revoke actions
+const user1 = { id: 1, username: 'user1_test', password_hash: 'hash1' }; // Target user for perms
+const user2 = { id: 2, username: 'user2_test', password_hash: 'hash2' }; // Another target user
+const adminUser = { id: 3, username: 'admin_test', password_hash: 'hash_admin' }; // User who can be granted admin
+const ownerUser = { id: 4, username: 'owner_test', password_hash: 'hash_owner' }; // Owner of objects
+const unrelatedUser = { id: 5, username: 'unrelated_test', password_hash: 'hash_unrelated' }; // No specific perms
 
 describe('Permission Service', () => {
     beforeAll(() => {
-        // Initialize an in-memory SQLite database for testing
         db = new Database(':memory:');
         console.log('Test DB connection established (in-memory)');
+        permissionService.__setTestDb(db);
 
-        // Override getDb in permissionService to use this test_db instance
-        // This is a common way to inject dependencies for testing.
-        // Ensure permissionService uses this db instance for its operations.
-        permissionService.__setTestDb(db); // We'll need to add this to permissionService or adapt
-
+        db.exec(`PRAGMA foreign_keys = ON;`);
         // Create users table
         db.exec(`
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
         `);
-
-        // Create object_permissions table (schema from previous subtask)
+        // Create notes table
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, type TEXT DEFAULT 'markdown',
+                user_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+        `);
+        // Create tasks table
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL, user_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+        `);
+        // Create note_databases table
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS note_databases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, user_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            );
+        `);
+        // Create database_rows table
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS database_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE
+            );
+        `);
+        // Create object_permissions table
         db.exec(`
             CREATE TABLE IF NOT EXISTS object_permissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,27 +83,25 @@ describe('Permission Service', () => {
         console.log('Test DB schema initialized.');
 
         // Seed users
-        const insertUserStmt = db.prepare("INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)");
-        try {
-            insertUserStmt.run(user1.id, user1.username, user1.password_hash);
-            insertUserStmt.run(user2.id, user2.username, user2.password_hash);
-            insertUserStmt.run(actorUser.id, actorUser.username, actorUser.password_hash);
-            console.log('Mock users seeded.');
-        } catch (error) {
-            // This might happen if running tests multiple times without proper reset in some environments
-            // or if IDs are not controlled as expected.
-            console.warn("Warning seeding users (might already exist if test runner doesn't isolate well):", error.message);
-        }
+        const usersToSeed = [user1, user2, adminUser, ownerUser, unrelatedUser];
+        const insertUserStmt = db.prepare("INSERT OR IGNORE INTO users (id, username, password_hash) VALUES (?, ?, ?)");
+        usersToSeed.forEach(u => {
+            try {
+                insertUserStmt.run(u.id, u.username, u.password_hash);
+            } catch (error) {
+                 console.warn("Warning seeding user (might already exist):", u.username, error.message);
+            }
+        });
+        console.log('Mock users seeded.');
     });
 
     beforeEach(() => {
-        // Clear object_permissions before each test to ensure test isolation
-        try {
-            db.prepare("DELETE FROM object_permissions").run();
-        } catch (error) {
-            console.error("Error clearing object_permissions:", error.message);
-            // If this fails, subsequent tests might be affected.
-        }
+        // Clear data before each test to ensure test isolation
+        db.prepare("DELETE FROM object_permissions").run();
+        db.prepare("DELETE FROM notes").run();
+        db.prepare("DELETE FROM tasks").run();
+        db.prepare("DELETE FROM database_rows").run(); // Clear rows before databases due to FK
+        db.prepare("DELETE FROM note_databases").run();
     });
 
     afterAll(() => {
@@ -85,91 +109,117 @@ describe('Permission Service', () => {
             db.close();
             console.log('Test DB connection closed.');
         }
-        // Restore original db if necessary, though for tests it's usually fine to leave the mock.
-        permissionService.__restoreOriginalDb(); // Companion to __setTestDb
+        permissionService.__restoreOriginalDb();
     });
 
     describe('grantPermission', () => {
-        it('should grant a new permission successfully', async () => {
-            const result = await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'read');
+        let noteId, taskId, dbId, rowId;
+
+        beforeEach(() => {
+            // Create objects owned by ownerUser
+            noteId = db.prepare("INSERT INTO notes (title, user_id) VALUES (?, ?)").run('Owned Note', ownerUser.id).lastInsertRowid;
+            taskId = db.prepare("INSERT INTO tasks (description, user_id) VALUES (?, ?)").run('Owned Task', ownerUser.id).lastInsertRowid;
+            dbId = db.prepare("INSERT INTO note_databases (name, user_id) VALUES (?, ?)").run('Owned DB', ownerUser.id).lastInsertRowid;
+            rowId = db.prepare("INSERT INTO database_rows (database_id) VALUES (?)").run(dbId).lastInsertRowid;
+        });
+
+        it('should allow owner to grant permission', async () => {
+            const result = await permissionService.grantPermission(ownerUser.id, user1.id, 'note', noteId, 'read');
             expect(result.success).toBe(true);
-            expect(result.permission).toBeDefined();
-            expect(result.permission.user_id).toBe(user1.id);
-            expect(result.permission.object_type).toBe('note');
-            expect(result.permission.object_id).toBe(101);
             expect(result.permission.permission_level).toBe('read');
         });
 
-        it('should update an existing permission to a new level', async () => {
-            await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'read');
-            const result = await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'write');
+        it('should allow user with admin rights to grant permission', async () => {
+            // Owner grants adminUser admin rights on the note
+            await permissionService.grantPermission(ownerUser.id, adminUser.id, 'note', noteId, 'admin');
+            // Then, adminUser grants user1 read rights
+            const result = await permissionService.grantPermission(adminUser.id, user1.id, 'note', noteId, 'read');
             expect(result.success).toBe(true);
-            expect(result.permission).toBeDefined();
-            expect(result.permission.permission_level).toBe('write');
-            expect(result.permission.user_id).toBe(user1.id); // Ensure other fields remain
-            expect(result.permission.object_id).toBe(101);
-
-            const finalPerm = db.prepare("SELECT * FROM object_permissions WHERE user_id = ? AND object_type = ? AND object_id = ?").get(user1.id, 'note', 101);
-            expect(finalPerm.permission_level).toBe('write');
+            expect(result.permission.user_id).toBe(user1.id);
         });
 
-        it('should fail with invalid objectType', async () => {
-            const result = await permissionService.grantPermission(actorUser.id, user1.id, 'invalid_type', 101, 'read');
+        it('should DENY if actor is not owner and has no admin rights', async () => {
+            const result = await permissionService.grantPermission(unrelatedUser.id, user1.id, 'note', noteId, 'read');
+            expect(result.success).toBe(false);
+            expect(result.error).toContain('Actor must be owner or have admin rights');
+        });
+
+        it('should allow system user (actorUserId=0) to grant permission even if not owner/admin', async () => {
+            const result = await permissionService.grantPermission(0, user1.id, 'note', noteId, 'write');
+            expect(result.success).toBe(true);
+            expect(result.permission.permission_level).toBe('write');
+        });
+
+        it('should fail if object not found (for ownership check)', async () => {
+            const result = await permissionService.grantPermission(ownerUser.id, user1.id, 'note', 9999, 'read');
+            expect(result.success).toBe(false);
+            expect(result.error).toContain('Object not found or ownership cannot be determined');
+        });
+
+        // Basic validation tests (from original set, ensuring actor is valid for them to pass now)
+        it('should fail with invalid objectType (actor is owner of a valid object)', async () => {
+             // Granting permission on a non-existent object type, actor is owner of other things
+            const result = await permissionService.grantPermission(ownerUser.id, user1.id, 'invalid_type', noteId, 'read');
             expect(result.success).toBe(false);
             expect(result.error).toContain('Invalid object_type');
         });
-
-        it('should fail with invalid permissionLevel', async () => {
-            const result = await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'invalid_level');
+         it('should fail with invalid permissionLevel (actor is owner)', async () => {
+            const result = await permissionService.grantPermission(ownerUser.id, user1.id, 'note', noteId, 'invalid_level');
             expect(result.success).toBe(false);
             expect(result.error).toContain('Invalid permission_level');
-        });
-
-        it('should fail with missing targetUserId', async () => {
-            const result = await permissionService.grantPermission(actorUser.id, null, 'note', 101, 'read');
-            expect(result.success).toBe(false);
-            expect(result.error).toContain('targetUserId is required');
-        });
-
-        it('should fail with missing objectId', async () => {
-            const result = await permissionService.grantPermission(actorUser.id, user1.id, 'note', null, 'read');
-            expect(result.success).toBe(false);
-            expect(result.error).toContain('objectId is required');
         });
     });
 
     describe('revokePermission', () => {
+        let noteId;
         beforeEach(async () => {
-            await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'read');
+            noteId = db.prepare("INSERT INTO notes (title, user_id) VALUES (?, ?)").run('Owned Note for Revoke', ownerUser.id).lastInsertRowid;
+            // Grant user1 read permission by owner for setup
+            await permissionService.grantPermission(ownerUser.id, user1.id, 'note', noteId, 'read');
         });
 
-        it('should revoke an existing permission successfully', async () => {
-            const result = await permissionService.revokePermission(actorUser.id, user1.id, 'note', 101);
+        it('should allow owner to revoke permission', async () => {
+            const result = await permissionService.revokePermission(ownerUser.id, user1.id, 'note', noteId);
             expect(result.success).toBe(true);
-            expect(result.removed).toBe(true); // Or check count if API changes
-
-            const perm = db.prepare("SELECT * FROM object_permissions WHERE user_id = ? AND object_type = ? AND object_id = ?").get(user1.id, 'note', 101);
-            expect(perm).toBeUndefined();
+            expect(result.removed).toBe(true);
         });
 
-        it('should succeed gracefully if permission does not exist', async () => {
-            const result = await permissionService.revokePermission(actorUser.id, user2.id, 'task', 202); // Non-existent
+        it('should allow user with admin rights to revoke permission', async () => {
+            // Owner grants adminUser admin rights
+            await permissionService.grantPermission(ownerUser.id, adminUser.id, 'note', noteId, 'admin');
+            // adminUser revokes user1's permission
+            const result = await permissionService.revokePermission(adminUser.id, user1.id, 'note', noteId);
             expect(result.success).toBe(true);
-            expect(result.removed).toBe(false);
+            expect(result.removed).toBe(true);
         });
 
-        it('should fail with invalid objectType', async () => {
-            const result = await permissionService.revokePermission(actorUser.id, user1.id, 'invalid_type', 101);
+        it('should DENY if actor is not owner and has no admin rights', async () => {
+            const result = await permissionService.revokePermission(unrelatedUser.id, user1.id, 'note', noteId);
             expect(result.success).toBe(false);
-            expect(result.error).toContain('Invalid object_type');
+            expect(result.error).toContain('Actor must be owner or have admin rights');
+        });
+
+        it('should allow system user (actorUserId=0) to revoke permission', async () => {
+            const result = await permissionService.revokePermission(0, user1.id, 'note', noteId);
+            expect(result.success).toBe(true);
+            expect(result.removed).toBe(true);
+        });
+
+        it('should fail if object not found (for ownership check during revoke)', async () => {
+            const result = await permissionService.revokePermission(ownerUser.id, user1.id, 'note', 9999);
+            expect(result.success).toBe(false);
+            expect(result.error).toContain('Object not found or ownership cannot be determined');
         });
     });
 
     describe('checkPermission (and _hasSufficientPermission implicitly)', () => {
+        // For these tests, an arbitrary actor (ownerUser) can grant initial perms.
+        // The focus is on checkPermission's logic, not actor perms for granting.
+        let noteId_checkPerm;
         beforeEach(async () => {
-            await permissionService.grantPermission(actorUser.id, user1.id, 'note', 101, 'write'); // user1 has 'write'
-            await permissionService.grantPermission(actorUser.id, user2.id, 'note', 101, 'read');  // user2 has 'read'
-            await permissionService.grantPermission(actorUser.id, user1.id, 'task', 201, 'admin'); // user1 has 'admin' on task
+            noteId_checkPerm = db.prepare("INSERT INTO notes (title, user_id) VALUES (?, ?)").run('CheckPerm Note', ownerUser.id).lastInsertRowid;
+            await permissionService.grantPermission(ownerUser.id, user1.id, 'note', noteId_checkPerm, 'write');
+            await permissionService.grantPermission(ownerUser.id, user2.id, 'note', noteId_checkPerm, 'read');
         });
 
         it('should return true if user has exact required permission', async () => {

@@ -49,6 +49,51 @@ function _hasSufficientPermission(actualPermission, requiredPermission) {
     return actualLevel >= requiredLevel;
 }
 
+// Internal helper to get owner of an object
+// Returns user_id or null if no owner/public, or undefined if object not found/type not supported for ownership.
+function _getObjectOwner(objectType, objectId, db) {
+    if (!db) db = getDbInService(); // Ensure db is available, useful for direct calls if any
+
+    let stmt;
+    switch (objectType) {
+        case 'note':
+            stmt = db.prepare("SELECT user_id FROM notes WHERE id = ?");
+            break;
+        case 'task':
+            stmt = db.prepare("SELECT user_id FROM tasks WHERE id = ?");
+            break;
+        case 'database':
+            stmt = db.prepare("SELECT user_id FROM note_databases WHERE id = ?");
+            break;
+        case 'database_row': {
+            // Ownership of a row is determined by the owner of its parent database
+            const row = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(objectId);
+            if (!row) return undefined; // Row not found
+            stmt = db.prepare("SELECT user_id FROM note_databases WHERE id = ?");
+            const ownerRow = stmt.get(row.database_id);
+            return ownerRow ? ownerRow.user_id : null; // Database itself might be public
+        }
+        case 'folder': // Assuming folders table and user_id column
+            // stmt = db.prepare("SELECT user_id FROM folders WHERE id = ?");
+            // break;
+            // For now, as tables are not confirmed for these:
+            console.warn(`Ownership check for objectType '${objectType}' not fully implemented yet.`);
+            return null; // Or a specific value like NOT_APPLICABLE if preferred
+        case 'workspace': // Assuming workspaces table and user_id column
+            // stmt = db.prepare("SELECT user_id FROM workspaces WHERE id = ?");
+            // break;
+            console.warn(`Ownership check for objectType '${objectType}' not fully implemented yet.`);
+            return null;
+        default:
+            console.warn(`Ownership check not applicable for objectType: ${objectType}`);
+            return null; // Not applicable or type doesn't support ownership
+    }
+    if (!stmt) return undefined; // Should not happen if cases cover all supported types for ownership
+
+    const ownerRow = stmt.get(objectId);
+    return ownerRow ? ownerRow.user_id : (ownerRow === undefined ? undefined : null); // null if user_id is null (public), undefined if row not found
+}
+
 
 // --- Public API Functions ---
 
@@ -72,7 +117,30 @@ async function grantPermission(actorUserId, targetUserId, objectType, objectId, 
     // This will require integrating with owner-checking logic from other services (e.g., noteService.getNoteById(objectId).user_id)
     // For now, this check is omitted for initial implementation.
 
-    const db = getDbInService(); // Changed
+    const db = getDbInService();
+
+    // Actor permission check: Must be owner or have 'admin' rights on the object
+    const ownerId = _getObjectOwner(objectType, objectId, db);
+
+    if (ownerId === undefined && ['note', 'task', 'database', 'database_row', 'folder', 'workspace'].includes(objectType)) {
+        // undefined means object not found by _getObjectOwner or type not supported for ownership lookup
+        return { success: false, error: "Object not found or ownership cannot be determined." };
+    }
+
+    let isOwner = false;
+    if (ownerId !== null && ownerId !== undefined) { // ownerId can be null for public objects
+        isOwner = (actorUserId === ownerId);
+    }
+
+    if (!isOwner && actorUserId !== 0) { // actorUserId 0 could be a system/super user
+        const hasAdminPermission = await checkPermission(actorUserId, objectType, objectId, 'admin');
+        if (!hasAdminPermission) {
+            return { success: false, error: "Permission denied: Actor must be owner or have admin rights on the object to manage its permissions." };
+        }
+    }
+    // If ownerId is null (public object), only an explicit 'admin' permission (checked above) allows managing permissions.
+    // If actorUserId is 0 (system), it bypasses this check.
+
     try {
         let existing = db.prepare("SELECT id FROM object_permissions WHERE object_type = ? AND object_id = ? AND user_id = ?").get(objectType, objectId, targetUserId);
         let resultPermission;
@@ -139,7 +207,25 @@ async function revokePermission(actorUserId, targetUserId, objectType, objectId)
     // TODO: Add check: actorUserId must have 'admin' permission or be owner.
     // Omitted for now.
 
-    const db = getDbInService(); // Changed
+    const db = getDbInService();
+
+    // Actor permission check
+    const ownerId = _getObjectOwner(objectType, objectId, db);
+    if (ownerId === undefined && ['note', 'task', 'database', 'database_row', 'folder', 'workspace'].includes(objectType)) {
+      return { success: false, error: "Object not found or ownership cannot be determined." };
+    }
+    let isOwner = false;
+    if (ownerId !== null && ownerId !== undefined) {
+        isOwner = (actorUserId === ownerId);
+    }
+
+    if (!isOwner && actorUserId !== 0) { // actorUserId 0 for system bypass
+        const hasAdminPermission = await checkPermission(actorUserId, objectType, objectId, 'admin');
+        if (!hasAdminPermission) {
+            return { success: false, error: "Permission denied: Actor must be owner or have admin rights on the object to manage its permissions." };
+        }
+    }
+
     try {
         const stmt = db.prepare("DELETE FROM object_permissions WHERE object_type = ? AND object_id = ? AND user_id = ?");
         const info = stmt.run(objectType, objectId, targetUserId);
