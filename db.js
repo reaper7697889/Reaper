@@ -150,9 +150,9 @@ function initializeDatabase() {
             'SHOW_UNIQUE', 'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY', 'COUNT_CHECKED',
             'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED'
         )),
-        lookup_source_relation_column_id INTEGER DEFAULT NULL, -- New
-        lookup_target_value_column_id INTEGER DEFAULT NULL,    -- New
-        lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')), -- New
+        lookup_source_relation_column_id INTEGER DEFAULT NULL,
+        lookup_target_value_column_id INTEGER DEFAULT NULL,
+        lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
@@ -160,8 +160,8 @@ function initializeDatabase() {
         FOREIGN KEY (inverse_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         FOREIGN KEY (rollup_target_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
-        FOREIGN KEY (lookup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL, -- New
-        FOREIGN KEY (lookup_target_value_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,    -- New
+        FOREIGN KEY (lookup_source_relation_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
+        FOREIGN KEY (lookup_target_value_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
         UNIQUE (database_id, name),
         UNIQUE (database_id, column_order)
     );
@@ -302,6 +302,76 @@ function initializeDatabase() {
     );
   `);
 
+  // --- Full-Text Search (FTS5) Tables ---
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+        note_id UNINDEXED,
+        title,
+        content,
+        tokenize = 'porter unicode61'
+    );
+  `);
+
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+        task_id UNINDEXED,
+        description,
+        tokenize = 'porter unicode61'
+    );
+  `);
+
+  // Triggers for notes_fts
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS notes_ai_fts_insert
+    AFTER INSERT ON notes
+    BEGIN
+        INSERT INTO notes_fts (note_id, title, content)
+        VALUES (NEW.id, NEW.title, NEW.content);
+    END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS notes_ad_fts_delete
+    AFTER DELETE ON notes
+    BEGIN
+        DELETE FROM notes_fts WHERE note_id = OLD.id;
+    END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS notes_au_fts_update
+    AFTER UPDATE ON notes
+    BEGIN
+        DELETE FROM notes_fts WHERE note_id = OLD.id;
+        INSERT INTO notes_fts (note_id, title, content)
+        VALUES (NEW.id, NEW.title, NEW.content);
+    END;
+  `);
+
+  // Triggers for tasks_fts
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS tasks_ai_fts_insert
+    AFTER INSERT ON tasks
+    BEGIN
+        INSERT INTO tasks_fts (task_id, description)
+        VALUES (NEW.id, NEW.description);
+    END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS tasks_ad_fts_delete
+    AFTER DELETE ON tasks
+    BEGIN
+        DELETE FROM tasks_fts WHERE task_id = OLD.id;
+    END;
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS tasks_au_fts_update
+    AFTER UPDATE ON tasks
+    BEGIN
+        DELETE FROM tasks_fts WHERE task_id = OLD.id;
+        INSERT INTO tasks_fts (task_id, description)
+        VALUES (NEW.id, NEW.description);
+    END;
+  `);
+
   // --- Block-Based Workspace Specific Tables ---
   // Blocks (for Notion-style pages)
   db.exec(`
@@ -370,7 +440,7 @@ function initializeDatabase() {
     END;
   `);
 
-  // Version History (Simple approach: store snapshots)
+  // Version History (Simple approach: store snapshots) - This is the old one, keep for now.
   db.exec(`
     CREATE TABLE IF NOT EXISTS note_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -391,6 +461,49 @@ function initializeDatabase() {
   console.log("Database schema initialized successfully.");
 
   // TODO: Add functions for CRUD operations
+
+  // --- FTS Initial Population Logic (using user_version pragma) ---
+  const currentVersionRow = db.prepare("PRAGMA user_version").get();
+  const currentUserVersion = currentVersionRow.user_version;
+  const targetFtsPopulatedVersion = 1; // This version indicates FTS tables have been populated at least once.
+
+  if (currentUserVersion < targetFtsPopulatedVersion) {
+    console.log(`Current DB user_version ${currentUserVersion}, attempting to populate FTS tables for version ${targetFtsPopulatedVersion}...`);
+    try {
+      db.prepare("BEGIN").run();
+
+      // Populate notes_fts
+      console.log("Populating notes_fts table...");
+      db.prepare("DELETE FROM notes_fts").run(); // Clear existing data in case of partial previous attempt
+      db.prepare(
+        "INSERT INTO notes_fts (note_id, title, content) SELECT id, title, content FROM notes"
+      ).run();
+      console.log("Finished populating notes_fts table.");
+
+      // Populate tasks_fts
+      console.log("Populating tasks_fts table...");
+      db.prepare("DELETE FROM tasks_fts").run(); // Clear existing data
+      db.prepare(
+        "INSERT INTO tasks_fts (task_id, description) SELECT id, description FROM tasks"
+      ).run();
+      console.log("Finished populating tasks_fts table.");
+
+      db.prepare(`PRAGMA user_version = ${targetFtsPopulatedVersion}`).run();
+      db.prepare("COMMIT").run();
+      console.log(`Successfully populated FTS tables and set user_version to ${targetFtsPopulatedVersion}.`);
+
+    } catch (err) {
+      console.error("Error during FTS initial data population:", err.message, err.stack);
+      try {
+        db.prepare("ROLLBACK").run();
+        console.log("Rolled back FTS population transaction.");
+      } catch (rollbackErr) {
+        console.error("Error rolling back FTS population transaction:", rollbackErr.message);
+      }
+    }
+  } else {
+    console.log(`DB user_version is ${currentUserVersion}. FTS tables presumed populated for version ${targetFtsPopulatedVersion} or newer.`);
+  }
 }
 
 function getDb() {
@@ -419,4 +532,3 @@ initializeDatabase();
 
 // Export functions for use in other backend modules
 module.exports = { getDb, closeDb };
-

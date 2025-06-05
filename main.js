@@ -18,8 +18,9 @@ const databaseRowService = require("./src/backend/services/databaseRowService");
 const databaseQueryService = require("./src/backend/services/databaseQueryService");
 const smartRuleService = require("./src/backend/services/smartRuleService");
 const historyService = require("./src/backend/services/historyService");
-const exportService = require('./src/backend/services/exportService'); // Added exportService
-const importService = require('./src/backend/services/importService'); // Added importService
+const exportService = require('./src/backend/services/exportService');
+const importService = require('./src/backend/services/importService');
+const searchService = require('./src/backend/services/searchService'); // Added searchService
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -262,6 +263,18 @@ ipcMain.handle("import:csvToTable", async (event, databaseId, columnMapping = {}
     console.error("Import CSV to table error:", error);
     return { success: false, error: error.message || "An unexpected error occurred during CSV import." };
   }
+});
+
+// Search Service
+ipcMain.handle("search:all", async (event, searchText, options) => {
+    try {
+        // searchService.searchAll already returns a structured error object or an array of results.
+        return await searchService.searchAll(searchText, options);
+    } catch (error) {
+        // This outer catch is for unexpected errors in the IPC call itself or if searchService throws an unhandled one.
+        console.error("Error during search:all IPC call:", error);
+        return { success: false, error: error.message || "An unexpected error occurred during search." };
+    }
 });
 
 // --- App Lifecycle ---
