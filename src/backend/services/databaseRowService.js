@@ -57,7 +57,8 @@ async function _getStoredRowData(rowId, dbInstance) {
     const db = dbInstance || getDb();
     const rowData = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
     if (!rowData) return null;
-    const allColumnDefinitions = getColumnsForDatabase(rowData.database_id);
+    // Ensure all column definitions are fetched for internal consistency, not user-filtered ones.
+    const allColumnDefinitions = await databaseDefService.getColumnsForDatabase(rowData.database_id, null);
     if (!allColumnDefinitions || allColumnDefinitions.length === 0) return {};
     const storedRowData = {};
     const cellValuesStmt = db.prepare("SELECT value_text, value_number, value_boolean FROM database_row_values WHERE row_id = ? AND column_id = ?");

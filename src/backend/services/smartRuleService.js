@@ -1,6 +1,9 @@
 // src/backend/services/smartRuleService.js
 const { getDb } = require("../db");
-const { getDatabaseById } = require("./databaseDefService"); // To validate target_database_id
+const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
+const FormulaEvaluator = require('../utils/FormulaEvaluator'); // For condition evaluation
+let databaseRowService = require('./databaseRowService'); // For action execution - potential circular dep
+
 // We might need getColumnById from databaseDefService if it exists, or query directly.
 // For now, direct query for column validation.
 
@@ -262,4 +265,120 @@ module.exports = {
   getRulesForDatabase,
   updateRule,
   deleteRule,
+  runSmartRulesForRowChange, // Export the new function
 };
+
+async function runSmartRulesForRowChange(rowId, databaseId, oldRowValues, newRowValues, dbInstance, _triggerDepth = 0, requestingUserId) {
+  const db = dbInstance || getDb();
+
+  // Fetch active rules for the database and trigger type
+  const rules = getRulesForDatabase(databaseId, { triggerType: 'ON_ROW_UPDATE', isEnabled: true });
+  if (!rules || rules.length === 0) {
+    return; // No rules to process
+  }
+
+  // Fetch column definitions for formula evaluation (once per databaseId)
+  let columnDefinitions;
+  try {
+    columnDefinitions = await databaseDefService.getColumnsForDatabase(databaseId, null); // Fetch all columns
+    if (!columnDefinitions) {
+      console.error(`SmartRules: Could not fetch column definitions for database ${databaseId}. Aborting rule execution.`);
+      return;
+    }
+  } catch (e) {
+    console.error(`SmartRules: Error fetching column definitions for database ${databaseId}: ${e.message}. Aborting rule execution.`);
+    return;
+  }
+
+  for (const rule of rules) {
+    try {
+      // 1. Watched Columns Check
+      let watchedColumnChanged = true; // Assume change if no watched_column_ids specified
+      if (rule.trigger_config && Array.isArray(rule.trigger_config.watched_column_ids) && rule.trigger_config.watched_column_ids.length > 0) {
+        watchedColumnChanged = rule.trigger_config.watched_column_ids.some(colId => {
+          // Simple comparison; consider deep equality for objects/arrays if column types could store them directly
+          // For now, _getStoredRowData provides simple values or arrays of IDs, so direct comparison (after stringify for arrays) is mostly fine.
+          const oldValue = oldRowValues[colId];
+          const newValue = newRowValues[colId];
+          if (Array.isArray(oldValue) || Array.isArray(newValue)) {
+            return JSON.stringify(oldValue) !== JSON.stringify(newValue);
+          }
+          return oldValue !== newValue;
+        });
+      }
+
+      if (!watchedColumnChanged) {
+        console.log(`SmartRules: Rule ${rule.id} skipped (no watched column changed).`);
+        continue;
+      }
+
+      // 2. Condition Evaluation
+      let conditionMet = true; // Assume true if no condition_formula
+      if (rule.condition_formula && rule.condition_formula.trim() !== "") {
+        const evalResult = FormulaEvaluator.evaluateFormula(rule.condition_formula, newRowValues, columnDefinitions);
+        if (evalResult.error) {
+          console.error(`SmartRules: Rule ${rule.id} condition evaluation error: ${evalResult.error}. Skipping rule.`);
+          continue;
+        }
+        conditionMet = !!evalResult.result; // Ensure boolean
+      }
+
+      if (!conditionMet) {
+        console.log(`SmartRules: Rule ${rule.id} skipped (condition not met).`);
+        continue;
+      }
+
+      // 3. Action Execution
+      if (rule.action_type === 'UPDATE_SAME_ROW') {
+        if (!rule.action_config || !rule.action_config.set_values) {
+          console.error(`SmartRules: Rule ${rule.id} action_config.set_values is missing. Skipping rule.`);
+          continue;
+        }
+
+        const updatesToApply = { ...rule.action_config.set_values }; // Clone to modify
+
+        // Handle special value placeholders
+        for (const colIdStr of Object.keys(updatesToApply)) {
+            const colId = parseInt(colIdStr, 10);
+            const targetColDef = columnDefinitions.find(c => c.id === colId);
+
+            if (updatesToApply[colIdStr] === "{CURRENT_TIMESTAMP}") {
+                if (targetColDef && targetColDef.type === 'DATETIME') {
+                    updatesToApply[colIdStr] = new Date().toISOString();
+                } else if (targetColDef && targetColDef.type === 'DATE') {
+                    updatesToApply[colIdStr] = new Date().toISOString().split('T')[0];
+                }
+                 else {
+                    console.warn(`SmartRules: Rule ${rule.id} placeholder {CURRENT_TIMESTAMP} used for non-DATETIME/DATE column ${colIdStr}. Using as literal string.`);
+                }
+            }
+            // Add more placeholder handlers here if needed (e.g., "{USER_ID}")
+        }
+
+        console.log(`SmartRules: Rule ${rule.id} triggered. Applying updates to row ${rowId}:`, updatesToApply);
+        // Call databaseRowService.updateRow
+        // Ensure databaseRowService is loaded, handling potential circular dependencies if necessary.
+        // If databaseRowService was destructured at the top, it might be undefined due to circular deps.
+        if (!databaseRowService || !databaseRowService.updateRow) {
+            console.error("SmartRules: databaseRowService.updateRow is not available. This might be a circular dependency issue.");
+            // Attempt to re-require if it was undefined. This is a common pattern to break circular dependencies at runtime.
+            databaseRowService = require('./databaseRowService');
+            if (!databaseRowService || !databaseRowService.updateRow) {
+                 console.error("SmartRules: Re-require of databaseRowService did not resolve updateRow. Cannot execute action for rule " + rule.id);
+                 continue;
+            }
+        }
+
+        await databaseRowService.updateRow({
+          rowId,
+          values: updatesToApply,
+          _triggerDepth: _triggerDepth + 1, // Increment depth
+          requestingUserId // Pass along the original user context
+        });
+        console.log(`SmartRules: Rule ${rule.id} action executed for row ${rowId}.`);
+      }
+    } catch (e) {
+      console.error(`SmartRules: Error processing rule ${rule.id} for row ${rowId}: ${e.message}`, e.stack);
+    }
+  }
+}
