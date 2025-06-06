@@ -97,7 +97,8 @@ function createDatabase(args) {
 
 function getDatabaseById(databaseId, requestingUserId = null) {
   const db = getDb();
-  let query = "SELECT * FROM note_databases WHERE id = ?";
+  // Select new calendar-related fields
+  let query = "SELECT id, note_id, name, is_calendar, user_id, created_at, updated_at, event_start_column_id, event_end_column_id FROM note_databases WHERE id = ?";
   const params = [databaseId];
 
   if (requestingUserId !== null) {
@@ -107,7 +108,9 @@ function getDatabaseById(databaseId, requestingUserId = null) {
 
   try {
     const row = db.prepare(query).get(...params);
-    if (row) row.is_calendar = !!row.is_calendar; // Parse to boolean
+    if (row) {
+        row.is_calendar = !!row.is_calendar; // Parse to boolean
+    }
     return row || null;
   }
   catch (err) { console.error(`Error getting database by ID ${databaseId} for user ${requestingUserId}:`, err.message); return null; }
@@ -116,14 +119,20 @@ function getDatabaseById(databaseId, requestingUserId = null) {
 function getDatabasesForNote(noteId, requestingUserId = null) {
   const db = getDb();
   try {
-    const allDBsForNote = db.prepare("SELECT * FROM note_databases WHERE note_id = ? ORDER BY created_at DESC").all(noteId);
+    // Select new calendar-related fields
+    const allDBsForNote = db.prepare("SELECT id, note_id, name, is_calendar, user_id, created_at, updated_at, event_start_column_id, event_end_column_id FROM note_databases WHERE note_id = ? ORDER BY created_at DESC").all(noteId);
+
+    const mapRow = row => ({
+        ...row,
+        is_calendar: !!row.is_calendar
+    });
 
     if (requestingUserId !== null) {
         return allDBsForNote
-            .map(row => ({...row, is_calendar: !!row.is_calendar}))
+            .map(mapRow)
             .filter(dbItem => dbItem.user_id === null || dbItem.user_id === requestingUserId);
     }
-    return allDBsForNote.map(row => ({...row, is_calendar: !!row.is_calendar}));
+    return allDBsForNote.map(mapRow);
   }
   catch (err) { console.error(`Error getting databases for note ${noteId} (user ${requestingUserId}):`, err.message); return []; }
 }
@@ -131,7 +140,7 @@ function getDatabasesForNote(noteId, requestingUserId = null) {
 function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
   const db = getDb();
 
-  const dbToUpdate = getDatabaseById(databaseId, null); // Unfiltered fetch for ownership check
+  const dbToUpdate = getDatabaseById(databaseId, null); // Unfiltered fetch for ownership check and current values
   if (!dbToUpdate) {
     return { success: false, error: "Database not found." };
   }
@@ -139,17 +148,58 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
     return { success: false, error: "Authorization failed: You do not own this database." };
   }
 
-  const { name, is_calendar } = updates;
-  if (Object.keys(updates).length === 0) return { success: false, error: "No update data provided."};
+  const { name, is_calendar, event_start_column_id, event_end_column_id } = updates;
+  if (Object.keys(updates).length === 0) return { success: false, error: "No update data provided." };
 
   const fieldsToSet = new Map();
   if (name !== undefined) {
     if (!name || typeof name !== 'string' || name.trim() === "") return { success: false, error: "Database name cannot be empty." };
     fieldsToSet.set("name", name.trim());
   }
+
+  // Handling is_calendar and its implications on event column IDs
   if (is_calendar !== undefined) {
     fieldsToSet.set("is_calendar", is_calendar ? 1 : 0);
+    if (is_calendar === false || is_calendar === 0) { // Explicitly setting to not a calendar
+      fieldsToSet.set("event_start_column_id", null);
+      fieldsToSet.set("event_end_column_id", null);
+    }
   }
+
+  // Validate and set event_start_column_id
+  if (event_start_column_id !== undefined) {
+    if (event_start_column_id === null) {
+      fieldsToSet.set("event_start_column_id", null);
+    } else {
+      const colIdNum = parseInt(String(event_start_column_id), 10);
+      if (isNaN(colIdNum)) return { success: false, error: "event_start_column_id must be a numeric ID or null." };
+      const column = db.prepare("SELECT database_id, type FROM database_columns WHERE id = ?").get(colIdNum);
+      if (!column) return { success: false, error: `event_start_column_id ${colIdNum} not found.` };
+      if (column.database_id !== databaseId) return { success: false, error: `event_start_column_id ${colIdNum} does not belong to this database.` };
+      if (column.type !== 'DATETIME') return { success: false, error: `event_start_column_id ${colIdNum} must be a DATETIME column.` };
+      fieldsToSet.set("event_start_column_id", colIdNum);
+    }
+  }
+
+  // Validate and set event_end_column_id
+  if (event_end_column_id !== undefined) {
+     if (event_end_column_id === null) {
+      fieldsToSet.set("event_end_column_id", null);
+    } else {
+      const colIdNum = parseInt(String(event_end_column_id), 10);
+      if (isNaN(colIdNum)) return { success: false, error: "event_end_column_id must be a numeric ID or null." };
+      const column = db.prepare("SELECT database_id, type FROM database_columns WHERE id = ?").get(colIdNum);
+      if (!column) return { success: false, error: `event_end_column_id ${colIdNum} not found.` };
+      if (column.database_id !== databaseId) return { success: false, error: `event_end_column_id ${colIdNum} does not belong to this database.` };
+      if (column.type !== 'DATETIME') return { success: false, error: `event_end_column_id ${colIdNum} must be a DATETIME column.` };
+      fieldsToSet.set("event_end_column_id", colIdNum);
+    }
+  }
+
+  // If is_calendar is true (either being set or already true) and event_start_column_id is not being set to null explicitly
+  // and this update is not already setting it via event_start_column_id field, ensure it's not null if it's required.
+  // However, the requirement says "If they are provided in updates, they must pass validation. If is_calendar is true... are null, this is acceptable"
+  // So no explicit error if they are null when is_calendar is true.
 
   if (fieldsToSet.size === 0) return { success: true, message: "No effective changes.", database: getDatabaseById(databaseId, requestingUserId) };
 

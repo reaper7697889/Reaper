@@ -110,10 +110,14 @@ function initializeDatabase() {
         name TEXT NOT NULL,
         is_calendar BOOLEAN NOT NULL DEFAULT 0,
         user_id INTEGER DEFAULT NULL, -- Added
+        event_start_column_id INTEGER DEFAULT NULL,
+        event_end_column_id INTEGER DEFAULT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL, -- Added
+        FOREIGN KEY (event_start_column_id) REFERENCES database_columns(id) ON DELETE SET NULL,
+        FOREIGN KEY (event_end_column_id) REFERENCES database_columns(id) ON DELETE SET NULL
     );
   `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_note_databases_updated_at AFTER UPDATE ON note_databases FOR EACH ROW BEGIN UPDATE note_databases SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
