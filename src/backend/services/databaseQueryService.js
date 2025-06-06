@@ -11,9 +11,10 @@ const { getColumnsForDatabase, getDatabaseById } = require("./databaseDefService
  *   - filters: [{ columnId, operator, value }]
  *   - sorts: [{ columnId, direction ('ASC'|'DESC') }] (simplified to one sort criteria)
  * @param {number | null} [requestingUserId=null] - Optional ID of the user making the request.
+ * @param {object} [options={ includeDeleted: false }] - Optional options object.
  * @returns {Promise<Array<object>>} - Array of full row objects, or empty array on error/no access.
  */
-async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }, requestingUserId = null) {
+async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }, requestingUserId = null, options = { includeDeleted: false }) {
   const db = getDb();
   try {
     // 1. Initial Ownership Check on databaseId
@@ -41,6 +42,11 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }, requ
 
     let sql = `SELECT DISTINCT dr.id FROM database_rows dr WHERE dr.database_id = ?`;
     const params = [databaseId];
+
+    // Add soft delete filter
+    if (!options.includeDeleted) {
+      sql += ` AND dr.deleted_at IS NULL`;
+    }
 
     function getValueFieldName(columnType) {
         switch (columnType) {
@@ -195,10 +201,10 @@ async function getRowsForDatabase(databaseId, { filters = [], sorts = [] }, requ
 
     // Fetch Full Row Data for each ID
     // Using Promise.all to fetch them concurrently.
-    // 3. Pass requestingUserId to getRow
-    const fullRows = await Promise.all(rowIds.map(id => getRow(id, requestingUserId)));
+    // Pass requestingUserId and options (containing includeDeleted) to getRow
+    const fullRows = await Promise.all(rowIds.map(id => getRow(id, requestingUserId, options)));
 
-    // Filter out any null results from getRow (e.g., if a row was deleted between queries or auth failed in getRow)
+    // Filter out any null results from getRow (e.g., if a row was deleted between queries or auth failed in getRow, or if it was soft-deleted and options.includeDeleted was false)
     return fullRows.filter(row => row !== null);
 
   } catch (err) {

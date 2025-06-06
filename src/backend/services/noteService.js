@@ -58,14 +58,18 @@ function createNote(noteData) {
   }
 }
 
-// Added options parameter with bypassPermissionCheck
-async function getNoteById(id, requestingUserId = null, options = { bypassPermissionCheck: false }) {
+// Added options parameter with bypassPermissionCheck and includeDeleted
+async function getNoteById(id, requestingUserId = null, options = { bypassPermissionCheck: false, includeDeleted: false }) {
   const db = getDb();
-  // Base query fetches all necessary fields, including user_id for ownership/permission checks.
-  const baseQuery = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?";
+  let baseQuery = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?";
+  const params = [id];
+
+  if (!options.includeDeleted) {
+    baseQuery += " AND deleted_at IS NULL";
+  }
 
   try {
-    const note = db.prepare(baseQuery).get(id);
+    const note = db.prepare(baseQuery).get(...params);
     if (!note) {
       return null; // Note not found
     }
@@ -277,10 +281,14 @@ function deleteNote(noteId, requestingUserId) { // Added requestingUserId (requi
   }
 }
 
-function listNotesByFolder(folderId, requestingUserId = null) {
+function listNotesByFolder(folderId, requestingUserId = null, options = { includeDeleted: false }) {
     const db = getDb();
-    let query = "SELECT id, type, title, user_id, is_pinned, updated_at FROM notes WHERE folder_id = ? AND is_archived = 0";
+    let query = "SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at FROM notes WHERE folder_id = ? AND is_archived = 0";
     const params = [folderId];
+
+    if (!options.includeDeleted) {
+        query += " AND deleted_at IS NULL";
+    }
 
     if (requestingUserId !== null) {
         query += " AND (user_id = ? OR user_id IS NULL)";

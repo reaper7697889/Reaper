@@ -63,11 +63,14 @@ function initializeDatabase() {
         user_id INTEGER DEFAULT NULL, -- Added
         is_pinned BOOLEAN DEFAULT 0,
         is_archived BOOLEAN DEFAULT 0,
+        deleted_at DATETIME DEFAULT NULL,
+        deleted_by_user_id INTEGER DEFAULT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL,
         FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL -- Added
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL, -- Added
+        FOREIGN KEY (deleted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
     );
   `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_note_timestamp AFTER UPDATE ON notes FOR EACH ROW BEGIN UPDATE notes SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
@@ -134,6 +137,7 @@ function initializeDatabase() {
         rollup_function TEXT DEFAULT NULL CHECK(rollup_function IS NULL OR rollup_function IN ('COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES', 'SUM', 'AVG', 'MIN', 'MAX', 'SHOW_UNIQUE', 'PERCENT_EMPTY', 'PERCENT_NOT_EMPTY', 'COUNT_CHECKED', 'COUNT_UNCHECKED', 'PERCENT_CHECKED', 'PERCENT_UNCHECKED')),
         lookup_source_relation_column_id INTEGER DEFAULT NULL, lookup_target_value_column_id INTEGER DEFAULT NULL,
         lookup_multiple_behavior TEXT DEFAULT NULL CHECK(lookup_multiple_behavior IS NULL OR lookup_multiple_behavior IN ('FIRST', 'LIST_UNIQUE_STRINGS')),
+        validation_rules TEXT DEFAULT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
         FOREIGN KEY (linked_database_id) REFERENCES note_databases(id) ON DELETE SET NULL,
@@ -146,7 +150,20 @@ function initializeDatabase() {
     );`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_columns_updated_at AFTER UPDATE ON database_columns FOR EACH ROW BEGIN UPDATE database_columns SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
-  db.exec(`CREATE TABLE IF NOT EXISTS database_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, database_id INTEGER NOT NULL, row_order INTEGER, recurrence_rule TEXT DEFAULT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_rows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        database_id INTEGER NOT NULL,
+        row_order INTEGER,
+        recurrence_rule TEXT DEFAULT NULL,
+        deleted_at DATETIME DEFAULT NULL,
+        deleted_by_user_id INTEGER DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
+        FOREIGN KEY (deleted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_rows_updated_at AFTER UPDATE ON database_rows FOR EACH ROW BEGIN UPDATE database_rows SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS database_row_values (id INTEGER PRIMARY KEY AUTOINCREMENT, row_id INTEGER NOT NULL, column_id INTEGER NOT NULL, value_text TEXT, value_number REAL, value_boolean INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (row_id) REFERENCES database_rows(id) ON DELETE CASCADE, FOREIGN KEY (column_id) REFERENCES database_columns(id) ON DELETE CASCADE, UNIQUE (row_id, column_id));`);

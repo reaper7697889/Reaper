@@ -257,7 +257,8 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
     makeBidirectional = false, targetInverseColumnName, existingTargetInverseColumnId,
     formula_definition: origFormulaDefinition, formula_result_type: origFormulaResultType,
     rollup_source_relation_column_id: origRollupSrcRelId, rollup_target_column_id: origRollupTargetId, rollup_function: origRollupFunc,
-    lookup_source_relation_column_id: origLookupSrcRelId, lookup_target_value_column_id: origLookupTargetValId, lookup_multiple_behavior: origLookupMultiBehavior
+    lookup_source_relation_column_id: origLookupSrcRelId, lookup_target_value_column_id: origLookupTargetValId, lookup_multiple_behavior: origLookupMultiBehavior,
+    validation_rules: origValidationRules // Added validation_rules
   } = args;
 
   const db = getDb();
@@ -281,8 +282,32 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
       inverseColumnId: null, // Handled by bidirectional logic specifically
       formulaDefinition: origFormulaDefinition, formulaResultType: origFormulaResultType,
       rollupSourceRelId: origRollupSrcRelId, rollupTargetId: origRollupTargetId, rollupFunction: origRollupFunc,
-      lookupSourceRelId: origLookupSrcRelId, lookupTargetValId: origLookupTargetValId, lookupMultiBehavior: origLookupMultiBehavior
+      lookupSourceRelId: origLookupSrcRelId, lookupTargetValId: origLookupTargetValId, lookupMultiBehavior: origLookupMultiBehavior,
+      validationRules: origValidationRules // Added validationRules
   };
+
+  // Validate validation_rules structure if provided
+  if (finalValues.validationRules !== undefined && finalValues.validationRules !== null) {
+    try {
+      const rules = JSON.parse(finalValues.validationRules);
+      if (!Array.isArray(rules)) throw new Error("validation_rules must be an array.");
+      for (const rule of rules) {
+        if (typeof rule !== 'object' || rule === null || typeof rule.type !== 'string' || typeof rule.error_message !== 'string') {
+          throw new Error("Each rule in validation_rules must be an object with 'type' and 'error_message' strings.");
+        }
+      }
+      // If valid, keep it as a JSON string. If it was an object, stringify it.
+      // The service expects a string from the client for simplicity, or it could handle object input too.
+      // For now, assuming client sends string or it's already stringified if constructed internally.
+      if (typeof finalValues.validationRules !== 'string') {
+          finalValues.validationRules = JSON.stringify(finalValues.validationRules);
+      }
+    } catch (e) {
+      return { success: false, error: `Invalid validation_rules: ${e.message}` };
+    }
+  } else {
+    finalValues.validationRules = null; // Ensure it's explicitly null if not provided or undefined
+  }
 
   // Type-specific validation and field nullification/setup
   if (type === 'RELATION') {
@@ -299,18 +324,19 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
     finalValues = {...finalValues, formulaDefinition: null, formulaResultType: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, defaultValue: null, selectOptions: null};
   } else if (type === 'FORMULA') {
     if (!finalValues.formulaDefinition || String(finalValues.formulaDefinition).trim() === "") return { success: false, error: "formula_definition is required."};
-    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, inverseColumnId: null};
+    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, inverseColumnId: null, validationRules: null}; // No validation rules for FORMULA
   } else if (type === 'ROLLUP') {
     const err = _validateRollupDefinition({rollup_source_relation_column_id: finalValues.rollupSourceRelId, rollup_target_column_id: finalValues.rollupTargetId, rollup_function: finalValues.rollupFunction}, db, databaseId);
     if (err) return { success: false, error: err };
-    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, formulaDefinition: null, formulaResultType: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, inverseColumnId: null};
+    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, formulaDefinition: null, formulaResultType: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, inverseColumnId: null, validationRules: null}; // No validation rules for ROLLUP
   } else if (type === 'LOOKUP') {
     finalValues.lookupMultiBehavior = finalValues.lookupMultiBehavior || 'FIRST';
     const err = _validateLookupDefinition({lookup_source_relation_column_id: finalValues.lookupSourceRelId, lookup_target_value_column_id: finalValues.lookupTargetValId, lookup_multiple_behavior: finalValues.lookupMultiBehavior}, db, databaseId);
     if (err) return { success: false, error: err };
-    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, formulaDefinition: null, formulaResultType: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, inverseColumnId: null};
+    finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', defaultValue: null, selectOptions: null, formulaDefinition: null, formulaResultType: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, inverseColumnId: null, validationRules: null}; // No validation rules for LOOKUP
   } else { // TEXT, NUMBER, DATE, DATETIME, BOOLEAN, SELECT, MULTI_SELECT
     finalValues = {...finalValues, linkedDatabaseId: null, relationTargetEntityType: 'NOTE_DATABASES', formulaDefinition: null, formulaResultType: null, rollupSourceRelId: null, rollupTargetId: null, rollupFunction: null, lookupSourceRelId: null, lookupTargetValId: null, lookupMultiBehavior: null, inverseColumnId: null};
+    // validationRules can apply to these types.
     if (makeBidirectional) return { success: false, error: "Bidirectional can only be set for RELATION type."};
     if (type === 'SELECT' || type === 'MULTI_SELECT') {
       if (finalValues.selectOptions) {
@@ -322,8 +348,8 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
   }
 
   const runTransaction = db.transaction(() => {
-    const colAStmt = db.prepare( `INSERT INTO database_columns ( database_id, name, type, column_order, default_value, select_options, linked_database_id, relation_target_entity_type, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)` );
-    const colAInfo = colAStmt.run( databaseId, trimmedName, type, columnOrder, finalValues.defaultValue, finalValues.selectOptions, finalValues.linkedDatabaseId, finalValues.relationTargetEntityType, finalValues.formulaDefinition, finalValues.formulaResultType, finalValues.rollupSourceRelId, finalValues.rollupTargetId, finalValues.rollupFunction, finalValues.lookupSourceRelId, finalValues.lookupTargetValId, finalValues.lookupMultiBehavior );
+    const colAStmt = db.prepare( `INSERT INTO database_columns ( database_id, name, type, column_order, default_value, select_options, linked_database_id, relation_target_entity_type, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, validation_rules ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)` );
+    const colAInfo = colAStmt.run( databaseId, trimmedName, type, columnOrder, finalValues.defaultValue, finalValues.selectOptions, finalValues.linkedDatabaseId, finalValues.relationTargetEntityType, finalValues.formulaDefinition, finalValues.formulaResultType, finalValues.rollupSourceRelId, finalValues.rollupTargetId, finalValues.rollupFunction, finalValues.lookupSourceRelId, finalValues.lookupTargetValId, finalValues.lookupMultiBehavior, finalValues.validationRules );
     const colAId = colAInfo.lastInsertRowid;
     if (!colAId) throw new Error("Failed to create primary column.");
 
@@ -380,7 +406,7 @@ function getColumnsForDatabase(databaseId, requestingUserId = null) {
   }
   // Ownership of parent DB implies permission to see its columns.
   try {
-    const stmt = db.prepare("SELECT *, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, relation_target_entity_type FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
+    const stmt = db.prepare("SELECT *, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, relation_target_entity_type, validation_rules FROM database_columns WHERE database_id = ? ORDER BY column_order ASC");
     // No need to map is_calendar here, it's a property of the database, not columns.
     return stmt.all(databaseId);
   } catch (err) {
@@ -427,7 +453,7 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
       ["select_options", "linked_database_id", "relation_target_entity_type", "inverse_column_id",
        "formula_definition", "formula_result_type", "rollup_source_relation_column_id",
        "rollup_target_column_id", "rollup_function", "lookup_source_relation_column_id",
-       "lookup_target_value_column_id", "lookup_multiple_behavior", "default_value"]
+       "lookup_target_value_column_id", "lookup_multiple_behavior", "default_value", "validation_rules"] // Added validation_rules
       .forEach(key => fieldsToSet.set(key, null));
 
       if (currentCol.type === 'RELATION') {
@@ -540,10 +566,12 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     }
     else if (finalState.type === 'LOOKUP') {
         if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        fieldsToSet.set("validation_rules", null); // No validation rules for LOOKUP
         /* ... as before ... */
     }
     else if (finalState.type === 'DATETIME') {
         if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        // validation_rules can apply
         /* Default value, other fields nulled by earlier mass nullification */
     }
     else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
@@ -551,9 +579,35 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
         _clearInverseColumnLink(currentCol.inverse_column_id, db);
         fieldsToSet.set("inverse_column_id", null);
       }
+      // validation_rules can apply
       if (updateData.defaultValue !== undefined) fieldsToSet.set("default_value", updateData.defaultValue);
       if (finalState.type === 'SELECT' || finalState.type === 'MULTI_SELECT') { /* ... as before ... */ }
     }
+
+    // Handle validation_rules update for applicable types
+    if (updateData.validation_rules !== undefined &&
+        !['FORMULA', 'ROLLUP', 'LOOKUP', 'RELATION'].includes(finalState.type)) {
+        if (updateData.validation_rules === null) {
+            fieldsToSet.set("validation_rules", null);
+        } else {
+            try {
+                const rules = JSON.parse(updateData.validation_rules);
+                if (!Array.isArray(rules)) throw new Error("validation_rules must be an array.");
+                for (const rule of rules) {
+                    if (typeof rule !== 'object' || rule === null || typeof rule.type !== 'string' || typeof rule.error_message !== 'string') {
+                        throw new Error("Each rule in validation_rules must be an object with 'type' and 'error_message' strings.");
+                    }
+                }
+                fieldsToSet.set("validation_rules", updateData.validation_rules); // Store as JSON string
+            } catch (e) {
+                throw new Error(`Invalid validation_rules: ${e.message}`);
+            }
+        }
+    } else if (['FORMULA', 'ROLLUP', 'LOOKUP', 'RELATION'].includes(finalState.type)) {
+        // Ensure validation_rules are nullified if type changes to one that doesn't support them
+        fieldsToSet.set("validation_rules", null);
+    }
+
 
     if (fieldsToSet.size === 0 && makeBidirectional === undefined) return { success: true, message: "No effective changes." };
     const finalFieldsSql = Array.from(fieldsToSet.keys()).map(key => `${key} = ?`);
