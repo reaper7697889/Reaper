@@ -208,6 +208,7 @@ function initializeDatabase() {
         is_completed BOOLEAN DEFAULT 0,
         due_date DATETIME,
         reminder_at DATETIME,
+        recurrence_rule TEXT DEFAULT NULL, -- Added for recurrence
         user_id INTEGER DEFAULT NULL, -- Added
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
