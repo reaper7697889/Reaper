@@ -362,7 +362,18 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
         if (Array.isArray(rawValue)) {
           rawValue.forEach((targetRowId, index) => {
             if (typeof targetRowId !== 'number') throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}.`);
-            // Validation of targetRowId existence and database belonging (as in addRow)
+
+            // --- BEGIN VALIDATION (copied and adapted from addRow) ---
+            if (colDef.relation_target_entity_type === 'NOTES_TABLE') {
+              const targetNote = db.prepare("SELECT id FROM notes WHERE id = ?").get(targetRowId);
+              if (!targetNote) throw new Error(`Target note ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
+            } else { // NOTE_DATABASES
+              const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
+              if (!targetRow) throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
+              if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked DB ${colDef.linked_database_id}.`);
+            }
+            // --- END VALIDATION ---
+
             linkInsertStmt.run(rowId, columnId, targetRowId, index);
             if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
                linkInsertStmt.run(targetRowId, colDef.inverse_column_id, rowId, 0); // Order might need adjustment for inverse
@@ -415,27 +426,38 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
 
 async function deleteRow(rowId, requestingUserId = null) {
   const db = getDb();
-  try {
+  const transaction = db.transaction(async () => { // Changed to async to allow await inside
     const rowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
     if (!rowMeta) {
-      return { success: false, error: "Row not found." };
+      throw new Error("Row not found."); // Throw error to rollback transaction
     }
+    // Perform accessibility check using the awaited version
     await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow");
 
-    // CASCADE should handle database_row_values and database_row_links.
-    // If not, manual deletion would be needed here, within a transaction.
+    // Explicitly delete links pointing to or from this row
+    db.prepare("DELETE FROM database_row_links WHERE source_row_id = ?").run(rowId);
+    db.prepare("DELETE FROM database_row_links WHERE target_row_id = ?").run(rowId);
+
+    // Note: database_row_values should have ON DELETE CASCADE via foreign key on row_id.
+    // If not, they would also need to be deleted here:
+    // db.prepare("DELETE FROM database_row_values WHERE row_id = ?").run(rowId);
+
     const stmt = db.prepare("DELETE FROM database_rows WHERE id = ?");
     const info = stmt.run(rowId);
 
     if (info.changes > 0) {
       console.log(`Deleted row ${rowId} by user ${requestingUserId}.`);
-      // History recording for deletion can be added if needed.
-      // For now, recordRowHistory is mainly for updates/creations.
-      // A simple way: recordRowHistory({rowId, oldRowValuesJson: JSON.stringify(await _getStoredRowData(rowId, db) || {}), newRowValuesJson: null, db});
-      // But _getStoredRowData won't work after delete. Fetch before delete if needed.
+      // History for deletion: Fetch old data *before* transaction or pass it if needed.
+      // For this subtask, focusing on link cleanup.
       return { success: true, changes: info.changes };
     }
-    return { success: false, error: "Row not found or delete failed." }; // Should be caught by pre-check
+    // If no changes, it means the row was not found at delete stage, though rowMeta found it.
+    // This scenario should ideally not happen if IDs are consistent.
+    throw new Error("Row found initially but delete operation affected no rows.");
+  });
+
+  try {
+    return await transaction(); // Execute the transaction
   } catch (err) {
     console.error(`Error deleting row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to delete row." };

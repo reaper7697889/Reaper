@@ -1,0 +1,45 @@
+# Ignore Node.js dependencies
+node_modules/
+
+# Ignore build output
+dist/
+build/
+
+# Ignore common OS files
+.DS_Store
+Thumbs.db
+
+# Ignore log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Ignore environment variables file
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Ignore SQLite database file if it's intended to be local development only
+# database.sqlite
+# /app/data/app.db
+# If the main db file (database.sqlite) is meant to be version controlled (e.g. for a template schema),
+# then comment out the line above or remove it.
+# For this test, I will assume database.sqlite can be ignored for now.
+/database.sqlite
+/app/database.sqlite
+data/app.db # if this specific path is used for a db
+*.sqlite
+*.sqlite3
+
+# Ignore test results or coverage
+coverage/
+.nyc_output/
+
+# IDE and editor directories
+.idea/
+.vscode/
+*.swp
+*.swo

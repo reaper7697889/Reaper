@@ -279,11 +279,32 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
 
     if (type === 'RELATION' && makeBidirectional && finalValues.relationTargetEntityType === 'NOTE_DATABASES') {
       let colBId;
-      // For existingTargetInverseColumnId, ensure it's accessible by the user if it's being linked.
-      // This check is complex as it involves another column's database.
-      // For simplicity, assume existingTargetInverseColumnId is valid if provided, or add deeper checks later if needed.
-      if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) { /* ... as before ... */ }
-      else { /* ... as before ... */ }
+      if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) {
+        // Use existing column as inverse
+        const validationResult = _validateTargetInverseColumn(existingTargetInverseColumnId, finalValues.linkedDatabaseId, databaseId, db);
+        if (typeof validationResult === 'string') throw new Error(`Invalid existing target inverse column: ${validationResult}`);
+        colBId = validationResult.id; // Use the validated ID
+        // Update existing colB to point back to colA
+        db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colAId, colBId);
+      } else {
+        // Create new inverse column (colB)
+        const colBName = targetInverseColumnName || `${trimmedName}_inverse_of_${parentDb.name}`.slice(0, 255); // Ensure name is reasonable
+        const colBOrder = db.prepare("SELECT COUNT(*) as count FROM database_columns WHERE database_id = ?").get(finalValues.linkedDatabaseId).count + 1;
+
+        const colBStmt = db.prepare(
+            `INSERT INTO database_columns (
+                database_id, name, type, column_order,
+                linked_database_id, relation_target_entity_type,
+                inverse_column_id,
+                created_at, updated_at
+            ) VALUES (?, ?, 'RELATION', ?, ?, 'NOTE_DATABASES', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        );
+        // colB links back to colA's database, and its inverse_column_id is colAId
+        const colBInfo = colBStmt.run(finalValues.linkedDatabaseId, colBName, colBOrder, databaseId, colAId);
+        colBId = colBInfo.lastInsertRowid;
+        if (!colBId) throw new Error("Failed to create inverse column (colB).");
+      }
+      // Update colA to point to colB
       db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colBId, colAId);
     }
     return colAId;
@@ -378,25 +399,108 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
                  throw new Error(`Current linked database ID ${finalState.linked_database_id} seems to be missing (unfiltered check).`);
             }
             fieldsToSet.set("linked_database_id", finalState.linked_database_id);
-            // Bidirectional logic only for NOTE_DATABASES target
-            if (makeBidirectional === true) { /* ... complex logic from addColumn, needs user context for target DB ... */ }
-            else if (makeBidirectional === false && currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); finalState.inverse_column_id = null; }
-            else if (updateData.inverse_column_id !== undefined) { /* explicit set */ _clearInverseColumnLink(currentCol.inverse_column_id, db); /* then set new if valid */ }
-            fieldsToSet.set("inverse_column_id", finalState.inverse_column_id);
-        } else { // NOTES_TABLE
+
+            // Handling changes that would break an existing bidirectional link
+            if (currentCol.inverse_column_id !== null && currentCol.type === 'RELATION' && finalState.type === 'RELATION' &&
+                (updateData.linked_database_id !== undefined && updateData.linked_database_id !== currentCol.linked_database_id ||
+                 updateData.relation_target_entity_type !== undefined && updateData.relation_target_entity_type !== currentCol.relation_target_entity_type)
+            ) {
+                _clearInverseColumnLink(currentCol.inverse_column_id, db);
+                currentCol.inverse_column_id = null; // Reflect this change in currentCol for subsequent logic
+                fieldsToSet.set("inverse_column_id", null);
+                mustClearRowLinksForRelationChange = true; // Links are definitely changing
+            }
+
+            if (makeBidirectional === true) {
+                if (finalState.inverse_column_id && existingTargetInverseColumnId && finalState.inverse_column_id !== existingTargetInverseColumnId) {
+                    _clearInverseColumnLink(finalState.inverse_column_id, db); // Clear old link before establishing new
+                }
+
+                if (existingTargetInverseColumnId !== undefined && existingTargetInverseColumnId !== null) {
+                    const validationResult = _validateTargetInverseColumn(existingTargetInverseColumnId, finalState.linked_database_id, currentCol.database_id, db);
+                    if (typeof validationResult === 'string') throw new Error(`Invalid existing target inverse column: ${validationResult}`);
+                    const colBId = validationResult.id;
+                    db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(currentCol.id, colBId);
+                    fieldsToSet.set("inverse_column_id", colBId);
+                } else {
+                    // Create new inverse column (colB) if one doesn't exist or if we are explicitly asked to make one without providing an existing one.
+                    // This implies currentCol.inverse_column_id might be null or we are overriding.
+                    if (currentCol.inverse_column_id) { // If currentCol already had an inverse, clear it first.
+                        _clearInverseColumnLink(currentCol.inverse_column_id, db);
+                    }
+
+                    const colBName = targetInverseColumnName || `${currentCol.name}_inverse_of_db_${currentCol.database_id}`.slice(0, 255);
+                    const colBOrder = db.prepare("SELECT COUNT(*) as count FROM database_columns WHERE database_id = ?").get(finalState.linked_database_id).count + 1;
+
+                    const colBStmt = db.prepare(
+                        `INSERT INTO database_columns (
+                            database_id, name, type, column_order,
+                            linked_database_id, relation_target_entity_type,
+                            inverse_column_id,
+                            created_at, updated_at
+                        ) VALUES (?, ?, 'RELATION', ?, ?, 'NOTE_DATABASES', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+                    );
+                    const colBInfo = colBStmt.run(finalState.linked_database_id, colBName, colBOrder, currentCol.database_id, currentCol.id);
+                    const colBId = colBInfo.lastInsertRowid;
+                    if (!colBId) throw new Error("Failed to create inverse column (colB) during update.");
+                    fieldsToSet.set("inverse_column_id", colBId);
+                }
+            } else if (makeBidirectional === false) { // Explicitly remove bidirectional link
+                if (currentCol.inverse_column_id !== null) {
+                    _clearInverseColumnLink(currentCol.inverse_column_id, db);
+                }
+                fieldsToSet.set("inverse_column_id", null);
+            } else if (updateData.inverse_column_id !== undefined) { // Allowing direct set of inverse_column_id (e.g. nullifying)
+                 if (currentCol.inverse_column_id && currentCol.inverse_column_id !== updateData.inverse_column_id) {
+                    _clearInverseColumnLink(currentCol.inverse_column_id, db);
+                 }
+                 fieldsToSet.set("inverse_column_id", updateData.inverse_column_id); // Could be null or a new ID (validation might be needed for new ID)
+            }
+            // Note: if makeBidirectional is undefined, and inverse_column_id is not in updateData, existing inverse_column_id is preserved unless cleared by relation change logic earlier.
+
+        } else { // NOTES_TABLE or type changed away from RELATION
+            if (currentCol.inverse_column_id !== null) { // If it had an inverse link, clear it
+                _clearInverseColumnLink(currentCol.inverse_column_id, db);
+            }
             fieldsToSet.set("linked_database_id", null);
-            if (currentCol.inverse_column_id !== null) _clearInverseColumnLink(currentCol.inverse_column_id, db);
             fieldsToSet.set("inverse_column_id", null);
-            if (makeBidirectional === true) throw new Error("Bidirectional links not supported for NOTES_TABLE relations.");
+            if (makeBidirectional === true && finalState.type === 'RELATION') throw new Error("Bidirectional links not supported for NOTES_TABLE relations.");
         }
-        if (updateData.type === currentCol.type && (updateData.linked_database_id !== currentCol.linked_database_id || updateData.relation_target_entity_type !== currentCol.relation_target_entity_type)) {
+
+        // If type is changing to RELATION or if linked_database_id/relation_target_entity_type changes for an existing RELATION
+        if ((updateData.type === 'RELATION' && currentCol.type !== 'RELATION') ||
+            (currentCol.type === 'RELATION' && finalState.type === 'RELATION' &&
+             (updateData.linked_database_id !== undefined && updateData.linked_database_id !== currentCol.linked_database_id ||
+              updateData.relation_target_entity_type !== undefined && updateData.relation_target_entity_type !== currentCol.relation_target_entity_type))
+           ) {
             mustClearRowLinksForRelationChange = true;
         }
-    } else if (finalState.type === 'FORMULA') { /* ... as before ... */ }
-    else if (finalState.type === 'ROLLUP') { /* ... as before ... */ }
-    else if (finalState.type === 'LOOKUP') { /* ... as before ... */ }
-    else if (finalState.type === 'DATETIME') { /* Default value, other fields nulled by earlier mass nullification */ }
+
+    } else if (finalState.type === 'FORMULA') {
+        if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        /* ... as before ... */
+    }
+    else if (finalState.type === 'ROLLUP') {
+        if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        /* ... as before ... */
+    }
+    else if (finalState.type === 'ROLLUP') {
+        if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        /* ... as before ... */
+    }
+    else if (finalState.type === 'LOOKUP') {
+        if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        /* ... as before ... */
+    }
+    else if (finalState.type === 'DATETIME') {
+        if (currentCol.inverse_column_id !== null) { _clearInverseColumnLink(currentCol.inverse_column_id, db); fieldsToSet.set("inverse_column_id", null); }
+        /* Default value, other fields nulled by earlier mass nullification */
+    }
     else { // TEXT, NUMBER, DATE, BOOLEAN, SELECT, MULTI_SELECT
+      if (currentCol.inverse_column_id !== null) { // If type changed from RELATION to these types
+        _clearInverseColumnLink(currentCol.inverse_column_id, db);
+        fieldsToSet.set("inverse_column_id", null);
+      }
       if (updateData.defaultValue !== undefined) fieldsToSet.set("default_value", updateData.defaultValue);
       if (finalState.type === 'SELECT' || finalState.type === 'MULTI_SELECT') { /* ... as before ... */ }
     }
@@ -423,32 +527,50 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
 
 function deleteColumn(columnId, requestingUserId) { // Added requestingUserId
   const db = getDb();
-  try {
-    const columnToDelete = db.prepare("SELECT database_id FROM database_columns WHERE id = ?").get(columnId);
-    if (!columnToDelete) {
-      return { success: false, error: "Column not found." };
+  // It's good practice to wrap this in a transaction if multiple dependent operations occur.
+  // For this specific change, _clearInverseColumnLink is one operation, then delete.
+  // SQLite operations are atomic per statement, but a transaction ensures both or neither.
+  const transaction = db.transaction(() => {
+    const colInfo = db.prepare("SELECT database_id, inverse_column_id FROM database_columns WHERE id = ?").get(columnId);
+    if (!colInfo) {
+      // Throw an error to be caught by the outer catch, which will then return the error object.
+      // This ensures the transaction is rolled back.
+      throw new Error("Column not found.");
     }
 
-    const parentDb = getDatabaseById(columnToDelete.database_id, requestingUserId);
+    const parentDb = getDatabaseById(colInfo.database_id, requestingUserId);
     if (!parentDb) {
-      return { success: false, error: "Parent database not found or not accessible." };
+      throw new Error("Parent database not found or not accessible.");
     }
     // Ownership implies permission to delete column
 
+    if (colInfo.inverse_column_id !== null) {
+      _clearInverseColumnLink(colInfo.inverse_column_id, db);
+    }
+
     const stmt = db.prepare("DELETE FROM database_columns WHERE id = ?");
     const info = stmt.run(columnId);
+
     if (info.changes > 0) {
-        // Clean up related row values and links (if not handled by CASCADE)
-        // This is more robust if done with triggers or specific service calls.
-        // For now, assuming direct delete of column is the main goal.
-        // db.prepare("DELETE FROM database_row_values WHERE column_id = ?").run(columnId);
-        // db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
-        return { success: true };
+      // Clean up related row values and links (if not handled by CASCADE)
+      // This is more robust if done with triggers or specific service calls.
+      // For now, assuming direct delete of column is the main goal.
+      // db.prepare("DELETE FROM database_row_values WHERE column_id = ?").run(columnId);
+      // db.prepare("DELETE FROM database_row_links WHERE source_column_id = ?").run(columnId);
+      return { success: true }; // Return success object for the transaction's result
     }
-    return { success: false, error: "Column found but delete operation failed." }; // Should be caught by pre-check
+    // If no changes, it means the column was not found at delete stage, though colInfo found it.
+    // This scenario should ideally not happen if IDs are consistent.
+    throw new Error("Column found initially but delete operation affected no rows.");
+  });
+
+  try {
+    return transaction(); // Execute the transaction
   } catch (err) {
-    console.error(`Error deleting column ID ${columnId} (user ${requestingUserId}):`, err.message);
-    return { success: false, error: "Failed to delete column." };
+    console.error(`Error deleting column ID ${columnId} (user ${requestingUserId}):`, err.message, err.stack);
+    console.error(`Error deleting column ID ${columnId} (user ${requestingUserId}):`, err.message, err.stack);
+    // Ensure a consistent error object structure as expected by consumers
+    return { success: false, error: err.message || "Failed to delete column." };
   }
 }
 
