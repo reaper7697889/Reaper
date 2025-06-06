@@ -1,5 +1,6 @@
 // src/backend/services/databaseDefService.js
 const { getDb } = require("../db");
+const authService = require('./authService'); // Added for RBAC
 
 const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'DATETIME', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'];
 const ALLOWED_ROLLUP_FUNCTIONS = [
@@ -81,9 +82,20 @@ function _validateLookupDefinition(lookupArgs, db, currentDatabaseId) { /* ... (
 }
 
 // --- Database Management ---
-function createDatabase(args) {
+async function createDatabase(args) { // Changed to async
   const db = getDb();
-  const { name, noteId = null, is_calendar = 0, userId = null } = args; // Extract userId from args
+  const { name, noteId = null, is_calendar = 0, userId = null } = args;
+
+  if (userId) {
+    const userCreating = await authService.getUserWithRole(userId);
+    if (userCreating && userCreating.role === 'VIEWER') {
+      return { success: false, error: "Viewers cannot create databases." };
+    }
+  } else {
+    // Policy: If no userId, perhaps it's a system/public DB creation?
+    // For now, assume if userId is null, it's not a user-driven action that needs this check.
+    // Or, enforce userId presence: return { success: false, error: "User ID is required to create a database." };
+  }
 
   if (!name || typeof name !== 'string' || name.trim() === "") return { success: false, error: "Database name is required." };
   try {
@@ -229,12 +241,32 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
 function deleteDatabase(databaseId, requestingUserId) {
   const db = getDb();
 
-  const dbToDelete = getDatabaseById(databaseId, null); // Unfiltered fetch
+  const dbToDelete = await getDatabaseById(databaseId, null); // Unfiltered fetch, ensure it's awaited
   if (!dbToDelete) {
     return { success: false, error: "Database not found." };
   }
-  if (dbToDelete.user_id !== null && dbToDelete.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this database." };
+
+  let canDelete = false;
+  const isOwner = (dbToDelete.user_id === requestingUserId);
+
+  if (isOwner) {
+    canDelete = true;
+  } else if (dbToDelete.user_id === null) { // Public DB
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true;
+    } else {
+      return { success: false, error: "Authorization failed: Only ADMIN can delete public databases." };
+    }
+  } else { // DB has an owner, and it's not the requestingUser
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true; // Admin can delete other users' databases
+    }
+  }
+
+  if (!canDelete) {
+    return { success: false, error: `Authorization failed: User ${requestingUserId} cannot delete database ${databaseId}.` };
   }
 
   try {
@@ -263,11 +295,31 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
 
   const db = getDb();
 
-  const parentDb = getDatabaseById(databaseId, requestingUserId);
-  if (!parentDb) {
-    return { success: false, error: "Parent database not found or not accessible." };
+  // Authorization for schema modification
+  const parentDbUnfiltered = await getDatabaseById(databaseId, null); // Get unfiltered for direct ownership check
+  if (!parentDbUnfiltered) {
+    return { success: false, error: "Parent database not found." };
   }
-  // Ownership implicit if parentDb was fetched successfully with requestingUserId
+
+  const isOwner = parentDbUnfiltered.user_id === requestingUserId;
+  const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+  let canModifySchema = isOwner;
+
+  if (!isOwner && parentDbUnfiltered.user_id !== null) { // Not owner and DB is not public
+    if (isAdmin) canModifySchema = true;
+  } else if (parentDbUnfiltered.user_id === null) { // Public DB
+    if (!isAdmin) {
+        return { success: false, error: "Authorization failed: Only ADMIN can modify public database schemas." };
+    }
+    canModifySchema = true;
+  }
+
+  if (!canModifySchema) {
+      return { success: false, error: `User ${requestingUserId} is not authorized to modify schema for database ${databaseId}.` };
+  }
+  // If execution reaches here, user is authorized. parentDb can be the one fetched for auth.
+  const parentDb = parentDbUnfiltered;
+
 
   const trimmedName = name ? name.trim() : "";
 
@@ -427,11 +479,25 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
     if (!currentCol) throw new Error("Column not found.");
 
-    // Ownership check on parent database
-    const parentDb = getDatabaseById(currentCol.database_id, requestingUserId);
-    if (!parentDb) {
-      throw new Error("Parent database not found or not accessible.");
+    // Authorization for schema modification (re-check within transaction for safety, using a non-throwing pattern)
+    const parentDbUnfiltered = await getDatabaseById(currentCol.database_id, null);
+    if (!parentDbUnfiltered) {
+        throw new Error("Parent database not found during update transaction.");
     }
+    const isOwner = parentDbUnfiltered.user_id === requestingUserId;
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    let canModifySchema = isOwner;
+
+    if (!isOwner && parentDbUnfiltered.user_id !== null) {
+        if (isAdmin) canModifySchema = true;
+    } else if (parentDbUnfiltered.user_id === null) {
+        if (!isAdmin) throw new Error("Authorization failed: Only ADMIN can modify public database schemas during update.");
+        canModifySchema = true;
+    }
+    if (!canModifySchema) {
+        throw new Error(`User ${requestingUserId} is not authorized to modify columns in database ${currentCol.database_id}.`);
+    }
+    // const parentDb = parentDbUnfiltered; // Use if needed later
 
     const fieldsToSet = new Map();
     let mustClearRowLinksForRelationChange = false;
@@ -642,11 +708,24 @@ function deleteColumn(columnId, requestingUserId) { // Added requestingUserId
       throw new Error("Column not found.");
     }
 
-    const parentDb = getDatabaseById(colInfo.database_id, requestingUserId);
-    if (!parentDb) {
-      throw new Error("Parent database not found or not accessible.");
+    // Authorization for schema modification
+    const parentDbUnfiltered = await getDatabaseById(colInfo.database_id, null);
+    if (!parentDbUnfiltered) {
+        throw new Error("Parent database not found during delete column transaction.");
     }
-    // Ownership implies permission to delete column
+    const isOwner = parentDbUnfiltered.user_id === requestingUserId;
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    let canModifySchema = isOwner;
+    if (!isOwner && parentDbUnfiltered.user_id !== null) {
+        if (isAdmin) canModifySchema = true;
+    } else if (parentDbUnfiltered.user_id === null) {
+        if (!isAdmin) throw new Error("Authorization failed: Only ADMIN can delete columns from public database schemas.");
+        canModifySchema = true;
+    }
+    if (!canModifySchema) {
+        throw new Error(`User ${requestingUserId} is not authorized to delete columns from database ${colInfo.database_id}.`);
+    }
+    // const parentDb = parentDbUnfiltered; // Use if needed
 
     if (colInfo.inverse_column_id !== null) {
       _clearInverseColumnLink(colInfo.inverse_column_id, db);

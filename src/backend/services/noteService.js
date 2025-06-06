@@ -5,16 +5,28 @@ const { recordNoteHistory } = require('./historyService');
 const linkService = require('./linkService');
 const permissionService = require('./permissionService'); // Added import
 const attachmentService = require('../../../attachmentService'); // For voice notes
+const authService = require('./authService'); // Added for RBAC
 
 // --- Note CRUD Operations ---
 
-function createNote(noteData) {
+async function createNote(noteData) { // Changed to async to use authService
   const db = getDb();
   // Ensure userId is destructured, defaulting to null if not provided
   const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0, userId = null } = noteData;
 
-  if (!type || !["simple", "markdown", "workspace_page"].includes(type)) {
-    console.error("Invalid note type provided.");
+  // RBAC Check: Viewers cannot create notes
+  if (userId) { // Check only if userId is provided for the note
+    const userCreating = await authService.getUserWithRole(userId);
+    if (userCreating && userCreating.role === 'VIEWER') {
+        console.error(`User ${userId} (Viewer) attempted to create a note. Denied.`);
+        return null; // Consistent with existing error return type for createNote
+    }
+  }
+  // If no userId is provided in noteData (e.g. for a public note if allowed), this check is skipped.
+  // Policy for anonymous creation or default ownership would be handled by how userId is set/required.
+
+  if (!type || !["simple", "markdown", "workspace_page", "voice"].includes(type)) { // Added 'voice'
+    console.error("Invalid note type provided: " + type);
     return null;
   }
 
@@ -231,48 +243,60 @@ async function updateNote(noteId, updateData, requestingUserId) {
   }
 }
 
-function deleteNote(noteId, requestingUserId) { // Added requestingUserId (required)
+async function deleteNote(noteId, requestingUserId) { // Changed to async
   const db = getDb();
-  const transaction = db.transaction(() => {
-    // Ownership check before deleting
-    const noteForOwnershipCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
+  const transaction = db.transaction(async () => { // transaction callback can be async if operations inside are
+    // Fetch note including deleted, bypass regular permission to check raw ownership/status
+    const noteToSoftDelete = await getNoteById(noteId, requestingUserId, { bypassPermissionCheck: true, includeDeleted: true });
 
-    if (!noteForOwnershipCheck) {
-      // Note: If we want to distinguish "not found" from "auth failed", this check is important.
-      // For now, throwing error will lead to a generic "failed to delete" if not caught specifically.
-      // Consider returning a specific object like { success: false, error: "Note not found." } if preferred.
-      throw new Error(`Note ${noteId} not found for deletion.`);
+    if (!noteToSoftDelete) {
+      throw new Error(`Note ${noteId} not found.`);
     }
 
-    if (noteForOwnershipCheck.user_id !== null && noteForOwnershipCheck.user_id !== requestingUserId) {
-      throw new Error(`Authorization failed: User ${requestingUserId} does not own note ${noteId}.`);
+    let canDelete = false;
+    const isOwner = (noteToSoftDelete.user_id === requestingUserId);
+
+    if (isOwner) {
+      canDelete = true;
+    } else if (noteToSoftDelete.user_id === null) { // Public note
+      const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+      if (isAdmin) {
+        canDelete = true;
+      } else {
+        throw new Error("Authorization failed: Only ADMIN can delete public notes.");
+      }
+    } else { // Note has an owner, and it's not the requestingUser
+      const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+      if (isAdmin) {
+        canDelete = true; // Admin can delete other users' notes
+      }
     }
 
-    const stmt = db.prepare("DELETE FROM notes WHERE id = ?");
-    const info = stmt.run(noteId);
+    if (!canDelete) {
+      throw new Error(`Authorization failed: User ${requestingUserId} cannot delete note ${noteId}.`);
+    }
+
+    // If already soft-deleted by this user, or by anyone if we don't care about who deleted it.
+    // For now, allow re-soft-delete, it just updates timestamps and deleted_by_user_id.
+    // if (noteToSoftDelete.deleted_at !== null) {
+    //   return { success: true, message: "Note already deleted.", changes: 0 };
+    // }
+
+    const stmt = db.prepare(
+      "UPDATE notes SET deleted_at = CURRENT_TIMESTAMP, deleted_by_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    );
+    const info = stmt.run(requestingUserId, noteId);
 
     if (info.changes > 0) {
-      console.log(`Deleted note ${noteId} by user ${requestingUserId}. Rows affected: ${info.changes}`);
-      const cleanupStmt = db.prepare(`
-        DELETE FROM database_row_links
-        WHERE target_row_id = ?
-        AND source_column_id IN (
-            SELECT id FROM database_columns
-            WHERE type = 'RELATION'
-            AND relation_target_entity_type = 'NOTES_TABLE'
-        )
-      `);
-      const cleanupInfo = cleanupStmt.run(noteId);
-      console.log(`Cleaned up ${cleanupInfo.changes} 'NOTES_TABLE' relation links targeting deleted note ${noteId}.`);
+      console.log(`Soft deleted note ${noteId} by user ${requestingUserId}.`);
+      // IMPORTANT: For soft delete, we DO NOT clean up database_row_links targeting this note.
       return { success: true, changes: info.changes };
     }
-    // This case (info.changes === 0 after ownership check passed) implies note was deleted between check and delete, which is unlikely in a transaction.
-    // Or, note existed but delete op failed for other reasons.
-    return { success: false, error: "Note not found or delete operation failed unexpectedly." };
+    return { success: false, error: "Note not found at soft delete stage or no changes made." };
   });
 
   try {
-    return transaction();
+    return await transaction(); // await if transaction callback is async
   } catch (err) {
     console.error(`Error deleting note ${noteId} (user ${requestingUserId}):`, err.message, err.stack);
     // Ensure rollback is attempted if transaction function throws

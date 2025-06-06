@@ -1,7 +1,8 @@
 // src/backend/services/folderService.js
 const { getDb } = require("../db");
+const authService = require('./src/backend/services/authService.js'); // Added for RBAC
 
-function createFolder(folderData, requestingUserId) {
+async function createFolder(folderData, requestingUserId) { // Changed to async
   const db = getDb();
   const { name, parent_id = null } = folderData; // userId will come from requestingUserId
 
@@ -10,6 +11,13 @@ function createFolder(folderData, requestingUserId) {
   }
   if (requestingUserId === null || requestingUserId === undefined) {
       return { success: false, error: "User ID is required to create a folder." };
+  }
+
+  // RBAC Check: Viewers cannot create folders
+  const userCreating = await authService.getUserWithRole(requestingUserId);
+  if (userCreating && userCreating.role === 'VIEWER') {
+      console.error(`User ${requestingUserId} (Viewer) attempted to create a folder. Denied.`);
+      return { success: false, error: "Viewers cannot create folders." };
   }
   // Optional: Validate parent_id if provided (e.g., ensure it exists and belongs to the user)
   // For now, assume parent_id is either null or valid if provided by the client for this user.
@@ -114,7 +122,7 @@ function updateFolder(folderId, updates, requestingUserId) {
   }
 }
 
-function deleteFolder(folderId, requestingUserId) {
+async function deleteFolder(folderId, requestingUserId) { // Changed to async
   const db = getDb();
    if (folderId === null || folderId === undefined || requestingUserId === null || requestingUserId === undefined) {
     return { success: false, error: "Folder ID and User ID are required." };
@@ -125,8 +133,27 @@ function deleteFolder(folderId, requestingUserId) {
     return { success: false, error: "Folder not found." };
   }
 
-  if (folder.user_id !== null && folder.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed. You do not own this folder." };
+  let canDelete = false;
+  const isOwner = (folder.user_id === requestingUserId);
+
+  if (isOwner) {
+    canDelete = true;
+  } else if (folder.user_id === null) { // Public folder (if concept exists for folders)
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true;
+    } else {
+      return { success: false, error: "Authorization failed: Only ADMIN can delete public folders." };
+    }
+  } else { // Folder has an owner, and it's not the requestingUser
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true; // Admin can delete other users' folders
+    }
+  }
+
+  if (!canDelete) {
+    return { success: false, error: `Authorization failed: User ${requestingUserId} cannot delete folder ${folderId}.` };
   }
 
   try {

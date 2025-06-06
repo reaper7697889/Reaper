@@ -1,7 +1,8 @@
 // src/backend/services/workspaceService.js
 const { getDb } = require("../db");
+const authService = require('./src/backend/services/authService.js'); // Added for RBAC
 
-function createWorkspace(workspaceData, requestingUserId) {
+async function createWorkspace(workspaceData, requestingUserId) { // Changed to async
   const db = getDb();
   const { name } = workspaceData; // userId will come from requestingUserId
 
@@ -10,6 +11,13 @@ function createWorkspace(workspaceData, requestingUserId) {
   }
   if (requestingUserId === null || requestingUserId === undefined) {
       return { success: false, error: "User ID is required to create a workspace." };
+  }
+
+  // RBAC Check: Viewers cannot create workspaces
+  const userCreating = await authService.getUserWithRole(requestingUserId);
+  if (userCreating && userCreating.role === 'VIEWER') {
+      console.error(`User ${requestingUserId} (Viewer) attempted to create a workspace. Denied.`);
+      return { success: false, error: "Viewers cannot create workspaces." };
   }
 
   const stmt = db.prepare("INSERT INTO workspaces (name, user_id) VALUES (?, ?)");
@@ -81,7 +89,7 @@ function updateWorkspace(workspaceId, updates, requestingUserId) {
   }
 }
 
-function deleteWorkspace(workspaceId, requestingUserId) {
+async function deleteWorkspace(workspaceId, requestingUserId) { // Changed to async
   const db = getDb();
   if (workspaceId === null || workspaceId === undefined || requestingUserId === null || requestingUserId === undefined) {
     return { success: false, error: "Workspace ID and User ID are required." };
@@ -92,8 +100,27 @@ function deleteWorkspace(workspaceId, requestingUserId) {
     return { success: false, error: "Workspace not found." };
   }
 
-  if (workspace.user_id !== null && workspace.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed. You do not own this workspace." };
+  let canDelete = false;
+  const isOwner = (workspace.user_id === requestingUserId);
+
+  if (isOwner) {
+    canDelete = true;
+  } else if (workspace.user_id === null) { // Public workspace (if concept exists)
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true;
+    } else {
+      return { success: false, error: "Authorization failed: Only ADMIN can delete public workspaces." };
+    }
+  } else { // Workspace has an owner, and it's not the requestingUser
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true; // Admin can delete other users' workspaces
+    }
+  }
+
+  if (!canDelete) {
+    return { success: false, error: `Authorization failed: User ${requestingUserId} cannot delete workspace ${workspaceId}.` };
   }
 
   try {

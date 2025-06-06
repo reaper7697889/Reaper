@@ -2,6 +2,7 @@
 const { getDb } = require('../db');
 const noteService = require('./noteService');
 const userService = require('./userService');
+const authService = require('./authService'); // Added for RBAC
 
 /**
  * Grants a permission level for a note to a target user.
@@ -29,9 +30,17 @@ async function grantNotePermission(noteId, targetUserId, permissionLevel, granti
       return { success: false, error: `Note ID ${noteId} not found.` };
     }
 
-    // Authorization: Only the note owner can grant permissions.
-    if (note.user_id !== grantingUserId) {
-      return { success: false, error: "Authorization failed: Only the note owner can grant permissions." };
+    // Authorization: User must be the note owner OR an ADMIN to grant permissions.
+    const isOwner = note.user_id === grantingUserId;
+    let canGrant = isOwner;
+    if (!isOwner) {
+        const isAdmin = await authService.checkUserRole(grantingUserId, 'ADMIN');
+        if (isAdmin) {
+            canGrant = true;
+        }
+    }
+    if (!canGrant) {
+         return { success: false, error: "Authorization failed: Only the note owner or an ADMIN can grant permissions." };
     }
 
     const targetUser = await userService.getUserById(targetUserId);
@@ -88,9 +97,17 @@ async function revokeNotePermission(noteId, targetUserId, revokingUserId) {
       return { success: false, error: `Note ID ${noteId} not found.` };
     }
 
-    // Authorization: Only the note owner can revoke permissions.
-    if (note.user_id !== revokingUserId) {
-      return { success: false, error: "Authorization failed: Only the note owner can revoke permissions." };
+    // Authorization: User must be the note owner OR an ADMIN to revoke permissions.
+    const isOwner = note.user_id === revokingUserId;
+    let canRevoke = isOwner;
+    if (!isOwner) {
+        const isAdmin = await authService.checkUserRole(revokingUserId, 'ADMIN');
+        if (isAdmin) {
+            canRevoke = true;
+        }
+    }
+    if (!canRevoke) {
+        return { success: false, error: "Authorization failed: Only the note owner or an ADMIN can revoke permissions." };
     }
 
     // It's okay if the target user doesn't exist, the delete will just affect 0 rows.
@@ -129,9 +146,17 @@ async function getPermissionsForNote(noteId, requestingUserId) {
       return { success: false, error: `Note ID ${noteId} not found.` };
     }
 
-    // Authorization: Only the note owner can view all permissions for the note.
-    if (note.user_id !== requestingUserId) {
-      return { success: false, error: "Authorization failed: Only the note owner can view permissions." };
+    // Authorization: User must be the note owner OR an ADMIN to view all permissions.
+    const isOwner = note.user_id === requestingUserId;
+    let canViewPermissions = isOwner;
+    if(!isOwner) {
+        const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+        if (isAdmin) {
+            canViewPermissions = true;
+        }
+    }
+    if (!canViewPermissions) {
+      return { success: false, error: "Authorization failed: Only the note owner or an ADMIN can view permissions." };
     }
 
     const sql = `

@@ -49,13 +49,17 @@ async function registerUser(username, password) {
 
     const passwordHash = await _hashPassword(password);
 
-    const stmt = db.prepare("INSERT INTO users (username, password_hash, created_at, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
-    const info = stmt.run(trimmedUsername, passwordHash);
+    // Determine role: first user is ADMIN, others are EDITOR by default
+    const userCountInfo = db.prepare("SELECT COUNT(*) as count FROM users").get();
+    const roleToSet = (userCountInfo.count === 0) ? 'ADMIN' : 'EDITOR';
+
+    const stmt = db.prepare("INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)");
+    const info = stmt.run(trimmedUsername, passwordHash, roleToSet);
 
     if (info.changes > 0 && info.lastInsertRowid) {
         return {
             success: true,
-            user: { id: info.lastInsertRowid, username: trimmedUsername }
+            user: { id: info.lastInsertRowid, username: trimmedUsername, role: roleToSet }
         };
     } else {
         // This case should ideally not be reached if prepare/run didn't throw for other reasons
@@ -86,7 +90,7 @@ async function loginUser(username, password) {
   }
 
   try {
-    const user = db.prepare("SELECT id, username, password_hash FROM users WHERE username = ? COLLATE NOCASE").get(trimmedUsername);
+    const user = db.prepare("SELECT id, username, password_hash, role FROM users WHERE username = ? COLLATE NOCASE").get(trimmedUsername);
     if (!user) {
       return { success: false, error: "Invalid username or password.", reason: "invalid_credentials" };
     }
@@ -98,7 +102,7 @@ async function loginUser(username, password) {
 
     return {
       success: true,
-      user: { id: user.id, username: user.username }
+      user: { id: user.id, username: user.username, role: user.role }
     };
   } catch (error) {
     console.error("Error during user login:", error);
@@ -118,7 +122,7 @@ async function getUserById(userId) {
       return null;
   }
   try {
-    const user = db.prepare("SELECT id, username, created_at, updated_at FROM users WHERE id = ?").get(userId);
+    const user = db.prepare("SELECT id, username, role, created_at, updated_at FROM users WHERE id = ?").get(userId);
     return user || null;
   } catch (error) {
     console.error(`Error fetching user by ID ${userId}:`, error);
@@ -130,14 +134,15 @@ module.exports = {
   registerUser,
   loginUser,
   getUserById,
-  getUserByUsername, // Export the new function
+  getUserByUsername,
+  adminSetUserRole, // Export the new function
 };
 
 /**
  * Retrieves a user by username (excluding password hash).
  * Case-insensitive username search.
  * @param {string} username
- * @returns {Promise<object | null>} User object { id, username, created_at, updated_at } or null if not found/error.
+ * @returns {Promise<object | null>} User object { id, username, role, created_at, updated_at } or null if not found/error.
  */
 async function getUserByUsername(username) {
   const db = getDb();
@@ -146,11 +151,72 @@ async function getUserByUsername(username) {
       return null;
   }
   try {
-    const sql = "SELECT id, username, created_at, updated_at FROM users WHERE username = ? COLLATE NOCASE";
+    const sql = "SELECT id, username, role, created_at, updated_at FROM users WHERE username = ? COLLATE NOCASE";
     const user = db.prepare(sql).get(String(username).trim());
     return user || null;
   } catch (error) {
     console.error(`Error fetching user by username "${username}":`, error);
     return null;
+  }
+}
+
+/**
+ * Allows an ADMIN user to set the role of a target user.
+ * @param {number} targetUserId - The ID of the user whose role is to be changed.
+ * @param {string} newRole - The new role ('ADMIN', 'EDITOR', 'VIEWER').
+ * @param {number} adminUserId - The ID of the user attempting this action (must be an ADMIN).
+ * @returns {Promise<object>} { success: boolean, user?: {id, role}, error?: string }
+ */
+async function adminSetUserRole(targetUserId, newRole, adminUserId) {
+  const db = getDb();
+
+  if (!targetUserId || !newRole || !adminUserId) {
+    return { success: false, error: "Target user ID, new role, and admin user ID are required." };
+  }
+
+  try {
+    // Authorization: Check if adminUserId is actually an ADMIN
+    const adminUser = await getUserById(adminUserId); // This now fetches role too
+    if (!adminUser || adminUser.role !== 'ADMIN') {
+      return { success: false, error: "Unauthorized: Only ADMIN users can change roles." };
+    }
+
+    // Validate newRole
+    if (!['ADMIN', 'EDITOR', 'VIEWER'].includes(newRole)) {
+      return { success: false, error: "Invalid role specified. Must be 'ADMIN', 'EDITOR', or 'VIEWER'." };
+    }
+
+    // Check if target user exists
+    const targetUser = await getUserById(targetUserId);
+    if (!targetUser) {
+      return { success: false, error: "Target user not found." };
+    }
+
+    // Prevent admin from changing their own role if they are the sole admin
+    if (targetUser.id === adminUserId && newRole !== 'ADMIN') {
+        const adminCountInfo = db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'ADMIN'").get();
+        if (adminCountInfo.count === 1) {
+            return { success: false, error: "Cannot change the role of the sole ADMIN user." };
+        }
+    }
+
+
+    const stmt = db.prepare("UPDATE users SET role = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const info = stmt.run(newRole, targetUserId);
+
+    if (info.changes > 0) {
+      // Fetch the updated user details to confirm
+      const updatedUser = await getUserById(targetUserId);
+      return { success: true, user: { id: updatedUser.id, username: updatedUser.username, role: updatedUser.role } };
+    } else {
+      // This could happen if the targetUserId doesn't exist (though checked above) or role was already set to newRole
+      if (targetUser.role === newRole) {
+        return { success: true, message: "User role is already set to the specified value.", user: { id: targetUser.id, username: targetUser.username, role: targetUser.role }};
+      }
+      return { success: false, error: "Failed to update user role or user not found." };
+    }
+  } catch (error) {
+    console.error(`Error in adminSetUserRole (target: ${targetUserId}, newRole: ${newRole}, admin: ${adminUserId}):`, error);
+    return { success: false, error: error.message || "Failed to set user role due to a server error." };
   }
 }

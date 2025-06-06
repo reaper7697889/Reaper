@@ -15,6 +15,7 @@ const taskService = require('./taskService'); // Assuming taskService exists and
 const attachmentService = require('./attachmentService'); // Assuming attachmentService exists
 const databaseDefService = require('./databaseDefService');
 const databaseQueryService = require('./databaseQueryService');
+const authService = require('./authService'); // Added authService import
 
 // --- Helper Functions ---
 
@@ -357,9 +358,10 @@ async function getTableJsonData(databaseId, requestingUserId = null) {
  * @returns {Promise<object>} - { success: boolean, filename?: string, path?: string, size?: number, message?: string, error?: string }
  */
 async function createDatabaseSnapshot(requestingUserId) {
-  // Authorization (Placeholder - replace with actual role/permission check)
-  if (requestingUserId !== 1) { // Assuming user ID 1 is an admin for now
-    return { success: false, error: "Unauthorized. Only admin users can create database snapshots." };
+  // Authorization
+  const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+  if (!isAdmin) {
+    return { success: false, error: "Unauthorized: Only ADMIN users can create database snapshots." };
   }
 
   try {
