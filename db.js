@@ -271,7 +271,41 @@ function initializeDatabase() {
   db.exec(`CREATE TRIGGER IF NOT EXISTS update_block_timestamp AFTER UPDATE ON blocks FOR EACH ROW BEGIN UPDATE blocks SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
   // Attachment table (moved after blocks)
-  db.exec(`CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, block_id TEXT, file_path TEXT NOT NULL, mime_type TEXT, original_filename TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_id INTEGER,
+        block_id TEXT,
+        user_id INTEGER DEFAULT NULL, -- User who created the attachment entity
+        file_path TEXT NOT NULL, -- Denormalized from current version for quick access
+        mime_type TEXT, -- Denormalized
+        original_filename TEXT, -- Denormalized
+        current_version_id INTEGER DEFAULT NULL, -- Points to an entry in attachment_versions
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        -- updated_at can be added if needed, tied to new versions or metadata changes
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE,
+        FOREIGN KEY (block_id) REFERENCES blocks(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+        FOREIGN KEY (current_version_id) REFERENCES attachment_versions(id) ON DELETE SET NULL
+    );
+  `);
+
+  // Attachment Versions Table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attachment_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attachment_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL, -- Path to the actual file for this version
+        mime_type TEXT,
+        original_filename TEXT,
+        version_number INTEGER NOT NULL,
+        user_id INTEGER, -- User who uploaded this specific version
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+        UNIQUE (attachment_id, version_number)
+    );
+  `);
 
   // --- Placeholder Tables for Future Features ---
   db.exec(`CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY);`);
