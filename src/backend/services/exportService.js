@@ -3,6 +3,10 @@ const fs = require('fs');
 const path = require('path');
 const { getDb } = require("../db"); // Used for db.backup() and db.name
 
+// New imports for PDF export
+let puppeteer;
+let marked;
+
 // Import services - adjust paths as necessary based on actual file structure
 const noteService = require('./noteService');
 const tagService = require('./tagService');
@@ -214,8 +218,92 @@ module.exports = {
   getNotesCollectionExportData,
   getTableCsvData,
   getTableJsonData,
-  createDatabaseSnapshot, // Export the new function
+  createDatabaseSnapshot,
+  getNotePdfExportData, // Export the new function
 };
+
+async function getNotePdfExportData(noteId, requestingUserId) {
+  try {
+    // Dynamically import modules if they haven't been loaded yet
+    if (!puppeteer) puppeteer = require('puppeteer');
+    if (!marked) marked = require('marked');
+
+    const note = await noteService.getNoteById(noteId, requestingUserId);
+    if (!note) {
+      return { success: false, error: "Note not found or not accessible." };
+    }
+
+    let htmlContent = "";
+    const safeTitle = (note.title || `note_${noteId}`).replace(/[^a-z0-9]/gi, '_').substring(0, 50);
+
+    if (note.type === 'markdown') {
+      htmlContent = marked.parse(note.content || "");
+    } else if (note.type === 'simple') { // Assuming 'simple' is HTML content
+      htmlContent = note.content || "";
+    } else {
+      return { success: false, error: `PDF export not supported for note type: ${note.type}` };
+    }
+
+    const defaultCss = `
+      body { font-family: Helvetica, Arial, sans-serif; line-height: 1.6; margin: 40px; color: #333; }
+      h1, h2, h3, h4, h5, h6 { color: #111; margin-bottom: 0.5em; margin-top: 1em; }
+      h1 { font-size: 2em; } h2 { font-size: 1.75em; } h3 { font-size: 1.5em; }
+      p { margin-bottom: 1em; }
+      ul, ol { margin-bottom: 1em; padding-left: 20px; }
+      code { background-color: #f0f0f0; padding: 2px 4px; border-radius: 3px; font-family: monospace; }
+      pre { background-color: #f0f0f0; padding: 10px; border-radius: 3px; overflow-x: auto; }
+      pre code { background-color: transparent; padding: 0; }
+      blockquote { border-left: 3px solid #ccc; margin-left: 0; padding-left: 15px; color: #555; }
+      table { border-collapse: collapse; width: 100%; margin-bottom: 1em; }
+      th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+      th { background-color: #f9f9f9; }
+      img { max-width: 100%; height: auto; }
+    `;
+    const fullHtml = `
+      <!DOCTYPE html>
+      <html><head><meta charset="UTF-8"><title>${note.title || 'Note'}</title><style>${defaultCss}</style></head>
+      <body>${htmlContent}</body></html>
+    `;
+
+    let browser;
+    try {
+      browser = await puppeteer.launch({
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage', // Common for CI environments
+          '--disable-gpu' // Can help in some environments
+        ],
+        headless: true // Ensure headless mode
+      });
+      const page = await browser.newPage();
+      await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
+      const pdfBuffer = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: { top: '2cm', right: '1.5cm', bottom: '2cm', left: '1.5cm' }
+      });
+
+      return {
+        success: true,
+        filename: `${safeTitle}.pdf`,
+        data: pdfBuffer, // This will be a Buffer
+        mimeType: 'application/pdf'
+      };
+    } catch (err) {
+      console.error("Error generating PDF with Puppeteer:", err);
+      return { success: false, error: err.message || "Failed to generate PDF." };
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
+    }
+  } catch (error) { // Catch errors from noteService or initial setup
+    console.error(`Error in getNotePdfExportData for noteId ${noteId}:`, error);
+    return { success: false, error: error.message || "Failed to export note to PDF." };
+  }
+}
+
 
 async function getTableJsonData(databaseId, requestingUserId = null) {
   try {
