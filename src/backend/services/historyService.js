@@ -136,8 +136,8 @@ async function revertNoteToVersion(noteId, versionNumber, requestingUserId) {
   const db = getDb();
   try {
     // First, ensure the requesting user can even access the note they are trying to revert.
-    // noteService.getNoteById will return null if not found or not accessible.
-    const noteToRevert = await noteService.getNoteById(noteId, requestingUserId);
+    // Fetch with includeDeleted: true to allow reverting a soft-deleted note.
+    const noteToRevert = await noteService.getNoteById(noteId, requestingUserId, { includeDeleted: true });
     if (!noteToRevert) {
       return { success: false, error: "Note not found or not accessible by user." };
     }
@@ -167,7 +167,11 @@ async function revertNoteToVersion(noteId, versionNumber, requestingUserId) {
 
     // noteService.updateNote is async and will handle its own history recording for this revert action.
     // It also requires requestingUserId for ownership check.
-    const updateResult = await noteService.updateNote(noteId, updateData, requestingUserId);
+
+    // Ensure undelete by explicitly setting deleted_at and deleted_by_user_id to null
+    const finalUpdateData = { ...updateData, deleted_at: null, deleted_by_user_id: null };
+
+    const updateResult = await noteService.updateNote(noteId, finalUpdateData, requestingUserId);
     return updateResult;
 
   } catch (err) {
@@ -186,9 +190,9 @@ async function revertNoteToVersion(noteId, versionNumber, requestingUserId) {
 async function revertRowToVersion(rowId, versionNumber, requestingUserId) {
   const db = getDb();
   try {
-    // Before fetching history, check if user can access the row (via its parent DB)
-    // This requires getting the row's database_id first.
-    const currentRow = await databaseRowService.getRow(rowId, requestingUserId);
+    // Before fetching history, check if user can access the row (via its parent DB).
+    // Fetch with includeDeleted: true to allow reverting a soft-deleted row.
+    const currentRow = await databaseRowService.getRow(rowId, requestingUserId, { includeDeleted: true });
     if (!currentRow) {
         return { success: false, error: "Row not found or not accessible by user."};
     }
@@ -213,9 +217,35 @@ async function revertRowToVersion(rowId, versionNumber, requestingUserId) {
         console.warn(`Row version ${versionNumber} for row ${rowId} (user ${requestingUserId}) has null for row_values_after_json. Reverting to effectively empty state for stored values.`);
     }
 
+    // Ensure that reverting also "undeletes" the row by setting deleted_at to null.
+    // The valuesToRevertTo from history will not contain deleted_at or deleted_by_user_id.
+    // So, if the updateRow service strictly applies only keys present in `values`,
+    // we might need to explicitly add them or ensure updateRow handles this.
+    // For now, assume updateRow will overwrite with provided fields.
+    // A more robust revert would fetch the target version's fields and explicitly set `deleted_at: null`.
+    // However, `databaseRowService.updateRow` doesn't directly touch `deleted_at`.
+    // The act of updating a row implies it's "active". If `revertRowToVersion` is meant to also undelete,
+    // then the `updateRow` call should include `deleted_at: null`.
+    // For this phase, we assume `updateRow` is sufficient.
+    // The key is that `getRow(..., {includeDeleted: true})` allowed us to fetch it.
+    // The `updateRow` will then set its `updated_at` and if `valuesToRevertTo` doesn't have `deleted_at`,
+    // the existing `deleted_at` (if any) on the row in DB would persist unless `updateRow` clears it.
+
+    // To ensure undelete:
+    // It's better if `updateRow` implicitly unsets `deleted_at` if it's being updated with non-null values.
+    // OR, `revertRowToVersion` must explicitly add `deleted_at: null` to `valuesToRevertTo`.
+    // Let's assume for now that if `updateRow` is called, the row is considered "active" again,
+    // and the `deleted_at` field should be reset by `updateRow` if it's not part of the `values` from history.
+    // This is a subtle point. The current `updateRow` does not automatically set `deleted_at = NULL`.
+    // So, to "undelete", the `valuesToRevertTo` should contain `deleted_at: null`.
+    // The history `row_values_after_json` does NOT contain `deleted_at`.
+    // So, we must add it here.
+    const finalValuesToRevert = { ...valuesToRevertTo, deleted_at: null, deleted_by_user_id: null };
+
+
     // databaseRowService.updateRow is async and will handle its own history recording.
     // It also requires requestingUserId for its own ownership checks.
-    const updateResult = await databaseRowService.updateRow({ rowId, values: valuesToRevertTo, requestingUserId });
+    const updateResult = await databaseRowService.updateRow({ rowId, values: finalValuesToRevert, requestingUserId });
     return updateResult;
 
   } catch (err) {
@@ -231,4 +261,61 @@ module.exports = {
   recordRowHistory,
   revertNoteToVersion,
   revertRowToVersion,
+  undoLastChangeForRow, // Export the new function
 };
+
+async function undoLastChangeForRow(rowId, requestingUserId) {
+  if (rowId === null || rowId === undefined) {
+    return { success: false, error: "rowId is required to undo last change." };
+  }
+  if (requestingUserId === null || requestingUserId === undefined) {
+    return { success: false, error: "requestingUserId is required to undo last change." };
+  }
+
+  try {
+    // Optional: Check accessibility and existence of the row.
+    // databaseRowService.getRow also performs an ownership check.
+    const currentRowCheck = await databaseRowService.getRow(rowId, requestingUserId);
+    if (!currentRowCheck) {
+      return { success: false, error: "Row not found or not accessible." };
+    }
+
+    // Fetch the last two history entries for the row.
+    const history = await getRowHistory(rowId, { limit: 2 });
+
+    // Check if getRowHistory returned an error structure
+    if (history && history.success === false) {
+        return history; // Propagate the error
+    }
+
+    if (!Array.isArray(history)) {
+        // This case might occur if getRowHistory had an unhandled exception and returned something unexpected.
+        // Or if it returned a single object on error (though current impl. returns array or error obj).
+        console.error(`undoLastChangeForRow: getRowHistory for row ${rowId} did not return an array as expected. Received:`, history);
+        return { success: false, error: "Failed to retrieve row history or history format is unexpected." };
+    }
+
+    if (history.length < 2) {
+      // history.length === 0 means no history (or row doesn't exist, though getRow check above should catch that)
+      // history.length === 1 means it's the initial version, no previous state to revert to.
+      return { success: false, message: "No previous version available to undo to for this row." };
+    }
+
+    // history[0] is the current state (latest version recorded).
+    // history[1] is the state *before* the last change was made (i.e., the state we want to revert to).
+    // So, we need to revert to version_number of history[1].
+    const versionToRevertTo = history[1].version_number;
+
+    if (versionToRevertTo === null || versionToRevertTo === undefined) {
+        console.error(`undoLastChangeForRow: Version number to revert to is undefined for row ${rowId}. History entry:`, history[1]);
+        return { success: false, error: "Could not determine the version number to revert to." };
+    }
+
+    // Call revertRowToVersion with the identified version number.
+    return await revertRowToVersion(rowId, versionToRevertTo, requestingUserId);
+
+  } catch (err) {
+    console.error(`Error in undoLastChangeForRow for row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to undo last change for row." };
+  }
+}

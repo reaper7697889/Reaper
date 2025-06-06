@@ -1,5 +1,6 @@
 // src/backend/services/taskService.js
 const { getDb } = require("../db");
+const authService = require('./authService'); // Added for RBAC
 
 // --- Basic Task CRUD Operations ---
 
@@ -8,7 +9,7 @@ const { getDb } = require("../db");
  * @param {object} taskData - { description, note_id, block_id, due_date, reminder_at, is_completed, userId }
  * @returns {object} - { success: boolean, task?: object, error?: string }
  */
-function createTask(taskData) {
+async function createTask(taskData) { // Changed to async
   const db = getDb();
   const {
     description,
@@ -17,25 +18,37 @@ function createTask(taskData) {
     due_date = null,
     reminder_at = null,
     is_completed = 0,
-    userId = null // userId is expected in taskData, defaults to null
+    userId = null, // userId is expected in taskData, defaults to null
+    recurrence_rule = null // Added recurrence_rule
   } = taskData;
 
   if (!description || typeof description !== 'string' || description.trim() === "") {
     return { success: false, error: "Task description is required." };
   }
 
+  // RBAC Check: Viewers cannot create tasks
+  if (userId) { // taskData.userId is the requestingUserId effectively for new tasks
+    const userCreating = await authService.getUserWithRole(userId);
+    if (userCreating && userCreating.role === 'VIEWER') {
+        console.error(`User ${userId} (Viewer) attempted to create a task. Denied.`);
+        return { success: false, error: "Viewers cannot create tasks." };
+    }
+  }
+  // If no userId, it's a public task or an error depending on policy (current schema allows NULL user_id for tasks)
+
   const sql = `
-    INSERT INTO tasks (description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    INSERT INTO tasks (description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
   `;
   try {
     const info = db.prepare(sql).run(
         description.trim(), note_id, block_id,
         due_date, reminder_at, is_completed ? 1 : 0,
-        userId // Pass userId to the SQL execution
+        userId, // Pass userId to the SQL execution
+        recurrence_rule // Added recurrence_rule
     );
-    // Fetch the newly created task. getTaskById selects user_id, so it will be included.
-    const newTask = getTaskById(info.lastInsertRowid);
+    // Fetch the newly created task. getTaskById selects user_id and recurrence_rule, so it will be included.
+    const newTask = getTaskById(info.lastInsertRowid, userId); // Pass userId for auth if needed by getTaskById
     return { success: true, task: newTask }; // Return the full task object including user_id
   } catch (err) {
     console.error("Error creating task:", err.message);
@@ -51,7 +64,7 @@ function createTask(taskData) {
  */
 function getTaskById(id, requestingUserId = null) {
   const db = getDb();
-  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE id = ?";
+  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE id = ?";
   const params = [id];
 
   if (requestingUserId !== null) {
@@ -89,7 +102,7 @@ function updateTask(id, updates, requestingUserId) {
     return { success: false, error: "Authorization failed: You do not own this task." };
   }
 
-  const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id"];
+  const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id", "recurrence_rule"];
   const fieldsToSet = [];
   const values = [];
 
@@ -124,17 +137,44 @@ function updateTask(id, updates, requestingUserId) {
  * @param {number} requestingUserId - ID of the user making the request.
  * @returns {object} - { success: boolean, error?: string }
  */
-function deleteTask(id, requestingUserId) {
+async function deleteTask(id, requestingUserId) { // Changed to async
   const db = getDb();
 
-  const taskFound = getTaskById(id, null); // Unfiltered fetch for ownership check
-  if (!taskFound) {
+  // Fetch task with any user context initially to check its existence and actual owner
+  const taskToDelete = await getTaskById(id, null); // Using existing getTaskById which is now aware of user_id filtering
+                                                    // but for delete, we need to fetch even if not directly owned to check for ADMIN override.
+                                                    // A getTaskByIdInternal or similar that bypasses user check might be better.
+                                                    // For now, assume getTaskById(id, null) gets it if it exists.
+
+  if (!taskToDelete) {
     return { success: false, error: "Task not found." };
   }
-  if (taskFound.user_id !== null && taskFound.user_id !== requestingUserId) {
-    return { success: false, error: "Authorization failed: You do not own this task." };
+
+  let canDelete = false;
+  const isOwner = (taskToDelete.user_id === requestingUserId);
+
+  if (isOwner) {
+    canDelete = true;
+  } else if (taskToDelete.user_id === null) { // Public task
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true;
+    } else {
+      return { success: false, error: "Authorization failed: Only ADMIN can delete public tasks." };
+    }
+  } else { // Task has an owner, and it's not the requestingUser
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (isAdmin) {
+      canDelete = true; // Admin can delete other users' tasks
+    }
   }
 
+  if (!canDelete) {
+    return { success: false, error: `Authorization failed: User ${requestingUserId} cannot delete task ${id}.` };
+  }
+
+  // For soft delete, this would be an UPDATE. For hard delete, it's DELETE.
+  // Current implementation is hard delete.
   const stmt = db.prepare("DELETE FROM tasks WHERE id = ?");
   try {
     const info = stmt.run(id);
@@ -143,7 +183,7 @@ function deleteTask(id, requestingUserId) {
       db.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(id, id);
       return { success: true };
     }
-    return { success: false, error: "Task found but delete operation failed."}; // Should not happen if taskFound
+    return { success: false, error: "Task found but delete operation failed."};
   } catch (err) {
     console.error(`Error deleting task ${id} for user ${requestingUserId}:`, err.message);
     return { success: false, error: "Failed to delete task." };
@@ -152,7 +192,7 @@ function deleteTask(id, requestingUserId) {
 
 function getTasksForNote(noteId, requestingUserId = null) {
     const db = getDb();
-    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE note_id = ?";
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE note_id = ?";
     const params = [noteId];
 
     if (requestingUserId !== null) {
@@ -171,7 +211,7 @@ function getTasksForNote(noteId, requestingUserId = null) {
 
 function getTasksForBlock(blockId, requestingUserId = null) {
     const db = getDb();
-    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, created_at, updated_at FROM tasks WHERE block_id = ?";
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE block_id = ?";
     const params = [blockId];
 
     if (requestingUserId !== null) {
@@ -258,6 +298,7 @@ async function getTaskPrerequisites(taskId, requestingUserId = null) {
       return [];
   }
 
+  // t.* will include recurrence_rule if the table schema is updated before this query runs.
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.depends_on_task_id WHERE td.task_id = ? ORDER BY t.created_at ASC`;
   try {
     let rows = db.prepare(sql).all(taskId);
@@ -281,6 +322,7 @@ async function getTasksBlockedBy(taskId, requestingUserId = null) {
       return [];
   }
 
+  // t.* will include recurrence_rule if the table schema is updated before this query runs.
   const sql = `SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.task_id WHERE td.depends_on_task_id = ? ORDER BY t.created_at ASC`;
   try {
     let rows = db.prepare(sql).all(taskId);

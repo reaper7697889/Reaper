@@ -6,6 +6,8 @@ const { performAggregation } = require('../utils/RollupCalculator');
 const smartRuleService = require('./smartRuleService');
 const { recordRowHistory } = require('./historyService');
 const noteService = require('./noteService');
+const { validateFieldValue } = require('../utils/validationUtils'); // Added import
+const permissionService = require('./permissionService'); // Added for RBAC
 
 const MAX_TRIGGER_DEPTH = 5;
 
@@ -53,11 +55,17 @@ function _deserializeValue(columnType, value_text, value_number, value_boolean) 
     }
 }
 
-async function _getStoredRowData(rowId, dbInstance) {
+async function _getStoredRowData(rowId, dbInstance, options = { includeDeleted: false }) { // Added options
     const db = dbInstance || getDb();
-    const rowData = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
+    let rowQuery = "SELECT database_id, deleted_at FROM database_rows WHERE id = ?"; // Select deleted_at
+    const queryParams = [rowId]; // Renamed params to queryParams to avoid conflict with options
+    if (options && !options.includeDeleted) {
+        rowQuery += " AND deleted_at IS NULL";
+    }
+    const rowData = db.prepare(rowQuery).get(...queryParams); // Use queryParams
     if (!rowData) return null;
-    const allColumnDefinitions = getColumnsForDatabase(rowData.database_id);
+    // Ensure all column definitions are fetched for internal consistency, not user-filtered ones.
+    const allColumnDefinitions = await databaseDefService.getColumnsForDatabase(rowData.database_id, null);
     if (!allColumnDefinitions || allColumnDefinitions.length === 0) return {};
     const storedRowData = {};
     const cellValuesStmt = db.prepare("SELECT value_text, value_number, value_boolean FROM database_row_values WHERE row_id = ? AND column_id = ?");
@@ -87,7 +95,14 @@ async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInst
 
 async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, requestingUserId = null }) {
   const db = getDb();
-  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow");
+
+  if (!requestingUserId) {
+    return { success: false, error: "User ID is required to add rows." };
+  }
+  const permCheck = await permissionService.checkUserDatabasePermission(databaseId, requestingUserId, 'WRITE');
+  if (!permCheck.V) {
+      return { success: false, error: "Authorization failed: Insufficient permissions to add rows to this database." };
+  }
 
   // Fetch column definitions using the potentially user-filtered getColumnsForDatabase
   // However, for internal consistency of adding a row, we might need all columns.
@@ -97,6 +112,23 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
   const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
   let newRowIdValue;
+
+  // Perform validation before starting transaction for database writes
+  const allValidationErrors = {};
+  for (const [columnIdStr, rawValue] of Object.entries(values)) {
+    const columnId = parseInt(columnIdStr, 10);
+    const colDef = columnDefsMap[columnId];
+    if (colDef && colDef.validation_rules && !['RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
+      const errors = validateFieldValue(rawValue, colDef.type, colDef.validation_rules);
+      if (errors.length > 0) {
+        allValidationErrors[colDef.name || columnIdStr] = errors;
+      }
+    }
+  }
+
+  if (Object.keys(allValidationErrors).length > 0) {
+    return { success: false, error: "Validation failed.", validation_errors: allValidationErrors };
+  }
 
   // IMPORTANT: database_rows table itself does not have a user_id column.
   // Ownership is derived from the parent note_databases table.
@@ -160,10 +192,15 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
   }
 }
 
-async function getRow(rowId, requestingUserId = null) {
+async function getRow(rowId, requestingUserId = null, options = { includeDeleted: false }) {
   const db = getDb();
   try {
-    const rowMetaData = db.prepare("SELECT id, database_id, row_order, recurrence_rule, created_at, updated_at FROM database_rows WHERE id = ?").get(rowId);
+    let query = "SELECT id, database_id, row_order, recurrence_rule, created_at, updated_at, deleted_at, deleted_by_user_id FROM database_rows WHERE id = ?";
+    const queryParams = [rowId];
+    if (!options.includeDeleted) {
+      query += " AND deleted_at IS NULL";
+    }
+    const rowMetaData = db.prepare(query).get(...queryParams);
     if (!rowMetaData) return null;
 
     // Ownership check on parent database
@@ -328,16 +365,56 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
   }
 
   const transaction = db.transaction(async () => {
-    const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
-    if (!currentRowMeta) throw new Error("Row not found.");
+    // Fetch essential row metadata, including deleted_at status
+    const currentRowMeta = db.prepare("SELECT database_id, deleted_at FROM database_rows WHERE id = ?").get(rowId);
+    if (!currentRowMeta) {
+        throw new Error("Row not found.");
+    }
 
-    await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow");
+    // If the row is already soft-deleted, it cannot be updated unless this is an 'undelete' operation
+    const isUndeleteOperation = values && values.hasOwnProperty('deleted_at') && values.deleted_at === null;
+    if (currentRowMeta.deleted_at !== null && !isUndeleteOperation) {
+        throw new Error("Cannot update a deleted row. Please restore it first.");
+    }
 
-    const oldStoredValues = await _getStoredRowData(rowId, db);
-    if (oldStoredValues === null) throw new Error("Could not retrieve current stored values for history.");
+    // Authorization check for WRITE permission on the database
+    if (!requestingUserId) { // Should ideally be caught by API layer/auth middleware
+        throw new Error("User ID is required to update rows.");
+    }
+    const permCheckWrite = await permissionService.checkUserDatabasePermission(currentRowMeta.database_id, requestingUserId, 'WRITE');
+    if (!permCheckWrite.V) {
+        throw new Error("Authorization failed: Insufficient permissions to update rows in this database.");
+    }
 
-    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null)) // Use null to get all columns for processing
+    // For history, get current state. If it's an undelete op, we need the soft-deleted state.
+    const oldStoredValues = await _getStoredRowData(rowId, db, { includeDeleted: isUndeleteOperation });
+    if (oldStoredValues === null && currentRowMeta.deleted_at === null) {
+      // If it's not soft-deleted and we can't get its values, that's an issue.
+      throw new Error("Could not retrieve current stored values for history for an existing, non-deleted row.");
+    }
+
+    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null))
         .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
+
+    // Perform validation on incoming values before applying changes
+    const allValidationErrors = {};
+    for (const [columnIdStr, rawValue] of Object.entries(values)) {
+        const columnId = parseInt(columnIdStr, 10);
+        const colDef = columnDefsMap[columnId];
+        if (colDef && colDef.validation_rules && !['RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
+            const errors = validateFieldValue(rawValue, colDef.type, colDef.validation_rules);
+            if (errors.length > 0) {
+                allValidationErrors[colDef.name || columnIdStr] = errors;
+            }
+        }
+    }
+
+    if (Object.keys(allValidationErrors).length > 0) {
+        // Throw an error to be caught by the outer try-catch, which will handle transaction rollback.
+        const validationError = new Error("Validation failed.");
+        validationError.validation_errors = allValidationErrors;
+        throw validationError;
+    }
 
     const valueUpdateStmt = db.prepare("REPLACE INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean) VALUES (?, ?, ?, ?, ?)");
     const linkDeleteStmt = db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ?");
@@ -353,7 +430,7 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
       if (colDef.type === 'RELATION') {
         linkDeleteStmt.run(rowId, columnId);
         if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
-            const oldLinkedTargetIds = oldStoredValues[columnId] || [];
+            const oldLinkedTargetIds = (oldStoredValues && oldStoredValues[columnId]) ? oldStoredValues[columnId] : [];
             for(const oldTargetId of oldLinkedTargetIds){
                 db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? AND target_row_id = ?")
                   .run(oldTargetId, colDef.inverse_column_id, rowId);
@@ -362,7 +439,18 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
         if (Array.isArray(rawValue)) {
           rawValue.forEach((targetRowId, index) => {
             if (typeof targetRowId !== 'number') throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}.`);
-            // Validation of targetRowId existence and database belonging (as in addRow)
+
+            // --- BEGIN VALIDATION (copied and adapted from addRow) ---
+            if (colDef.relation_target_entity_type === 'NOTES_TABLE') {
+              const targetNote = db.prepare("SELECT id FROM notes WHERE id = ?").get(targetRowId);
+              if (!targetNote) throw new Error(`Target note ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
+            } else { // NOTE_DATABASES
+              const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
+              if (!targetRow) throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
+              if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked DB ${colDef.linked_database_id}.`);
+            }
+            // --- END VALIDATION ---
+
             linkInsertStmt.run(rowId, columnId, targetRowId, index);
             if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
                linkInsertStmt.run(targetRowId, colDef.inverse_column_id, rowId, 0); // Order might need adjustment for inverse
@@ -399,8 +487,10 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
     }
 
     // Run Smart Rules (only if _triggerDepth is 0 for user-initiated changes)
+    // Pass includeDeleted:true if we need to get the state of a soft-deleted row after updates (e.g. undeleting)
     if (_triggerDepth === 0) {
-        await smartRuleService.runSmartRulesForRowChange(rowId, currentRowMeta.database_id, oldStoredValues, await _getStoredRowData(rowId, db), db, _triggerDepth + 1, requestingUserId);
+        const newStoredValuesForRules = await _getStoredRowData(rowId, db, { includeDeleted: true });
+        await smartRuleService.runSmartRulesForRowChange(rowId, currentRowMeta.database_id, oldStoredValues || {}, newStoredValuesForRules, db, _triggerDepth + 1, requestingUserId);
     }
     return { success: true };
   });
@@ -409,33 +499,53 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
     return await transaction(); // Ensure async operations within transaction are awaited
   } catch (err) {
     console.error(`Error updating row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
+    // If the error came from our validation logic, propagate the validation_errors object
+    if (err.validation_errors) {
+        return { success: false, error: err.message, validation_errors: err.validation_errors };
+    }
     return { success: false, error: err.message || "Failed to update row." };
   }
 }
 
 async function deleteRow(rowId, requestingUserId = null) {
   const db = getDb();
-  try {
+  const transaction = db.transaction(async () => {
     const rowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
     if (!rowMeta) {
-      return { success: false, error: "Row not found." };
+      throw new Error("Row not found.");
     }
-    await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow");
 
-    // CASCADE should handle database_row_values and database_row_links.
-    // If not, manual deletion would be needed here, within a transaction.
-    const stmt = db.prepare("DELETE FROM database_rows WHERE id = ?");
-    const info = stmt.run(rowId);
+    // Authorization check for WRITE permission on the database
+    if (!requestingUserId) {
+        throw new Error("User ID is required to delete rows.");
+    }
+    const permCheck = await permissionService.checkUserDatabasePermission(rowMeta.database_id, requestingUserId, 'WRITE');
+    if (!permCheck.V) {
+        throw new Error("Authorization failed: Insufficient permissions to delete rows from this database.");
+    }
+
+    if (rowMeta.deleted_at !== null) { // Already soft-deleted
+        // Optionally, allow re-deleting by same user to update timestamp, or prevent re-delete.
+        // For now, consider it success if already deleted.
+        return { success: true, changes: 0, message: "Row was already soft-deleted." };
+    }
+
+    // Soft delete: Update deleted_at and deleted_by_user_id
+    const stmt = db.prepare(
+      "UPDATE database_rows SET deleted_at = CURRENT_TIMESTAMP, deleted_by_user_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    );
+    const info = stmt.run(requestingUserId, rowId);
 
     if (info.changes > 0) {
-      console.log(`Deleted row ${rowId} by user ${requestingUserId}.`);
-      // History recording for deletion can be added if needed.
-      // For now, recordRowHistory is mainly for updates/creations.
-      // A simple way: recordRowHistory({rowId, oldRowValuesJson: JSON.stringify(await _getStoredRowData(rowId, db) || {}), newRowValuesJson: null, db});
-      // But _getStoredRowData won't work after delete. Fetch before delete if needed.
+      console.log(`Soft deleted row ${rowId} by user ${requestingUserId}.`);
       return { success: true, changes: info.changes };
     }
-    return { success: false, error: "Row not found or delete failed." }; // Should be caught by pre-check
+    // This state should ideally not be reached if rowMeta was found and not deleted_at.
+    throw new Error("Row not found at soft delete stage or no changes made, despite initial checks.");
+  });
+
+  try {
+    return await transaction(); // Execute the transaction
   } catch (err) {
     console.error(`Error deleting row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to delete row." };
@@ -455,9 +565,10 @@ async function getColumnValuesForRows(databaseId, rowIds, columnId, requestingUs
   if (!targetColDef) throw new Error(`Column ID ${columnId} not found in database ${databaseId}.`);
   if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetColDef.type)) {
     // For computed columns, we need to fetch each row individually.
+    // Pass includeDeleted from options to getRow.
     const values = [];
     for (const rowId of rowIds) {
-      const fullRow = await getRow(rowId, requestingUserId); // Pass user context
+      const fullRow = await getRow(rowId, requestingUserId, options);
       values.push(fullRow ? fullRow.values[columnId] : null);
     }
     return values;
