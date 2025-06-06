@@ -281,4 +281,147 @@ module.exports = {
   importMarkdownNoteFromString,
   importJsonNotesFromString,
   importCsvToTableFromString,
+  importJsonToTableFromString, // Export the new function
 };
+
+async function importJsonToTableFromString(databaseId, jsonString, requestingUserId = null) {
+  const results = { successCount: 0, errorCount: 0, errors: [] };
+  let jsonData;
+
+  try {
+    jsonData = JSON.parse(jsonString);
+  } catch (e) {
+    results.errors.push({ itemIndex: -1, error: "Invalid JSON string: " + e.message });
+    results.errorCount = 1; // Or jsonData.length if it was an array-like string that failed parsing
+    return results;
+  }
+
+  if (!Array.isArray(jsonData)) {
+    results.errors.push({ itemIndex: -1, error: "JSON data must be an array of objects." });
+    results.errorCount = 1;
+    return results;
+  }
+
+  if (jsonData.length === 0) {
+    return results; // Nothing to import
+  }
+
+  try {
+    // Accessibility check
+    const dbDef = await databaseDefService.getDatabaseById(databaseId, requestingUserId);
+    if (!dbDef) {
+      results.errors.push({ itemIndex: -1, error: `Database ID ${databaseId} not found or not accessible.` });
+      results.errorCount = jsonData.length;
+      return results;
+    }
+
+    const targetColumns = await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId);
+    if (!targetColumns || targetColumns.length === 0) {
+      results.errors.push({ itemIndex: -1, error: "Target database has no columns defined." });
+      results.errorCount = jsonData.length;
+      return results;
+    }
+
+    const colNameLowerMap = targetColumns.reduce((map, col) => { map[col.name.toLowerCase()] = col; return map; }, {});
+    const colIdStringMap = targetColumns.reduce((map, col) => { map[String(col.id)] = col; return map; }, {});
+
+    for (let i = 0; i < jsonData.length; i++) {
+      const jsonObject = jsonData[i];
+      if (typeof jsonObject !== 'object' || jsonObject === null) {
+        results.errorCount++;
+        results.errors.push({ itemIndex: i, itemData: jsonObject, error: "Item is not a valid object." });
+        continue;
+      }
+
+      const rowDataForDb = {};
+      let itemHasError = false;
+
+      for (const [key, value] of Object.entries(jsonObject)) {
+        let targetColDef = colNameLowerMap[key.toLowerCase()] || colIdStringMap[String(key)];
+
+        if (targetColDef) {
+          if (['FORMULA', 'ROLLUP', 'LOOKUP'].includes(targetColDef.type)) continue; // Skip computed columns
+
+          if (value === null || value === undefined || String(value).trim() === "") {
+            rowDataForDb[targetColDef.id] = null;
+            continue;
+          }
+
+          try {
+            switch (targetColDef.type) {
+              case 'TEXT':
+              case 'SELECT':
+                rowDataForDb[targetColDef.id] = String(value);
+                break;
+              case 'NUMBER':
+                const num = parseFloat(value);
+                if (isNaN(num)) throw new Error(`'${value}' is not a valid number for column '${targetColDef.name}'.`);
+                rowDataForDb[targetColDef.id] = num;
+                break;
+              case 'BOOLEAN':
+                if (typeof value === 'boolean') rowDataForDb[targetColDef.id] = value;
+                else rowDataForDb[targetColDef.id] = ['true', '1', 'yes', 't', 'y'].includes(String(value).toLowerCase());
+                break;
+              case 'DATE':
+                const d = new Date(value);
+                if (isNaN(d.getTime())) throw new Error(`'${value}' is not a valid date for column '${targetColDef.name}'.`);
+                rowDataForDb[targetColDef.id] = d.toISOString().split('T')[0];
+                break;
+              case 'DATETIME':
+                const dt = new Date(value);
+                if (isNaN(dt.getTime())) throw new Error(`'${value}' is not a valid datetime for column '${targetColDef.name}'.`);
+                rowDataForDb[targetColDef.id] = dt.toISOString();
+                break;
+              case 'MULTI_SELECT':
+                if (!Array.isArray(value)) throw new Error(`Value for MULTI_SELECT column '${targetColDef.name}' must be an array. Found: ${JSON.stringify(value)}`);
+                rowDataForDb[targetColDef.id] = value.map(s => String(s).trim()).filter(s => s);
+                break;
+              case 'RELATION':
+                if (!Array.isArray(value)) throw new Error(`Value for RELATION column '${targetColDef.name}' must be an array of numbers. Found: ${JSON.stringify(value)}`);
+                rowDataForDb[targetColDef.id] = value.map(id => {
+                  const numId = parseInt(id, 10);
+                  if (isNaN(numId)) throw new Error(`Invalid ID '${id}' in RELATION array for column '${targetColDef.name}'.`);
+                  return numId;
+                });
+                break;
+              default:
+                break;
+            }
+          } catch (typeError) {
+            results.errors.push({ itemIndex: i, itemData: jsonObject, error: typeError.message });
+            itemHasError = true;
+            break;
+          }
+        }
+      }
+
+      if (!itemHasError && Object.keys(rowDataForDb).length > 0) {
+        try {
+          const addResult = await databaseRowService.addRow({ databaseId, values: rowDataForDb, requestingUserId });
+          if (addResult.success) {
+            results.successCount++;
+          } else {
+            results.errorCount++;
+            results.errors.push({ itemIndex: i, itemData: jsonObject, error: addResult.error || "Failed to add row to database." });
+          }
+        } catch (addRowError) {
+          results.errorCount++;
+          results.errors.push({ itemIndex: i, itemData: jsonObject, error: addRowError.message || "Error during addRow call." });
+        }
+      } else if (!itemHasError && Object.keys(rowDataForDb).length === 0) {
+        results.errorCount++;
+        results.errors.push({ itemIndex: i, itemData: jsonObject, error: "No mappable fields found for this item." });
+      }
+    }
+  } catch (error) {
+    // General error affecting the whole import (e.g., DB connection, service failure)
+    console.error(`Error importing JSON to table ${databaseId}:`, error);
+    if (results.successCount === 0 && results.errorCount === 0) { // If no specific item errors yet
+        results.errors.push({ itemIndex: -1, error: error.message || "An unexpected error occurred during JSON import." });
+        results.errorCount = jsonData && Array.isArray(jsonData) ? jsonData.length : 1; // Assume all failed if one major error
+    } else { // If some items were processed, add this as a general error
+        results.errors.push({ itemIndex: -1, error: `A general error occurred: ${error.message}` });
+    }
+  }
+  return results;
+}

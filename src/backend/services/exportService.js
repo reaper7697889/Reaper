@@ -211,4 +211,51 @@ module.exports = {
   getNoteExportData,
   getNotesCollectionExportData,
   getTableCsvData,
+  getTableJsonData, // Export the new function
 };
+
+async function getTableJsonData(databaseId, requestingUserId = null) {
+  try {
+    const dbDef = await databaseDefService.getDatabaseById(databaseId, requestingUserId);
+    if (!dbDef) {
+      return { success: false, error: `Database with ID ${databaseId} not found or not accessible.` };
+    }
+
+    const columns = await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId);
+    if (!columns) { // Should not happen if dbDef was found, but good check
+        return { success: false, error: `Could not retrieve columns for database ID ${databaseId}.`};
+    }
+    // Sort columns by column_order, though getColumnsForDatabase should already do it.
+    // It's good practice to ensure it here if the order is critical for the export format.
+    columns.sort((a, b) => a.column_order - b.column_order);
+
+    // Fetch all rows with fully computed values.
+    // Pass requestingUserId to getRowsForDatabase.
+    const rows = await databaseQueryService.getRowsForDatabase(databaseId, { filters: [], sorts: [] }, requestingUserId);
+    if (!rows) { // if getRowsForDatabase can return null on error or no rows
+        return { success: false, error: `Could not retrieve rows for database ID ${databaseId}.`};
+    }
+
+    const arrayOfRowObjects = rows.map(row => {
+      const rowObject = {};
+      columns.forEach(col => {
+        // Use column name as key. If names are not unique (should be handled by DB constraints), this could be an issue.
+        // Assuming column names are unique within a database.
+        rowObject[col.name] = row.values[col.id];
+      });
+      return rowObject;
+    });
+
+    const safeDbName = (dbDef.name || `database_${databaseId}`).replace(/[^a-z0-9]/gi, '_').substring(0, 50);
+    const filename = `${safeDbName}_export.json`;
+
+    return {
+      filename,
+      data: JSON.stringify(arrayOfRowObjects, null, 2), // Pretty print JSON
+    };
+
+  } catch (error) {
+    console.error(`Error getting table JSON data for databaseId ${databaseId} (user ${requestingUserId}):`, error);
+    return { success: false, error: error.message || "Failed to export table to JSON." };
+  }
+}
