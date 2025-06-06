@@ -4,6 +4,7 @@ const { getDb } = require("../db");
 const { recordNoteHistory } = require('./historyService');
 const linkService = require('./linkService');
 const permissionService = require('./permissionService'); // Added import
+const attachmentService = require('../../../attachmentService'); // For voice notes
 
 // --- Note CRUD Operations ---
 
@@ -311,4 +312,84 @@ module.exports = {
   updateNote,
   deleteNote,
   listNotesByFolder,
+  createVoiceNote, // Export new function
 };
+
+async function createVoiceNote(fileDetails, { title, folder_id = null, workspace_id = null, is_pinned = 0 }, requestingUserId) {
+  if (!requestingUserId) {
+    return { success: false, error: "Requesting user ID is required." };
+  }
+  if (!fileDetails || !fileDetails.tempFilePath || !fileDetails.original_filename || !fileDetails.mime_type) {
+    return { success: false, error: "File details (tempFilePath, original_filename, mime_type) are required." };
+  }
+  if (!fileDetails.mime_type.startsWith('audio/')) {
+    return { success: false, error: "Invalid file type for voice note. Must be an audio type." };
+  }
+
+  try {
+    // Step 1: Create Attachment (initially unlinked to a note)
+    const attachmentResult = await attachmentService.createAttachment(
+      {
+        ...fileDetails, // tempFilePath, original_filename, mime_type
+        note_id: null,
+        block_id: null
+      },
+      requestingUserId
+    );
+
+    if (!attachmentResult || !attachmentResult.success) {
+      return {
+        success: false,
+        error: "Failed to create attachment for voice note. " + (attachmentResult ? attachmentResult.error : 'Unknown attachment error')
+      };
+    }
+    const attachmentId = attachmentResult.attachment.id;
+
+    // Step 2: Create the 'voice' Note
+    // Content of a voice note will store the ID of its primary attachment.
+    const noteContent = JSON.stringify({ attachmentId: attachmentId });
+    const noteTitle = title || attachmentResult.attachment.original_filename || `Voice Note ${new Date().toISOString().substring(0,10)}`;
+
+    // createNote is synchronous and returns newNoteId or null
+    const newNoteId = createNote({
+      type: 'voice', // Assuming 'voice' is a valid type to be added to CHECK constraint in notes table
+      title: noteTitle,
+      content: noteContent,
+      folder_id,
+      workspace_id,
+      is_pinned,
+      userId: requestingUserId
+    });
+
+    if (!newNoteId) {
+      console.error(`Failed to create voice note record for attachment ID: ${attachmentId}. Orphaned attachment.`);
+      // Attempting to delete the orphaned attachment is complex here.
+      // Consider a cleanup utility or ensure createNote is more robust.
+      return { success: false, error: "Failed to create voice note record after creating attachment." };
+    }
+
+    // Step 3: Link Attachment to New Note by updating the attachment's note_id
+    const linkResult = await attachmentService.updateAttachmentParent(attachmentId, newNoteId, 'note', requestingUserId);
+    if (!linkResult || !linkResult.success) {
+      // This is a partial failure. The note and attachment exist but are not linked via attachments.note_id.
+      // The note's content still holds the attachmentId, so it's findable.
+      console.warn(`Failed to link attachment ${attachmentId} to new voice note ${newNoteId} via attachmentService.updateAttachmentParent. Note content has link.`);
+      // Depending on strictness, this could be an error or a warning. For now, proceed but log.
+    }
+
+    // Step 4: Return Success
+    // Fetch the newly created note to return its full details, including the user_id set by createNote.
+    const newVoiceNote = await getNoteById(newNoteId, requestingUserId);
+    if (!newVoiceNote) {
+        // This would be unusual if createNote succeeded.
+        console.error(`Failed to fetch newly created voice note ${newNoteId}.`);
+        return { success: false, error: "Voice note created but could not be retrieved."}
+    }
+
+    return { success: true, note: newVoiceNote, attachment: attachmentResult.attachment };
+
+  } catch (error) {
+    console.error("Error in createVoiceNote:", error);
+    return { success: false, error: error.message || "An unexpected error occurred while creating the voice note." };
+  }
+}

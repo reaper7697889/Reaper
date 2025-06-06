@@ -55,7 +55,7 @@ function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL CHECK(type IN ('simple', 'markdown', 'workspace_page')),
+        type TEXT NOT NULL CHECK(type IN ('simple', 'markdown', 'workspace_page', 'voice')),
         title TEXT,
         content TEXT,
         folder_id INTEGER,

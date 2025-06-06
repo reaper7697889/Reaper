@@ -8,8 +8,8 @@ const path = require("path");
 // For now, authorization will be basic based on requestingUserId matching attachment.user_id.
 
 // Define a base directory for storing attachments.
-// Assuming db.js is in project root, __dirname of this file is /app/src/backend/services
-const PROJECT_ROOT = path.join(__dirname, "..", "..", "..");
+// If attachmentService.js is in the project root /app:
+const PROJECT_ROOT = __dirname;
 const ATTACHMENT_DIR = path.join(PROJECT_ROOT, "attachments_data"); // Store in /app/attachments_data
 
 
@@ -303,5 +303,54 @@ module.exports = {
   getAttachmentDetails,
   listAttachmentVersions,
   setAttachmentVersionAsCurrent,
+  updateAttachmentParent, // Export the new function
 };
 
+async function updateAttachmentParent(attachmentId, parentEntityId, parentEntityType, requestingUserId) {
+  const db = getDb();
+
+  if (!attachmentId || !parentEntityId || !parentEntityType || !requestingUserId) {
+    return { success: false, error: "Attachment ID, parent entity ID, parent entity type, and requesting user ID are required." };
+  }
+
+  const attachment = getAttachmentByIdInternal(attachmentId, db);
+  if (!attachment) {
+    return { success: false, error: "Attachment not found." };
+  }
+
+  // Authorization: Only the user who created the attachment can change its parentage.
+  if (attachment.user_id !== requestingUserId) {
+    return { success: false, error: "Authorization failed: You do not own this attachment." };
+  }
+
+  let noteIdToSet = null;
+  let blockIdToSet = null;
+
+  if (parentEntityType === 'note') {
+    noteIdToSet = parentEntityId;
+  } else if (parentEntityType === 'block') {
+    blockIdToSet = parentEntityId;
+  } else {
+    return { success: false, error: "Invalid parentEntityType. Must be 'note' or 'block'." };
+  }
+
+  try {
+    // The `attachments` table does not have an `updated_at` column as per schema check.
+    const stmt = db.prepare(
+      "UPDATE attachments SET note_id = ?, block_id = ? WHERE id = ?"
+    );
+    const info = stmt.run(noteIdToSet, blockIdToSet, attachmentId);
+
+    if (info.changes > 0) {
+      return { success: true };
+    } else {
+      // This could happen if the attachmentId was valid but somehow the update affected no rows
+      // (e.g., already set to these values, or a race condition if it was deleted).
+      // For now, consider it a non-error if no changes, but could be an error.
+      return { success: true, message: "No changes made to attachment parentage (values might be the same)." };
+    }
+  } catch (error) {
+    console.error(`Error updating attachment parent for attachment ${attachmentId}:`, error);
+    return { success: false, error: error.message || "Failed to update attachment parent." };
+  }
+}
