@@ -353,4 +353,54 @@ module.exports = {
   updateTimeLog,
   deleteTimeLog,
   getLogsForTask,
+  getTimeLogsForUser, // Export the new function
 };
+
+async function getTimeLogsForUser(targetUserId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
+  if (targetUserId === null || targetUserId === undefined) {
+    return { success: false, error: "targetUserId is required." };
+  }
+  if (requestingUserId === null || requestingUserId === undefined) {
+    // This case should ideally be caught by middleware or an earlier auth check in a real app.
+    return { success: false, error: "requestingUserId is required for authorization." };
+  }
+
+  // Authorization: Users can only fetch their own time logs.
+  if (targetUserId !== requestingUserId) {
+    // Consider logging this attempt for security auditing if needed.
+    console.warn(`User ${requestingUserId} attempted to fetch time logs for user ${targetUserId}. Denied.`);
+    return { success: false, error: "Authorization denied: Users can only fetch their own time logs." };
+  }
+
+  const db = getDb();
+  try {
+    let sql = "SELECT * FROM time_logs WHERE user_id = ?";
+    const params = [targetUserId];
+
+    if (dateRangeStartStr) {
+      // Validate date string format if necessary, or let SQLite handle it (it's quite flexible with ISO8601)
+      // For stricter validation, _parseDate could be used here, but it throws on error.
+      // Assuming dateRangeStartStr and dateRangeEndStr are valid ISO 8601 strings.
+      sql += " AND start_time >= ?";
+      params.push(dateRangeStartStr);
+    }
+    if (dateRangeEndStr) {
+      sql += " AND start_time <= ?"; // Using start_time to check if it falls within the end of the range
+      params.push(dateRangeEndStr);
+    }
+
+    sql += " ORDER BY start_time DESC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+
+    const rows = db.prepare(sql).all(...params);
+    // Return rows directly as the function is expected to return an array of time log objects,
+    // not a { success: true, data: rows } wrapper, unless specified.
+    // The prompt asks for "Return an array of time log objects."
+    return rows;
+
+  } catch (err) {
+    console.error(`Error getting time logs for user ${targetUserId} (requested by ${requestingUserId}):`, err.message, err.stack);
+    // Instead of returning an array on error, match the error object structure for consistency.
+    return { success: false, error: "Failed to retrieve time logs due to a server error." };
+  }
+}
