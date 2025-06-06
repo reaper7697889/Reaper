@@ -1,5 +1,7 @@
 // src/backend/services/exportService.js
-const { getDb } = require("../db"); // May not be needed if all data comes from other services
+const fs = require('fs');
+const path = require('path');
+const { getDb } = require("../db"); // Used for db.backup() and db.name
 
 // Import services - adjust paths as necessary based on actual file structure
 const noteService = require('./noteService');
@@ -211,7 +213,8 @@ module.exports = {
   getNoteExportData,
   getNotesCollectionExportData,
   getTableCsvData,
-  getTableJsonData, // Export the new function
+  getTableJsonData,
+  createDatabaseSnapshot, // Export the new function
 };
 
 async function getTableJsonData(databaseId, requestingUserId = null) {
@@ -257,5 +260,61 @@ async function getTableJsonData(databaseId, requestingUserId = null) {
   } catch (error) {
     console.error(`Error getting table JSON data for databaseId ${databaseId} (user ${requestingUserId}):`, error);
     return { success: false, error: error.message || "Failed to export table to JSON." };
+  }
+}
+
+/**
+ * Creates a snapshot (backup) of the main application database.
+ * @param {number} requestingUserId - The ID of the user making the request (for authorization).
+ * @returns {Promise<object>} - { success: boolean, filename?: string, path?: string, size?: number, message?: string, error?: string }
+ */
+async function createDatabaseSnapshot(requestingUserId) {
+  // Authorization (Placeholder - replace with actual role/permission check)
+  if (requestingUserId !== 1) { // Assuming user ID 1 is an admin for now
+    return { success: false, error: "Unauthorized. Only admin users can create database snapshots." };
+  }
+
+  try {
+    const mainDbInstance = getDb();
+    const mainDbPath = mainDbInstance.name; // better-sqlite3 .name property holds the file path
+
+    // Determine backup directory: ../backups relative to the DB file's directory
+    // If db is /app/database.sqlite, backupDir will be /app/backups
+    // If db is /app/data/database.sqlite, backupDir will be /app/data/backups
+    const dbDir = path.dirname(mainDbPath);
+    const backupDir = path.join(dbDir, 'backups_project_root'); // To place it in project root's backups
+    // Correcting the path to ensure 'backups' is at project root, assuming db.js is in project root
+    // and mainDbPath is like '/app/database.sqlite'
+    // So, path.dirname(mainDbPath) is '/app'. We want '/app/backups'.
+    const projectRoot = path.dirname(mainDbPath); // if mainDbPath = /app/database.sqlite, projectRoot = /app
+    const actualBackupDir = path.join(projectRoot, 'backups');
+
+
+    if (!fs.existsSync(actualBackupDir)) {
+      fs.mkdirSync(actualBackupDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[.:T]/g, '-').slice(0, -5); // YYYY-MM-DD-HH-MM-SS
+    const backupFilename = `database_snapshot_${timestamp}.sqlite`;
+    const backupFilePath = path.join(actualBackupDir, backupFilename);
+
+    // better-sqlite3's backup method is synchronous.
+    // Wrapping in Promise.resolve() to keep async function signature if preferred, though not strictly necessary here.
+    await Promise.resolve().then(() => mainDbInstance.backup(backupFilePath));
+
+    const stats = fs.statSync(backupFilePath);
+    const fileSizeInBytes = stats.size;
+
+    return {
+      success: true,
+      filename: backupFilename,
+      path: backupFilePath, // This is the server-side path
+      size: fileSizeInBytes,
+      message: "Database snapshot created successfully."
+    };
+
+  } catch (err) {
+    console.error("Error creating database snapshot:", err);
+    return { success: false, error: err.message || "Failed to create database snapshot." };
   }
 }
