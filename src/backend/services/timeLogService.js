@@ -1,6 +1,8 @@
 // src/backend/services/timeLogService.js
 const { getDb } = require("../db");
 const taskService = require('./taskService'); // To validate taskId
+const noteService = require('./noteService'); // Added
+const databaseRowService = require('./databaseRowService'); // Added
 
 // --- Helper Functions ---
 function _parseDate(dateStr, fieldName) {
@@ -17,60 +19,83 @@ function _toISOString(dateObj) {
     return dateObj.toISOString();
 }
 
+async function _validateTarget(targetType, targetId, requestingUserId, operationName = "operation") {
+    if (!['task', 'note', 'database_row'].includes(targetType)) {
+        throw new Error(`Invalid targetType: ${targetType} for ${operationName}.`);
+    }
+    if (targetId === null || targetId === undefined) {
+        throw new Error(`targetId is required for ${operationName}.`);
+    }
+
+    let targetEntity;
+    switch (targetType) {
+        case 'task':
+            targetEntity = await taskService.getTaskById(targetId, requestingUserId);
+            if (!targetEntity) throw new Error(`Authorization failed: Task ID ${targetId} not found or not accessible by user for ${operationName}.`);
+            break;
+        case 'note':
+            targetEntity = await noteService.getNoteById(targetId, requestingUserId);
+            if (!targetEntity) throw new Error(`Authorization failed: Note ID ${targetId} not found or not accessible by user for ${operationName}.`);
+            break;
+        case 'database_row':
+            targetEntity = await databaseRowService.getRow(targetId, requestingUserId);
+            if (!targetEntity) throw new Error(`Authorization failed: Database Row ID ${targetId} not found or not accessible by user for ${operationName}.`);
+            break;
+        default: // Should be caught by the initial check, but as a safeguard
+            throw new Error(`Unhandled targetType: ${targetType} for ${operationName}.`);
+    }
+    return targetEntity; // Return entity if needed, or just let it pass if no error
+}
+
+
 // --- Public Service Functions ---
 
 /**
- * Gets the currently active timer for a given task.
- * @param {number} taskId - The ID of the task.
+ * Gets the currently active timer for a given target.
+ * @param {string} targetType - Type of the target ('task', 'note', 'database_row').
+ * @param {number} targetId - The ID of the target entity.
  * @param {number | null} requestingUserId - ID of the user making the request.
  * @param {object} [db=getDb()] - Optional database instance for transactions.
  * @returns {Promise<object|null>} - The active time log object or null if none/not accessible.
  */
-async function getActiveTimerForTask(taskId, requestingUserId, db = getDb()) {
+async function getActiveTimerForTarget(targetType, targetId, requestingUserId, db = getDb()) {
     try {
-        // Ownership check on the task itself
-        const task = await taskService.getTaskById(taskId, requestingUserId);
-        if (!task) {
-            // Task not found or user does not have access
-            console.warn(`getActiveTimerForTask: Task ${taskId} not found or not accessible by user ${requestingUserId}.`);
-            return null;
-        }
-        const stmt = db.prepare("SELECT * FROM time_logs WHERE task_id = ? AND end_time IS NULL ORDER BY start_time DESC LIMIT 1");
-        return stmt.get(taskId) || null;
+        await _validateTarget(targetType, targetId, requestingUserId, "getActiveTimerForTarget");
+        const stmt = db.prepare("SELECT * FROM time_logs WHERE log_target_type = ? AND log_target_id = ? AND end_time IS NULL ORDER BY start_time DESC LIMIT 1");
+        return stmt.get(targetType, targetId) || null;
     } catch (err) {
-        console.error(`Error getting active timer for task ${taskId} (user ${requestingUserId}):`, err.message);
-        // Throwing here might be too much if the outer function expects null for "no active timer" vs "error".
-        // For now, let's return null on error too, to signify "no accessible active timer".
-        return null;
+        console.error(`Error getting active timer for ${targetType} ${targetId} (user ${requestingUserId}):`, err.message);
+        return null; // Return null on validation error or DB error
     }
 }
 
 /**
- * Starts a new timer for a task.
- * @param {number} taskId
- * @param {object} [options={}] - { description = null } (userId from options is removed)
+ * Starts a new timer for a target.
+ * @param {string} targetType
+ * @param {number} targetId
+ * @param {object} [options={}] - { description = null }
  * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, newLog?: object, error?: string, activeTimer?: object }
  */
-async function startTimerForTask(taskId, { description = null } = {}, requestingUserId) {
+async function startTimerForTarget(targetType, targetId, { description = null } = {}, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
-        const task = await taskService.getTaskById(taskId, requestingUserId);
-        if (!task) {
-            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
-        }
+        await _validateTarget(targetType, targetId, requestingUserId, "startTimerForTarget");
 
-        const existingTimer = await getActiveTimerForTask(taskId, requestingUserId, db);
+        const existingTimer = await getActiveTimerForTarget(targetType, targetId, requestingUserId, db);
         if (existingTimer) {
-            return { success: false, error: "An active timer already exists for this task.", activeTimer: existingTimer, isExistingTimerError: true };
+            // Use a specific error structure or property to indicate this specific case
+            const error = new Error("An active timer already exists for this target.");
+            error.isExistingTimerError = true;
+            error.activeTimer = existingTimer;
+            throw error;
         }
 
         const startTime = _toISOString(new Date());
-        // user_id for the log is the requestingUserId
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, description, user_id) VALUES (?, ?, ?, ?)"
+            "INSERT INTO time_logs (log_target_type, log_target_id, start_time, description, user_id) VALUES (?, ?, ?, ?, ?)"
         );
-        const info = stmt.run(taskId, startTime, description, requestingUserId);
+        const info = stmt.run(targetType, targetId, startTime, description, requestingUserId);
         const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
         return { success: true, newLog };
     });
@@ -78,31 +103,28 @@ async function startTimerForTask(taskId, { description = null } = {}, requesting
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error starting timer for task ${taskId} (user ${requestingUserId}):`, err.message);
-        if (err.isExistingTimerError) return { success: false, error: err.error, activeTimer: err.activeTimer }; // Keep this specific error for client UI
+        console.error(`Error starting timer for ${targetType} ${targetId} (user ${requestingUserId}):`, err.message);
+        if (err.isExistingTimerError) return { success: false, error: err.message, activeTimer: err.activeTimer };
         return { success: false, error: err.message || "Failed to start timer." };
     }
 }
 
 /**
- * Stops the currently active timer for a task.
- * @param {number} taskId
+ * Stops the currently active timer for a target.
+ * @param {string} targetType
+ * @param {number} targetId
  * @param {object} [options={}] - { endTimeStr = null, description = null }
  * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, updatedLog?: object, error?: string }
  */
-async function stopTimerForTask(taskId, { endTimeStr = null, description = null } = {}, requestingUserId) {
+async function stopTimerForTarget(targetType, targetId, { endTimeStr = null, description = null } = {}, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
-        const task = await taskService.getTaskById(taskId, requestingUserId);
-        if (!task) {
-            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
-        }
+        await _validateTarget(targetType, targetId, requestingUserId, "stopTimerForTarget");
 
-        const activeTimer = await getActiveTimerForTask(taskId, requestingUserId, db); // Pass requestingUserId
+        const activeTimer = await getActiveTimerForTarget(targetType, targetId, requestingUserId, db);
         if (!activeTimer) {
-            // This implies no active timer for this (accessible) task. This is not an auth error.
-            throw new Error("No active timer found for this task.");
+            throw new Error("No active timer found for this target.");
         }
 
         const parsedEndTime = endTimeStr ? _parseDate(endTimeStr, "endTimeStr") : new Date();
@@ -142,19 +164,17 @@ async function stopTimerForTask(taskId, { endTimeStr = null, description = null 
 }
 
 /**
- * Adds a manual time log entry for a task.
- * @param {number} taskId
- * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description? } (userId from logData removed)
+ * Adds a manual time log entry for a target.
+ * @param {string} targetType
+ * @param {number} targetId
+ * @param {object} logData - { startTimeStr, endTimeStr?, durationSeconds?, description? }
  * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<object>} - { success, newLog?: object, error?: string }
  */
-async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationSeconds, description = null }, requestingUserId) {
+async function addManualLogForTarget(targetType, targetId, { startTimeStr, endTimeStr, durationSeconds, description = null }, requestingUserId) {
     const db = getDb();
     const transaction = db.transaction(async () => {
-        const task = await taskService.getTaskById(taskId, requestingUserId);
-        if (!task) {
-            throw new Error(`Authorization failed: Task ID ${taskId} not found or not accessible by user.`);
-        }
+        await _validateTarget(targetType, targetId, requestingUserId, "addManualLogForTarget");
 
         let finalStartTime, finalEndTime, finalDurationSeconds;
 
@@ -179,11 +199,10 @@ async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationS
 
         if (finalDurationSeconds < 0) throw new Error("Calculated duration is negative. End time must be after start time.");
 
-        // user_id for the log is the requestingUserId
         const stmt = db.prepare(
-            "INSERT INTO time_logs (task_id, start_time, end_time, duration_seconds, description, user_id) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO time_logs (log_target_type, log_target_id, start_time, end_time, duration_seconds, description, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
         );
-        const info = stmt.run(taskId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description, requestingUserId);
+        const info = stmt.run(targetType, targetId, _toISOString(finalStartTime), _toISOString(finalEndTime), finalDurationSeconds, description, requestingUserId);
         const newLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(info.lastInsertRowid);
         return { success: true, newLog };
     });
@@ -191,7 +210,7 @@ async function addManualLogForTask(taskId, { startTimeStr, endTimeStr, durationS
     try {
         return await transaction();
     } catch (err) {
-        console.error(`Error adding manual log for task ${taskId} (user ${requestingUserId}):`, err.message);
+        console.error(`Error adding manual log for ${targetType} ${targetId} (user ${requestingUserId}):`, err.message);
         return { success: false, error: err.message || "Failed to add manual log." };
     }
 }
@@ -211,11 +230,8 @@ async function updateTimeLog(logId, updates, requestingUserId) {
             throw new Error("Time log not found.");
         }
 
-        // Ownership check on parent task
-        const task = await taskService.getTaskById(currentLog.task_id, requestingUserId);
-        if (!task) {
-            throw new Error(`Authorization failed: Task ID ${currentLog.task_id} for this log is not found or not accessible by user.`);
-        }
+        // Validate access to the target entity of the log
+        await _validateTarget(currentLog.log_target_type, currentLog.log_target_id, requestingUserId, "updateTimeLog (target check)");
 
         // If timer is active, only description can be updated, or it must be stopped first.
         if (currentLog.end_time === null && (updates.startTimeStr || updates.endTimeStr || updates.durationSeconds !== undefined)) {
@@ -287,75 +303,77 @@ async function updateTimeLog(logId, updates, requestingUserId) {
  */
 async function deleteTimeLog(logId, requestingUserId) {
   const db = getDb();
-  try {
-    const currentLog = db.prepare("SELECT task_id FROM time_logs WHERE id = ?").get(logId);
-    if (!currentLog) {
-      return { success: false, error: "Time log not found." };
-    }
+    const transaction = db.transaction(async () => { // Wrap in transaction for consistency if future pre-delete checks are added
+        const currentLog = db.prepare("SELECT * FROM time_logs WHERE id = ?").get(logId);
+        if (!currentLog) {
+            throw new Error("Time log not found.");
+        }
 
-    const task = await taskService.getTaskById(currentLog.task_id, requestingUserId);
-    if (!task) {
-      throw new Error(`Authorization failed: Task ID ${currentLog.task_id} for this log is not found or not accessible by user.`);
-    }
+        await _validateTarget(currentLog.log_target_type, currentLog.log_target_id, requestingUserId, "deleteTimeLog (target check)");
 
-    const stmt = db.prepare("DELETE FROM time_logs WHERE id = ?");
-    const info = stmt.run(logId);
-    return { success: info.changes > 0 };
-  } catch (err) {
-    console.error(`Error deleting time log ${logId} (user ${requestingUserId}):`, err.message);
-    return { success: false, error: err.message || "Failed to delete time log." };
-  }
+        const stmt = db.prepare("DELETE FROM time_logs WHERE id = ?");
+        const info = stmt.run(logId);
+        if (info.changes === 0) {
+            // This might happen if the log was deleted between the check and the delete command, though unlikely with a transaction.
+            throw new Error("Time log found but delete operation affected no rows.");
+        }
+        return { success: true };
+    });
+    try {
+        return await transaction();
+    } catch (err) {
+        console.error(`Error deleting time log ${logId} (user ${requestingUserId}):`, err.message);
+        return { success: false, error: err.message || "Failed to delete time log." };
+    }
 }
 
 /**
- * Retrieves time logs for a specific task, optionally filtered by date range.
- * @param {number} taskId
+ * Retrieves time logs for a specific target, optionally filtered by date range.
+ * @param {string} targetType
+ * @param {number} targetId
  * @param {object} [options={}] - { dateRangeStartStr?, dateRangeEndStr?, limit=50, offset=0 }
  * @param {number | null} requestingUserId - ID of the user making the request.
  * @returns {Promise<Array<object>>} - Array of time log objects.
  */
-async function getLogsForTask(taskId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
+async function getLogsForTarget(targetType, targetId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
   const db = getDb();
   try {
-    const task = await taskService.getTaskById(taskId, requestingUserId);
-    if (!task) {
-        console.warn(`getLogsForTask: Task ${taskId} not found or not accessible by user ${requestingUserId}.`);
-        return [];
-    }
+    await _validateTarget(targetType, targetId, requestingUserId, "getLogsForTarget");
 
-    let sql = "SELECT * FROM time_logs WHERE task_id = ?";
-    const params = [taskId];
+    let sql = "SELECT * FROM time_logs WHERE log_target_type = ? AND log_target_id = ?";
+    const params = [targetType, targetId];
 
     if (dateRangeStartStr) {
-      sql += " AND start_time >= ?"; // Assumes start_time is what should be in range
-    params.push(dateRangeStartStr);
-  }
-  if (dateRangeEndStr) {
-    sql += " AND start_time <= ?"; // Inclusive end for start_time based range queries
-    params.push(dateRangeEndStr);
-  }
-  sql += " ORDER BY start_time DESC LIMIT ? OFFSET ?";
-  params.push(limit, offset);
+      sql += " AND start_time >= ?";
+      params.push(dateRangeStartStr);
+    }
+    if (dateRangeEndStr) {
+      sql += " AND start_time <= ?";
+      params.push(dateRangeEndStr);
+    }
+    sql += " ORDER BY start_time DESC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
 
-  try {
     return db.prepare(sql).all(...params);
   } catch (err) {
-    console.error(`Error getting logs for task ${taskId}:`, err.message);
+    console.error(`Error getting logs for ${targetType} ${targetId} (user ${requestingUserId}):`, err.message);
     return [];
   }
 }
 
 module.exports = {
-  getActiveTimerForTask,
-  startTimerForTask,
-  stopTimerForTask,
-  addManualLogForTask,
+  getActiveTimerForTarget,
+  startTimerForTarget,
+  stopTimerForTarget,
+  addManualLogForTarget,
   updateTimeLog,
   deleteTimeLog,
-  getLogsForTask,
-  getTimeLogsForUser, // Export the new function
+  getLogsForTarget,
+  getTimeLogsForUser,
 };
 
+// getTimeLogsForUser remains largely the same as it filters by user_id on time_logs table.
+// The schema change from task_id to generic target fields doesn't affect its core query logic.
 async function getTimeLogsForUser(targetUserId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
   if (targetUserId === null || targetUserId === undefined) {
     return { success: false, error: "targetUserId is required." };

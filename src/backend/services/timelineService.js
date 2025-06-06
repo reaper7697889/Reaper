@@ -150,6 +150,215 @@ async function getTimelineDataForDatabase(config) {
   }
 }
 
+const { getRecurrenceInstances } = require('../utils/recurrenceUtils'); // Added
+// databaseDefService is already imported
+// const databaseDefService = require('./databaseDefService');
+
+/**
+ * @typedef {Object} TimelineEvent
+ * @property {string} id - Unique ID for the event instance (e.g., row.id or row.id_instanceTimestamp for recurring)
+ * @property {number} originalRowId - The ID of the source row.
+ * @property {number} sourceDatabaseId - The ID of the database this event came from.
+ * @property {string} title - The event title or label.
+ * @property {string} start - ISO 8601 string for the event start.
+ * @property {string} end - ISO 8601 string for the event end.
+ * @property {string} type - Type hint (e.g., 'event', 'task', 'generic').
+ */
+
+/**
+ * @typedef {Object} DatabaseSourceConfig
+ * @property {number} databaseId - ID of the database to source events from.
+ * @property {'calendar' | 'generic'} typeHint - Hint for how to treat this source.
+ * @property {string} [titleColumnNameHint] - Name of the column for event titles (used if not calendar or if calendar label needs override).
+ * @property {string} [startDateColumnNameHint] - Name of the start date column (used for 'generic' typeHint).
+ * @property {string} [endDateColumnNameHint] - Name of the end date column (used for 'generic' typeHint).
+ */
+
+/**
+ * Fetches and aggregates timeline data from multiple database sources, including handling recurring events.
+ *
+ * @param {object} params - Parameters object.
+ * @param {DatabaseSourceConfig[]} params.databaseSources - Array of database source configurations.
+ * @param {string} params.dateRangeStart - ISO 8601 string for the start of the overall timeline view.
+ * @param {string} params.dateRangeEnd - ISO 8601 string for the end of the overall timeline view.
+ * @param {number} params.requestingUserId - ID of the user making the request.
+ * @returns {Promise<{ success: boolean, events?: TimelineEvent[], error?: string }>}
+ */
+async function getAggregatedTimelineEvents({ databaseSources, dateRangeStart, dateRangeEnd, requestingUserId }) {
+  const allEvents = [];
+  let dateRangeStartObj, dateRangeEndObj;
+
+  try {
+    dateRangeStartObj = new Date(dateRangeStart);
+    dateRangeEndObj = new Date(dateRangeEnd);
+    if (isNaN(dateRangeStartObj.getTime()) || isNaN(dateRangeEndObj.getTime())) {
+      return { success: false, error: "Invalid dateRangeStart or dateRangeEnd." };
+    }
+  } catch (e) {
+    return { success: false, error: "Failed to parse dateRangeStart or dateRangeEnd." };
+  }
+
+  if (!Array.isArray(databaseSources) || databaseSources.length === 0) {
+    return { success: true, events: [] }; // No sources, return empty successfully.
+  }
+
+  for (const source of databaseSources) {
+    try {
+      const dbDef = await databaseDefService.getDatabaseById(source.databaseId, requestingUserId);
+      if (!dbDef) {
+        console.warn(`Timeline: Database ID ${source.databaseId} not found or not accessible by user ${requestingUserId}. Skipping.`);
+        continue;
+      }
+
+      const allColumnsForDb = await databaseDefService.getColumnsForDatabase(source.databaseId, requestingUserId);
+      if (!allColumnsForDb || allColumnsForDb.length === 0) {
+        console.warn(`Timeline: No columns found for database ID ${source.databaseId}. Skipping.`);
+        continue;
+      }
+
+      let actualStartDateColumn;
+      let actualEndDateColumn;
+      let actualLabelColumn;
+
+      if (dbDef.is_calendar && source.typeHint === 'calendar') {
+        if (!dbDef.event_start_column_id) {
+            console.warn(`Timeline: Calendar database ${dbDef.name} (ID ${source.databaseId}) is missing event_start_column_id. Skipping.`);
+            continue;
+        }
+        actualStartDateColumn = allColumnsForDb.find(c => c.id === dbDef.event_start_column_id);
+        actualEndDateColumn = dbDef.event_end_column_id ? allColumnsForDb.find(c => c.id === dbDef.event_end_column_id) : actualStartDateColumn; // Default end to start if not specified
+
+        if (source.titleColumnNameHint) {
+            actualLabelColumn = allColumnsForDb.find(c => c.name.toLowerCase() === source.titleColumnNameHint.toLowerCase());
+        }
+        if (!actualLabelColumn) { // Default label for calendars
+            actualLabelColumn = allColumnsForDb.find(c => c.name.toLowerCase() === "name" || c.name.toLowerCase() === "title");
+        }
+         if (!actualLabelColumn && allColumnsForDb.length > 0) { // Fallback to first text-like column if no specific label
+            actualLabelColumn = allColumnsForDb.find(c => ['TEXT', 'SELECT'].includes(c.type) || (c.type === 'FORMULA' && c.formula_result_type === 'TEXT'));
+         }
+
+
+      } else { // Generic source or calendar with overrides
+        if (!source.startDateColumnNameHint || !source.titleColumnNameHint) {
+          console.warn(`Timeline: Generic source (DB ID ${source.databaseId}) requires startDateColumnNameHint and titleColumnNameHint. Skipping.`);
+          continue;
+        }
+        actualStartDateColumn = allColumnsForDb.find(c => c.name.toLowerCase() === source.startDateColumnNameHint.toLowerCase());
+        actualLabelColumn = allColumnsForDb.find(c => c.name.toLowerCase() === source.titleColumnNameHint.toLowerCase());
+        if (source.endDateColumnNameHint) {
+          actualEndDateColumn = allColumnsForDb.find(c => c.name.toLowerCase() === source.endDateColumnNameHint.toLowerCase());
+        } else { // If no end date hint, assume it's same as start (point event or task)
+          actualEndDateColumn = actualStartDateColumn;
+        }
+      }
+
+      if (!actualStartDateColumn) { console.warn(`Timeline: Start date column not resolved for DB ID ${source.databaseId}. Skipping.`); continue; }
+      if (!actualEndDateColumn) { console.warn(`Timeline: End date column not resolved for DB ID ${source.databaseId}. Skipping.`); continue; }
+      if (!actualLabelColumn) { console.warn(`Timeline: Label column not resolved for DB ID ${source.databaseId}. Skipping.`); continue; }
+
+      if (!['DATE', 'DATETIME'].includes(actualStartDateColumn.type)) { console.warn(`Timeline: Start column for DB ${source.databaseId} is not DATE/DATETIME. Skipping.`); continue; }
+      if (!['DATE', 'DATETIME'].includes(actualEndDateColumn.type)) { console.warn(`Timeline: End column for DB ${source.databaseId} is not DATE/DATETIME. Skipping.`); continue; }
+
+
+      const filters = [];
+      filters.push({ columnId: actualEndDateColumn.id, operator: 'GREATER_THAN_OR_EQUAL_TO', value: dateRangeStart });
+      filters.push({ columnId: actualStartDateColumn.id, operator: 'LESS_THAN_OR_EQUAL_TO', value: dateRangeEnd });
+
+      // Assuming getRowsForDatabase structure from previous analysis.
+      // It expects { filters, sorts }, requestingUserId, options
+      const queryResult = await databaseQueryService.getRowsForDatabase(source.databaseId, { filters }, requestingUserId);
+
+      let sourceRows = [];
+      if (Array.isArray(queryResult)) {
+          sourceRows = queryResult;
+      } else if (queryResult && queryResult.success === false) { // Handle potential error structure from service
+          console.warn(`Timeline: Failed to fetch rows for DB ID ${source.databaseId}: ${queryResult.error}. Skipping source.`);
+          continue;
+      } else if (queryResult && Array.isArray(queryResult.rows)) { // Handle potential object structure with rows array
+          sourceRows = queryResult.rows;
+      } else {
+           console.warn(`Timeline: Unexpected data structure from getRowsForDatabase for DB ID ${source.databaseId}. Skipping source.`);
+           continue;
+      }
+
+
+      for (const row of sourceRows) {
+        const eventTitle = row.values[actualLabelColumn.id] != null ? String(row.values[actualLabelColumn.id]) : "Untitled Event";
+        const eventStartStr = row.values[actualStartDateColumn.id];
+        let eventEndStr = row.values[actualEndDateColumn.id];
+
+        if (!eventStartStr) {
+          console.warn(`Timeline: Row ID ${row.id} in DB ${source.databaseId} skipped: missing start date value.`);
+          continue;
+        }
+        if (!eventEndStr) { // If end date is missing, default it to start date
+            eventEndStr = eventStartStr;
+        }
+
+        const eventStartDateTime = new Date(eventStartStr);
+        if (isNaN(eventStartDateTime.getTime())) {
+            console.warn(`Timeline: Row ID ${row.id} in DB ${source.databaseId} has invalid start date ${eventStartStr}. Skipping.`);
+            continue;
+        }
+        let eventEndDateTime = new Date(eventEndStr);
+        if (isNaN(eventEndDateTime.getTime())) {
+            console.warn(`Timeline: Row ID ${row.id} in DB ${source.databaseId} has invalid end date ${eventEndStr}. Using start date as end.`);
+            eventEndDateTime = new Date(eventStartDateTime); // Default to start if end is invalid
+        }
+         if (eventEndDateTime < eventStartDateTime) { // Ensure end is not before start
+            eventEndDateTime = new Date(eventStartDateTime);
+        }
+
+
+        const recurrenceRule = row.recurrence_rule; // Assuming recurrence_rule is a direct property on the row if it exists
+
+        if (dbDef.is_calendar && recurrenceRule && typeof recurrenceRule === 'string' && recurrenceRule.trim() !== "") {
+          const originalDuration = eventEndDateTime.getTime() - eventStartDateTime.getTime();
+          const instances = getRecurrenceInstances(recurrenceRule, eventStartDateTime, dateRangeStartObj, dateRangeEndObj);
+
+          for (const instanceDate of instances) {
+            const instanceEndDate = new Date(instanceDate.getTime() + originalDuration);
+            allEvents.push({
+              id: `${row.id}_${instanceDate.toISOString()}`, // Create unique ID for instance
+              originalRowId: row.id,
+              sourceDatabaseId: source.databaseId,
+              title: eventTitle,
+              start: instanceDate.toISOString(),
+              end: instanceEndDate.toISOString(),
+              type: source.typeHint === 'calendar' ? 'event' : (source.typeHint || 'generic'),
+            });
+          }
+        } else {
+          allEvents.push({
+            id: String(row.id),
+            originalRowId: row.id,
+            sourceDatabaseId: source.databaseId,
+            title: eventTitle,
+            start: eventStartDateTime.toISOString(),
+            end: eventEndDateTime.toISOString(),
+            type: source.typeHint || 'generic',
+          });
+        }
+      }
+    } catch (sourceError) {
+      console.error(`Timeline: Error processing source DB ID ${source.databaseId}:`, sourceError.message, sourceError.stack);
+      // Continue to next source
+    }
+  }
+
+  allEvents.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+
+  return { success: true, events: allEvents };
+
+} catch (overallError) {
+    console.error("Timeline: Overall error in getAggregatedTimelineEvents:", overallError.message, overallError.stack);
+    return { success: false, error: overallError.message || "An unexpected error occurred while aggregating timeline events." };
+}
+}
+
+
 module.exports = {
   getTimelineDataForDatabase,
+  getAggregatedTimelineEvents, // Added
 };

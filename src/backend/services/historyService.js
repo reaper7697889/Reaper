@@ -261,8 +261,55 @@ module.exports = {
   recordRowHistory,
   revertNoteToVersion,
   revertRowToVersion,
-  undoLastChangeForRow, // Export the new function
+  undoLastChangeForRow,
+  undoLastChangeForNote, // Export the new function
 };
+
+async function undoLastChangeForNote(noteId, requestingUserId) {
+  if (noteId === null || noteId === undefined) {
+    return { success: false, error: "noteId is required to undo last change for a note." };
+  }
+  if (requestingUserId === null || requestingUserId === undefined) {
+    return { success: false, error: "requestingUserId is required to undo last change for a note." };
+  }
+
+  const db = getDb();
+  try {
+    // First, check if the note exists and is accessible by the user,
+    // This is implicitly handled by revertNoteToVersion's call to noteService.getNoteById,
+    // but an early check can be clearer. However, to keep it concise and rely on
+    // revertNoteToVersion's existing checks, we can proceed.
+
+    // Fetch the last two history entries for the note.
+    // We only need version_number, but selecting * might be fine if overhead is negligible.
+    const historyEntries = db.prepare(
+      "SELECT version_number FROM notes_history WHERE note_id = ? ORDER BY version_number DESC LIMIT 2"
+    ).all(noteId);
+
+    if (!historyEntries || historyEntries.length < 2) {
+      // historyEntries.length === 0 means no history (or note doesn't exist)
+      // historyEntries.length === 1 means it's the initial version, no previous state to revert to.
+      return { success: false, message: "No previous version available to undo to for this note." };
+    }
+
+    // historyEntries[0] is the current state (latest version recorded).
+    // historyEntries[1] is the state *before* the last change was made (i.e., the state we want to revert to).
+    // So, we need to revert to version_number of historyEntries[1].
+    const versionToRevertTo = historyEntries[1].version_number;
+
+    if (versionToRevertTo === null || versionToRevertTo === undefined) {
+      console.error(`undoLastChangeForNote: Version number to revert to is undefined for note ${noteId}. History entry:`, historyEntries[1]);
+      return { success: false, error: "Could not determine the version number to revert to for the note." };
+    }
+
+    // Call revertNoteToVersion with the identified version number.
+    return await revertNoteToVersion(noteId, versionToRevertTo, requestingUserId);
+
+  } catch (err) {
+    console.error(`Error in undoLastChangeForNote for note ${noteId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to undo last change for note." };
+  }
+}
 
 async function undoLastChangeForRow(rowId, requestingUserId) {
   if (rowId === null || rowId === undefined) {
