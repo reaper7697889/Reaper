@@ -3,6 +3,7 @@
 const { getDb } = require("../db");
 const { recordNoteHistory } = require('./historyService');
 const linkService = require('./linkService');
+const permissionService = require('./permissionService'); // Added import
 
 // --- Note CRUD Operations ---
 
@@ -57,53 +58,93 @@ function createNote(noteData) {
   }
 }
 
-function getNoteById(id, requestingUserId = null) {
+// Added options parameter with bypassPermissionCheck
+async function getNoteById(id, requestingUserId = null, options = { bypassPermissionCheck: false }) {
   const db = getDb();
-  let query = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?";
-  const params = [id];
-
-  if (requestingUserId !== null) {
-    query += " AND (user_id = ? OR user_id IS NULL)";
-    params.push(requestingUserId);
-  }
+  // Base query fetches all necessary fields, including user_id for ownership/permission checks.
+  const baseQuery = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at FROM notes WHERE id = ?";
 
   try {
-    const stmt = db.prepare(query);
-    const note = stmt.get(...params);
-    // if (note) { // No specific boolean conversion needed here }
-    return note || null;
+    const note = db.prepare(baseQuery).get(id);
+    if (!note) {
+      return null; // Note not found
+    }
+
+    if (options.bypassPermissionCheck) {
+      return note; // Used by internal services like permissionService itself
+    }
+
+    if (requestingUserId !== null) {
+      // Check 1: Is the requesting user the owner?
+      if (note.user_id === requestingUserId) {
+        return note;
+      }
+      // Check 2: Is the note public (user_id is NULL)?
+      if (note.user_id === null) {
+        return note; // Public notes are accessible
+      }
+      // Check 3: Does the user have explicit 'READ' permission?
+      const permissionCheck = await permissionService.checkUserNotePermission(id, requestingUserId, 'READ');
+      if (permissionCheck && permissionCheck.V) {
+        return note;
+      }
+    } else { // No requestingUserId provided
+      // If note is public, allow access. Otherwise, deny.
+      if (note.user_id === null) {
+        return note;
+      }
+      // Non-public notes require a requestingUserId to check ownership or permissions
+      console.warn(`getNoteById: Access denied for note ${id} as no requestingUserId was provided for a non-public note.`);
+      return null;
+    }
+
+    // If none of the above conditions met, user does not have access.
+    console.warn(`getNoteById: Access denied for user ${requestingUserId} to note ${id}.`);
+    return null;
+
   } catch (err) {
-    console.error(`Error getting note ${id} for user ${requestingUserId}:`, err.message);
+    console.error(`Error getting note ${id} for user ${requestingUserId}:`, err.message, err.stack);
     return null;
   }
 }
 
-async function updateNote(noteId, updateData, requestingUserId) { // Added requestingUserId (required)
+async function updateNote(noteId, updateData, requestingUserId) {
   const db = getDb();
 
-  // Perform ownership check first using an unfiltered get
-  const noteForOwnershipCheck = db.prepare("SELECT user_id FROM notes WHERE id = ?").get(noteId);
+  // Fetch the note with bypass to get current owner, regardless of requesting user's direct permissions yet.
+  const noteToUpdate = await getNoteById(noteId, null, { bypassPermissionCheck: true });
 
-  if (!noteForOwnershipCheck) {
+  if (!noteToUpdate) {
     console.error(`Error updating note ${noteId}: Note not found.`);
     return { success: false, error: "Note not found." };
   }
 
-  if (noteForOwnershipCheck.user_id !== null && noteForOwnershipCheck.user_id !== requestingUserId) {
-    console.error(`Authorization failed: User ${requestingUserId} does not own note ${noteId} (owned by ${noteForOwnershipCheck.user_id}).`);
-    return { success: false, error: "Authorization failed: You do not own this note." };
+  let hasPermission = false;
+  if (noteToUpdate.user_id === null) { // Publicly editable note (if such a concept is allowed by app rules)
+    // For now, let's assume public notes are not editable by just anyone unless specific rules are added.
+    // This example will require ownership or explicit WRITE permission even for public notes.
+    // If public notes were world-writable, this logic would change:
+    // hasPermission = true; // Or check a specific "public_writable" flag.
+    // For now, fall through to ownership/permission check.
   }
 
-  // Proceed with existing getNoteById logic, now potentially filtered if we passed requestingUserId,
-  // but for oldValues, we need the actual current values, so unfiltered is better here.
-  // However, the initial ownership check is the primary gate.
-  const oldNote = getNoteById(noteId, null); // Get current state, unfiltered by user for history
-  if (!oldNote) { // Should not happen if ownership check passed, but as a safeguard
-    console.error(`Error updating note ${noteId}: Note disappeared after ownership check.`);
-    return { success: false, error: "Note not found after ownership check." };
-    console.error(`Error updating note ${noteId}: Note disappeared after ownership check.`);
-    return { success: false, error: "Note not found after ownership check." };
+  if (noteToUpdate.user_id === requestingUserId) {
+    hasPermission = true; // Owner has permission
+  } else {
+    // Not the owner, check for 'WRITE' permission
+    const permissionCheck = await permissionService.checkUserNotePermission(noteId, requestingUserId, 'WRITE');
+    if (permissionCheck && permissionCheck.V) {
+      hasPermission = true;
+    }
   }
+
+  if (!hasPermission) {
+    console.error(`Authorization failed: User ${requestingUserId} cannot update note ${noteId}.`);
+    return { success: false, error: "Authorization failed: Insufficient permissions to update this note." };
+  }
+
+  // Use the already fetched noteToUpdate as oldNote to avoid second getNoteById call.
+  const oldNote = noteToUpdate;
 
   // user_id is set at creation and checked for ownership. Not typically part of updatableNoteFields by user.
   const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type };

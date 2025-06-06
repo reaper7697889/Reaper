@@ -17,7 +17,6 @@ function initializeDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
-        user_id INTEGER DEFAULT NULL, -- This line seems incorrect for the users table itself. user_id is typically for other tables to reference this one.
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );

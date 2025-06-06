@@ -130,4 +130,27 @@ module.exports = {
   registerUser,
   loginUser,
   getUserById,
+  getUserByUsername, // Export the new function
 };
+
+/**
+ * Retrieves a user by username (excluding password hash).
+ * Case-insensitive username search.
+ * @param {string} username
+ * @returns {Promise<object | null>} User object { id, username, created_at, updated_at } or null if not found/error.
+ */
+async function getUserByUsername(username) {
+  const db = getDb();
+  if (username === null || username === undefined || String(username).trim() === "") {
+      console.warn("getUserByUsername called with empty or invalid username");
+      return null;
+  }
+  try {
+    const sql = "SELECT id, username, created_at, updated_at FROM users WHERE username = ? COLLATE NOCASE";
+    const user = db.prepare(sql).get(String(username).trim());
+    return user || null;
+  } catch (error) {
+    console.error(`Error fetching user by username "${username}":`, error);
+    return null;
+  }
+}
