@@ -101,6 +101,31 @@ function initializeDatabase() {
     END;
   `);
 
+  // Database Permissions Table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_permissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        database_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL, -- User being granted permission
+        permission_level TEXT NOT NULL CHECK(permission_level IN ('READ', 'WRITE', 'ADMIN')),
+        granted_by_user_id INTEGER NOT NULL, -- User who granted the permission
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (granted_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+        UNIQUE (database_id, user_id)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_permissions_updated_at
+    AFTER UPDATE ON database_permissions
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_permissions SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
   db.exec(`CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE COLLATE NOCASE NOT NULL);`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_tags (note_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY (note_id, tag_id), FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE, FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_note_id INTEGER NOT NULL, target_note_id INTEGER NOT NULL, link_text TEXT, target_header TEXT, target_block_id TEXT, is_embed BOOLEAN DEFAULT 0 NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE (source_note_id, target_note_id, link_text, target_header, target_block_id, is_embed), FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE);`);

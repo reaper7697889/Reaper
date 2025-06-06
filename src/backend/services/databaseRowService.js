@@ -7,6 +7,7 @@ const smartRuleService = require('./smartRuleService');
 const { recordRowHistory } = require('./historyService');
 const noteService = require('./noteService');
 const { validateFieldValue } = require('../utils/validationUtils'); // Added import
+const permissionService = require('./permissionService'); // Added for RBAC
 
 const MAX_TRIGGER_DEPTH = 5;
 
@@ -94,7 +95,14 @@ async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInst
 
 async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, requestingUserId = null }) {
   const db = getDb();
-  await _getAccessibleDatabaseOrFail(databaseId, requestingUserId, db, "addRow");
+
+  if (!requestingUserId) {
+    return { success: false, error: "User ID is required to add rows." };
+  }
+  const permCheck = await permissionService.checkUserDatabasePermission(databaseId, requestingUserId, 'WRITE');
+  if (!permCheck.V) {
+      return { success: false, error: "Authorization failed: Insufficient permissions to add rows to this database." };
+  }
 
   // Fetch column definitions using the potentially user-filtered getColumnsForDatabase
   // However, for internal consistency of adding a row, we might need all columns.
@@ -357,22 +365,35 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
   }
 
   const transaction = db.transaction(async () => {
-    const currentRowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
-    if (!currentRowMeta) throw new Error("Row not found.");
-
-    await _getAccessibleDatabaseOrFail(currentRowMeta.database_id, requestingUserId, db, "updateRow");
-
-    // Pass includeDeleted option to _getStoredRowData if current row is soft-deleted but we are fetching it (e.g. for history)
-    const oldStoredValues = await _getStoredRowData(rowId, db, { includeDeleted: true }); // History needs full "before" state
-    if (oldStoredValues === null && !currentRowMeta.deleted_at) {
-      // If not soft-deleted, old values should exist. If it IS soft-deleted, oldStoredValues might be null if it was deleted before any values.
-      // This condition might need refinement based on how history for "creation of a now-deleted row" is handled.
-      // For now, if it's not a soft-deleted row we are processing, then not finding old values is an issue.
-      throw new Error("Could not retrieve current stored values for history for an existing row.");
+    // Fetch essential row metadata, including deleted_at status
+    const currentRowMeta = db.prepare("SELECT database_id, deleted_at FROM database_rows WHERE id = ?").get(rowId);
+    if (!currentRowMeta) {
+        throw new Error("Row not found.");
     }
 
+    // If the row is already soft-deleted, it cannot be updated unless this is an 'undelete' operation
+    const isUndeleteOperation = values && values.hasOwnProperty('deleted_at') && values.deleted_at === null;
+    if (currentRowMeta.deleted_at !== null && !isUndeleteOperation) {
+        throw new Error("Cannot update a deleted row. Please restore it first.");
+    }
 
-    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null)) // Use null to get all columns for processing
+    // Authorization check for WRITE permission on the database
+    if (!requestingUserId) { // Should ideally be caught by API layer/auth middleware
+        throw new Error("User ID is required to update rows.");
+    }
+    const permCheckWrite = await permissionService.checkUserDatabasePermission(currentRowMeta.database_id, requestingUserId, 'WRITE');
+    if (!permCheckWrite.V) {
+        throw new Error("Authorization failed: Insufficient permissions to update rows in this database.");
+    }
+
+    // For history, get current state. If it's an undelete op, we need the soft-deleted state.
+    const oldStoredValues = await _getStoredRowData(rowId, db, { includeDeleted: isUndeleteOperation });
+    if (oldStoredValues === null && currentRowMeta.deleted_at === null) {
+      // If it's not soft-deleted and we can't get its values, that's an issue.
+      throw new Error("Could not retrieve current stored values for history for an existing, non-deleted row.");
+    }
+
+    const columnDefsMap = (await databaseDefService.getColumnsForDatabase(currentRowMeta.database_id, null))
         .reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
     // Perform validation on incoming values before applying changes
@@ -409,7 +430,7 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
       if (colDef.type === 'RELATION') {
         linkDeleteStmt.run(rowId, columnId);
         if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {
-            const oldLinkedTargetIds = oldStoredValues[columnId] || [];
+            const oldLinkedTargetIds = (oldStoredValues && oldStoredValues[columnId]) ? oldStoredValues[columnId] : [];
             for(const oldTargetId of oldLinkedTargetIds){
                 db.prepare("DELETE FROM database_row_links WHERE source_row_id = ? AND source_column_id = ? AND target_row_id = ?")
                   .run(oldTargetId, colDef.inverse_column_id, rowId);
@@ -488,13 +509,26 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
 
 async function deleteRow(rowId, requestingUserId = null) {
   const db = getDb();
-  const transaction = db.transaction(async () => { // Changed to async to allow await inside
+  const transaction = db.transaction(async () => {
     const rowMeta = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(rowId);
     if (!rowMeta) {
-      throw new Error("Row not found."); // Throw error to rollback transaction
+      throw new Error("Row not found.");
     }
-    // Perform accessibility check using the awaited version. Allow fetching a (soft) deleted row for the purpose of modifying it (e.g. undelete via history).
-    const parentDb = await _getAccessibleDatabaseOrFail(rowMeta.database_id, requestingUserId, db, "deleteRow");
+
+    // Authorization check for WRITE permission on the database
+    if (!requestingUserId) {
+        throw new Error("User ID is required to delete rows.");
+    }
+    const permCheck = await permissionService.checkUserDatabasePermission(rowMeta.database_id, requestingUserId, 'WRITE');
+    if (!permCheck.V) {
+        throw new Error("Authorization failed: Insufficient permissions to delete rows from this database.");
+    }
+
+    if (rowMeta.deleted_at !== null) { // Already soft-deleted
+        // Optionally, allow re-deleting by same user to update timestamp, or prevent re-delete.
+        // For now, consider it success if already deleted.
+        return { success: true, changes: 0, message: "Row was already soft-deleted." };
+    }
 
     // Soft delete: Update deleted_at and deleted_by_user_id
     const stmt = db.prepare(
@@ -504,22 +538,10 @@ async function deleteRow(rowId, requestingUserId = null) {
 
     if (info.changes > 0) {
       console.log(`Soft deleted row ${rowId} by user ${requestingUserId}.`);
-      // For soft delete, links in database_row_links are NOT removed.
-      // History recording for soft delete:
-      // Fetch the state *before* soft delete (which is the current state)
-      // The 'after' state is this row with deleted_at set.
-      // This might require _getStoredRowData to fetch a row even if it's about to be marked deleted.
-      // The current recordRowHistory in historyService.js would need to be called appropriately.
-      // For now, just performing the soft delete. History of soft delete is a further refinement.
       return { success: true, changes: info.changes };
     }
-    // If no changes, it means the row was not found (e.g. already hard-deleted, or ID is wrong)
-    // or it was already soft-deleted and this operation effectively did nothing new.
-    // Check if it was already soft-deleted by this user to avoid error.
-    if (rowMeta.deleted_at && rowMeta.deleted_by_user_id === requestingUserId) {
-        return { success: true, changes: 0, message: "Row was already soft-deleted by this user." };
-    }
-    throw new Error("Row not found for soft delete or no changes made.");
+    // This state should ideally not be reached if rowMeta was found and not deleted_at.
+    throw new Error("Row not found at soft delete stage or no changes made, despite initial checks.");
   });
 
   try {

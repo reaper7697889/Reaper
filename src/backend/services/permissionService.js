@@ -3,6 +3,7 @@ const { getDb } = require('../db');
 const noteService = require('./noteService');
 const userService = require('./userService');
 const authService = require('./authService'); // Added for RBAC
+const databaseDefService = require('./databaseDefService'); // For DB details
 
 /**
  * Grants a permission level for a note to a target user.
@@ -240,4 +241,187 @@ module.exports = {
   revokeNotePermission,
   getPermissionsForNote,
   checkUserNotePermission,
+  grantDatabasePermission,
+  revokeDatabasePermission,
+  getPermissionsForDatabase,
+  checkUserDatabasePermission,
 };
+
+// --- Database Permission Functions ---
+
+async function grantDatabasePermission(databaseId, targetUserId, permissionLevel, grantingUserId) {
+  const db = getDb();
+  try {
+    if (!databaseId || !targetUserId || !permissionLevel || !grantingUserId) {
+      return { success: false, error: "Database ID, target user ID, permission level, and granting user ID are required." };
+    }
+
+    const grantingUser = await userService.getUserById(grantingUserId);
+    if (!grantingUser) {
+      return { success: false, error: `Granting user ID ${grantingUserId} not found.` };
+    }
+
+    const databaseToShare = await databaseDefService.getDatabaseById(databaseId, null); // Unfiltered
+    if (!databaseToShare) {
+      return { success: false, error: `Database ID ${databaseId} not found.` };
+    }
+
+    const isOwner = databaseToShare.user_id === grantingUserId;
+    const isAdminGranter = await authService.checkUserRole(grantingUserId, 'ADMIN');
+    if (!isOwner && !isAdminGranter) {
+      return { success: false, error: "Authorization failed: Only database owner or an ADMIN can grant permissions." };
+    }
+
+    const targetUser = await userService.getUserById(targetUserId);
+    if (!targetUser) {
+      return { success: false, error: `Target user ID ${targetUserId} not found.` };
+    }
+
+    if (targetUserId === databaseToShare.user_id) {
+      return { success: false, error: "Cannot grant explicit permission to the database owner; owner has inherent full access." };
+    }
+
+    if (!['READ', 'WRITE', 'ADMIN'].includes(permissionLevel)) {
+      return { success: false, error: "Invalid permission level. Must be 'READ', 'WRITE', or 'ADMIN'." };
+    }
+
+    const stmt = db.prepare(
+      `REPLACE INTO database_permissions (database_id, user_id, permission_level, granted_by_user_id)
+       VALUES (?, ?, ?, ?)`
+    );
+    // info.lastInsertRowid might be 0 if REPLACE updated an existing row.
+    // Query by database_id and user_id to get the definitive record.
+    stmt.run(databaseId, targetUserId, permissionLevel, grantingUserId);
+    const newPerm = db.prepare("SELECT * FROM database_permissions WHERE database_id = ? AND user_id = ?").get(databaseId, targetUserId);
+
+    return { success: true, permission: newPerm };
+
+  } catch (error) {
+    console.error(`Error in grantDatabasePermission (db ${databaseId}, targetUser ${targetUserId}, granter ${grantingUserId}):`, error);
+    return { success: false, error: error.message || "Failed to grant database permission." };
+  }
+}
+
+async function revokeDatabasePermission(databaseId, targetUserId, revokingUserId) {
+  const db = getDb();
+  try {
+    if (!databaseId || !targetUserId || !revokingUserId) {
+      return { success: false, error: "Database ID, target user ID, and revoking user ID are required." };
+    }
+
+    const revokingUser = await userService.getUserById(revokingUserId);
+    if (!revokingUser) {
+      return { success: false, error: `Revoking user ID ${revokingUserId} not found.` };
+    }
+
+    const databaseToModify = await databaseDefService.getDatabaseById(databaseId, null); // Unfiltered
+    if (!databaseToModify) {
+      return { success: false, error: `Database ID ${databaseId} not found.` };
+    }
+
+    const isOwner = databaseToModify.user_id === revokingUserId;
+    const isAdminRevoker = await authService.checkUserRole(revokingUserId, 'ADMIN');
+    if (!isOwner && !isAdminRevoker) {
+      return { success: false, error: "Authorization failed: Only database owner or an ADMIN can revoke permissions." };
+    }
+
+    const stmt = db.prepare("DELETE FROM database_permissions WHERE database_id = ? AND user_id = ?");
+    const info = stmt.run(databaseId, targetUserId);
+
+    return { success: true, changes: info.changes };
+
+  } catch (error) {
+    console.error(`Error in revokeDatabasePermission (db ${databaseId}, targetUser ${targetUserId}, revoker ${revokingUserId}):`, error);
+    return { success: false, error: error.message || "Failed to revoke database permission." };
+  }
+}
+
+async function getPermissionsForDatabase(databaseId, requestingUserId) {
+  const db = getDb();
+  try {
+    if (!databaseId || !requestingUserId) {
+      return { success: false, error: "Database ID and requesting user ID are required." };
+    }
+
+    const dbToList = await databaseDefService.getDatabaseById(databaseId, null); // Unfiltered
+    if (!dbToList) {
+      return { success: false, error: `Database ID ${databaseId} not found.` };
+    }
+
+    const isOwner = dbToList.user_id === requestingUserId;
+    const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+    if (!isOwner && !isAdmin) {
+      return { success: false, error: "Authorization failed: Only database owner or an ADMIN can list permissions." };
+    }
+
+    const sql = `
+      SELECT dp.id, dp.database_id, dp.user_id, u.username as target_username,
+             dp.permission_level, dp.granted_by_user_id, gbu.username as granted_by_username,
+             dp.created_at, dp.updated_at
+      FROM database_permissions dp
+      JOIN users u ON dp.user_id = u.id
+      LEFT JOIN users gbu ON dp.granted_by_user_id = gbu.id
+      WHERE dp.database_id = ?
+      ORDER BY u.username ASC
+    `;
+    const permissions = db.prepare(sql).all(databaseId);
+    return { success: true, permissions };
+
+  } catch (error) {
+    console.error(`Error in getPermissionsForDatabase for db ${databaseId} (user ${requestingUserId}):`, error);
+    return { success: false, error: error.message || "Failed to retrieve permissions for database." };
+  }
+}
+
+async function checkUserDatabasePermission(databaseId, checkUserId, requiredPermissionLevel) {
+  const db = getDb();
+  try {
+    if (!databaseId || !checkUserId || !requiredPermissionLevel) {
+      return { V: false, error: "Missing parameters for database permission check." };
+    }
+    if (!['READ', 'WRITE', 'ADMIN'].includes(requiredPermissionLevel)) {
+        return { V: false, error: "Invalid requiredPermissionLevel." };
+    }
+
+    const dbOwnerInfo = db.prepare("SELECT user_id FROM note_databases WHERE id = ?").get(databaseId);
+    if (!dbOwnerInfo) {
+      return { V: false, error: "Database not found." };
+    }
+
+    // Owner has all permissions
+    if (dbOwnerInfo.user_id === checkUserId) {
+      return { V: true, level: 'OWNER' };
+    }
+
+    // Public DBs: For this check, explicit permission or ADMIN override is still required if not owner.
+    // If public DBs had an implicit read for all authenticated users, logic would go here.
+
+    const permRecord = db.prepare(
+      "SELECT permission_level FROM database_permissions WHERE database_id = ? AND user_id = ?"
+    ).get(databaseId, checkUserId);
+
+    if (permRecord) {
+      if (permRecord.permission_level === 'ADMIN') {
+        return { V: true, level: 'ADMIN' }; // DB-specific ADMIN implies WRITE and READ
+      }
+      if (permRecord.permission_level === 'WRITE' && (requiredPermissionLevel === 'WRITE' || requiredPermissionLevel === 'READ')) {
+        return { V: true, level: 'WRITE' }; // WRITE implies READ
+      }
+      if (permRecord.permission_level === 'READ' && requiredPermissionLevel === 'READ') {
+        return { V: true, level: 'READ' };
+      }
+    }
+
+    // Check for global ADMIN role as an override if no specific permission grants access
+    const isGlobalAdmin = await authService.checkUserRole(checkUserId, 'ADMIN');
+    if (isGlobalAdmin) {
+      return { V: true, level: 'ADMIN_GLOBAL_OVERRIDE' };
+    }
+
+    return { V: false }; // No sufficient permission found
+
+  } catch (error) {
+    console.error(`Error in checkUserDatabasePermission (db ${databaseId}, user ${checkUserId}):`, error);
+    return { V: false, error: error.message || "Error checking database permission." };
+  }
+}
