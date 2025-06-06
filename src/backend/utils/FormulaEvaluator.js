@@ -101,6 +101,41 @@ parser.functions.DAY = (dateStr) => {
 parser.functions.ABS = Math.abs;
 parser.functions.SQRT = Math.sqrt;
 parser.functions.POW = Math.pow;
+
+parser.functions.DATE_DIFF = (dateStr1, dateStr2, unit = 'days') => {
+  const date1 = new Date(String(dateStr1));
+  const date2 = new Date(String(dateStr2));
+
+  if (!(date1 instanceof Date && !isNaN(date1.valueOf())) ||
+      !(date2 instanceof Date && !isNaN(date2.valueOf()))) {
+    return NaN; // Invalid date input
+  }
+
+  const diffMs = date1.getTime() - date2.getTime();
+
+  let conversionFactor;
+  const lowerUnit = String(unit).toLowerCase();
+
+  switch (lowerUnit) {
+    case 'days':
+      conversionFactor = 1000 * 60 * 60 * 24;
+      break;
+    case 'hours':
+      conversionFactor = 1000 * 60 * 60;
+      break;
+    case 'minutes':
+      conversionFactor = 1000 * 60;
+      break;
+    case 'seconds':
+      conversionFactor = 1000;
+      break;
+    default: // Default to 'days' if unit is invalid or not provided
+      conversionFactor = 1000 * 60 * 60 * 24;
+      break;
+  }
+
+  return diffMs / conversionFactor;
+};
 // Consider adding text functions like LEFT, RIGHT, MID, REPLACE, FIND if required.
 
 /**
