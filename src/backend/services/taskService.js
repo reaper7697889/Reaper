@@ -19,7 +19,8 @@ async function createTask(taskData) { // Changed to async
     reminder_at = null,
     is_completed = 0,
     userId = null, // userId is expected in taskData, defaults to null
-    recurrence_rule = null // Added recurrence_rule
+    recurrence_rule = null, // Added recurrence_rule
+    project_row_id = null // Added project_row_id
   } = taskData;
 
   if (!description || typeof description !== 'string' || description.trim() === "") {
@@ -37,17 +38,18 @@ async function createTask(taskData) { // Changed to async
   // If no userId, it's a public task or an error depending on policy (current schema allows NULL user_id for tasks)
 
   const sql = `
-    INSERT INTO tasks (description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    INSERT INTO tasks (description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, project_row_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
   `;
   try {
     const info = db.prepare(sql).run(
         description.trim(), note_id, block_id,
         due_date, reminder_at, is_completed ? 1 : 0,
         userId, // Pass userId to the SQL execution
-        recurrence_rule // Added recurrence_rule
+        recurrence_rule, // Added recurrence_rule
+        project_row_id // Added project_row_id
     );
-    // Fetch the newly created task. getTaskById selects user_id and recurrence_rule, so it will be included.
+    // Fetch the newly created task. getTaskById selects user_id, recurrence_rule, and project_row_id, so it will be included.
     const newTask = getTaskById(info.lastInsertRowid, userId); // Pass userId for auth if needed by getTaskById
     return { success: true, task: newTask }; // Return the full task object including user_id
   } catch (err) {
@@ -64,7 +66,7 @@ async function createTask(taskData) { // Changed to async
  */
 function getTaskById(id, requestingUserId = null) {
   const db = getDb();
-  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE id = ?";
+  let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, project_row_id, created_at, updated_at FROM tasks WHERE id = ?";
   const params = [id];
 
   if (requestingUserId !== null) {
@@ -102,7 +104,7 @@ function updateTask(id, updates, requestingUserId) {
     return { success: false, error: "Authorization failed: You do not own this task." };
   }
 
-  const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id", "recurrence_rule"];
+  const allowedFields = ["description", "is_completed", "due_date", "reminder_at", "note_id", "block_id", "recurrence_rule", "project_row_id"];
   const fieldsToSet = [];
   const values = [];
 
@@ -192,7 +194,7 @@ async function deleteTask(id, requestingUserId) { // Changed to async
 
 function getTasksForNote(noteId, requestingUserId = null) {
     const db = getDb();
-    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE note_id = ?";
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, project_row_id, created_at, updated_at FROM tasks WHERE note_id = ?";
     const params = [noteId];
 
     if (requestingUserId !== null) {
@@ -211,7 +213,7 @@ function getTasksForNote(noteId, requestingUserId = null) {
 
 function getTasksForBlock(blockId, requestingUserId = null) {
     const db = getDb();
-    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, created_at, updated_at FROM tasks WHERE block_id = ?";
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, project_row_id, created_at, updated_at FROM tasks WHERE block_id = ?";
     const params = [blockId];
 
     if (requestingUserId !== null) {
@@ -340,4 +342,33 @@ module.exports = {
   createTask, getTaskById, updateTask, deleteTask,
   getTasksForNote, getTasksForBlock,
   addTaskDependency, removeTaskDependency, getTaskPrerequisites, getTasksBlockedBy,
+  getTasksForProject, // Added new function
 };
+
+/**
+ * Retrieves all tasks associated with a specific project row ID.
+ * @param {number} projectRowId - The ID of the project row.
+ * @param {number | null} [requestingUserId=null] - Optional ID of the user making the request (for filtering by task ownership).
+ * @returns {Array<object>} - An array of task objects (with is_completed as boolean), or empty array on error.
+ */
+function getTasksForProject(projectRowId, requestingUserId = null) {
+    const db = getDb();
+    let sql = "SELECT id, description, note_id, block_id, due_date, reminder_at, is_completed, user_id, recurrence_rule, project_row_id, created_at, updated_at FROM tasks WHERE project_row_id = ?";
+    const params = [projectRowId];
+
+    if (requestingUserId !== null) {
+        sql += " AND (user_id = ? OR user_id IS NULL)"; // Standard user access filter
+        params.push(requestingUserId);
+    }
+    sql += " ORDER BY created_at ASC";
+
+    try {
+        return db.prepare(sql).all(...params).map(task => ({
+            ...task,
+            is_completed: !!task.is_completed
+        }));
+    } catch (err) {
+        console.error(`Error listing tasks for project_row_id ${projectRowId} (user ${requestingUserId}):`, err.message);
+        return [];
+    }
+}
