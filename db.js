@@ -198,6 +198,29 @@ function initializeDatabase() {
   db.exec(`CREATE TABLE IF NOT EXISTS database_row_links (id INTEGER PRIMARY KEY AUTOINCREMENT, source_row_id INTEGER NOT NULL, source_column_id INTEGER NOT NULL, target_row_id INTEGER NOT NULL, link_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (source_row_id) REFERENCES database_rows(id) ON DELETE CASCADE, FOREIGN KEY (source_column_id) REFERENCES database_columns(id) ON DELETE CASCADE, FOREIGN KEY (target_row_id) REFERENCES database_rows(id) ON DELETE CASCADE, UNIQUE (source_row_id, source_column_id, target_row_id));`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_database_row_links_updated_at AFTER UPDATE ON database_row_links FOR EACH ROW BEGIN UPDATE database_row_links SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
+  // --- Database Row Templates Table ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS database_row_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        database_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        template_values TEXT NOT NULL, -- JSON stored as TEXT
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (database_id) REFERENCES note_databases(id) ON DELETE CASCADE,
+        UNIQUE (database_id, name)
+    );
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trigger_database_row_templates_updated_at
+    AFTER UPDATE ON database_row_templates
+    FOR EACH ROW
+    BEGIN
+        UPDATE database_row_templates SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+    END;
+  `);
+
   // --- Smart Rules Table ---
   db.exec(`CREATE TABLE IF NOT EXISTS smart_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, target_database_id INTEGER NOT NULL, trigger_type TEXT NOT NULL CHECK(trigger_type IN ('ON_ROW_UPDATE')), trigger_config TEXT, condition_formula TEXT, action_type TEXT NOT NULL CHECK(action_type IN ('UPDATE_SAME_ROW')), action_config TEXT NOT NULL, is_enabled BOOLEAN NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (target_database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_smart_rules_updated_at AFTER UPDATE ON smart_rules FOR EACH ROW BEGIN UPDATE smart_rules SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);

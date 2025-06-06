@@ -1,6 +1,7 @@
 // src/backend/services/databaseRowService.js
 const { getDb } = require("../db");
 const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
+const databaseTemplateService = require('./databaseTemplateService');
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');
 const smartRuleService = require('./smartRuleService');
@@ -93,7 +94,7 @@ async function _getAccessibleDatabaseOrFail(databaseId, requestingUserId, dbInst
   return parentDb;
 }
 
-async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, requestingUserId = null }) {
+async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = null, templateId = null, requestingUserId = null }) {
   const db = getDb();
 
   if (!requestingUserId) {
@@ -111,11 +112,26 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
   if (!columnDefsArray) throw new Error(`Could not retrieve column definitions for database ${databaseId}`);
   const columnDefsMap = columnDefsArray.reduce((acc, col) => { acc[col.id] = col; return acc; }, {});
 
+  let finalValues = values; // Use original values by default
+
+  if (templateId !== null && templateId !== undefined) {
+    const templateResult = await databaseTemplateService.getRowTemplateById(templateId, requestingUserId);
+    if (!templateResult.success) {
+        return { success: false, error: templateResult.error || 'Failed to retrieve template.' };
+    }
+    const template = templateResult.template;
+    if (template.database_id !== databaseId) {
+        return { success: false, error: 'Template does not belong to the target database.' };
+    }
+    // Start with template values, then override with explicit values
+    finalValues = { ...template.template_values, ...values };
+  }
+
   let newRowIdValue;
 
   // Perform validation before starting transaction for database writes
   const allValidationErrors = {};
-  for (const [columnIdStr, rawValue] of Object.entries(values)) {
+  for (const [columnIdStr, rawValue] of Object.entries(finalValues)) {
     const columnId = parseInt(columnIdStr, 10);
     const colDef = columnDefsMap[columnId];
     if (colDef && colDef.validation_rules && !['RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'].includes(colDef.type)) {
@@ -141,7 +157,7 @@ async function addRow({ databaseId, values, rowOrder = null, recurrence_rule = n
     const valueInsertStmt = db.prepare("INSERT INTO database_row_values (row_id, column_id, value_text, value_number, value_boolean) VALUES (?, ?, ?, ?, ?)");
     const linkInsertStmt = db.prepare("INSERT INTO database_row_links (source_row_id, source_column_id, target_row_id, link_order) VALUES (?, ?, ?, ?)");
 
-    for (const [columnIdStr, rawValue] of Object.entries(values)) {
+    for (const [columnIdStr, rawValue] of Object.entries(finalValues)) {
       const columnId = parseInt(columnIdStr, 10);
       const colDef = columnDefsMap[columnId];
       if (!colDef) throw new Error(`Column ID ${columnId} not found in DB ${databaseId}.`);
