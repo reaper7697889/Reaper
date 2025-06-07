@@ -1,7 +1,7 @@
 // src/backend/services/smartRuleService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
-const FormulaEvaluator = require('../utils/FormulaEvaluator'); // For condition evaluation
+const FormulaEvaluator = require('../utils/FormulaEvaluator.js'); // Corrected path & added .js
 let databaseRowService = require('./databaseRowService'); // For action execution - potential circular dep
 
 // We might need getColumnById from databaseDefService if it exists, or query directly.

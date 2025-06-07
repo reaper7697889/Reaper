@@ -1,5 +1,5 @@
 // src/backend/services/trashService.js
-const { getDb } = require('../db');
+const { getDb } = require('../../../db'); // Corrected path
 const noteService = require('./noteService');
 const databaseRowService = require('./databaseRowService');
 const userService = require('./userService'); // To validate user IDs if needed, or get usernames

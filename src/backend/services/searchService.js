@@ -1,5 +1,5 @@
 // src/backend/services/searchService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 
 /**
  * Searches across notes, tasks, and database row content using FTS5.

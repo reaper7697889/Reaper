@@ -1,5 +1,5 @@
 // src/backend/services/databaseQueryService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const { getRow } = require("./databaseRowService"); // To fetch full row data
 // Import getDatabaseById as well for ownership check
 const { getColumnsForDatabase, getDatabaseById } = require("./databaseDefService");

@@ -1,5 +1,5 @@
 // src/backend/services/timeLogService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const taskService = require('./taskService'); // To validate taskId
 const noteService = require('./noteService'); // Added
 const databaseRowService = require('./databaseRowService'); // Added

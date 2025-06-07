@@ -1,6 +1,6 @@
 // src/backend/services/blockService.js
 
-const { getDb } = require("../db");
+const { getDb } = require("./db"); // Corrected path
 const { v4: uuidv4 } = require("uuid"); // Use uuid for block IDs
 
 /**

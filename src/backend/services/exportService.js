@@ -1,7 +1,8 @@
 // src/backend/services/exportService.js
 const fs = require('fs');
 const path = require('path');
-const { getDb } = require("../db"); // Used for db.backup() and db.name
+const { getDb } = require("../../../db"); // Corrected path
+// Used for db.backup() and db.name
 
 // New imports for PDF export
 let puppeteer;
@@ -9,10 +10,10 @@ let marked;
 
 // Import services - adjust paths as necessary based on actual file structure
 const noteService = require('./noteService');
-const tagService = require('./tagService');
-const linkService = require('./linkService');
+const tagService = require('../../../tagService.js'); // Corrected path
+const linkService = require('../../../linkService.js'); // Corrected path
 const taskService = require('./taskService'); // Assuming taskService exists and has getTasksForNote
-const attachmentService = require('./attachmentService'); // Assuming attachmentService exists
+const attachmentService = require('../../../attachmentService.js'); // Corrected path
 const databaseDefService = require('./databaseDefService');
 const databaseQueryService = require('./databaseQueryService');
 const authService = require('./authService'); // Added authService import

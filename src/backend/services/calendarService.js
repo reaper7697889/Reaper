@@ -1,5 +1,5 @@
 // src/backend/services/calendarService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const databaseDefService = require('./databaseDefService');
 const databaseQueryService = require('./databaseQueryService');
 const { RRule, RRuleSet, rrulestr } = require('rrule');

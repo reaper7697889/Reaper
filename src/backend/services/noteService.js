@@ -1,8 +1,8 @@
 // src/backend/services/noteService.js
 
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const { recordNoteHistory } = require('./historyService');
-const linkService = require('./linkService');
+const linkService = require('../../../linkService.js'); // Corrected path
 const permissionService = require('./permissionService'); // Added import
 const attachmentService = require('../../../attachmentService'); // For voice notes
 const authService = require('./authService'); // Added for RBAC

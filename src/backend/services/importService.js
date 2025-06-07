@@ -1,9 +1,10 @@
 // src/backend/services/importService.js
-const { getDb } = require("../db"); // May not be needed if all data comes from other services
+const { getDb } = require("../../../db"); // Corrected path
+// May not be needed if all data comes from other services
 
 const noteService = require('./noteService');
-const linkService = require('./linkService');
-const tagService = require('./tagService');
+const linkService = require('../../../linkService.js'); // Corrected path
+const tagService = require('../../../tagService.js'); // Corrected path
 const databaseDefService = require('./databaseDefService');
 const databaseRowService = require('./databaseRowService');
 

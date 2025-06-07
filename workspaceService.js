@@ -1,5 +1,5 @@
 // src/backend/services/workspaceService.js
-const { getDb } = require("../db");
+const { getDb } = require("./db"); // Corrected path
 const authService = require('./src/backend/services/authService.js'); // Added for RBAC
 
 async function createWorkspace(workspaceData, requestingUserId) { // Changed to async

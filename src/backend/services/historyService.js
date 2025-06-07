@@ -1,5 +1,5 @@
 // src/backend/services/historyService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const noteService = require('./noteService');
 const databaseRowService = require('./databaseRowService');
 

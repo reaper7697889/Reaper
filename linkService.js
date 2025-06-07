@@ -1,6 +1,6 @@
 // src/backend/services/linkService.js - Enhanced for markdown wiki links
 
-const { getDb } = require("../db");
+const { getDb } = require("./db"); // Corrected path
 const { v4: uuidv4 } = require("uuid");
 
 /**

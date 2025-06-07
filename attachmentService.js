@@ -1,6 +1,6 @@
 // src/backend/services/attachmentService.js
 
-const { getDb } = require("../db");
+const { getDb } = require("./db"); // Corrected path
 const fs = require("fs").promises; // Use promises for async file operations
 const fsSync = require("fs"); // For sync operations like existsSync, statSync if needed in sync parts
 const path = require("path");
@@ -296,8 +296,8 @@ async function deleteAttachment(attachmentId, requestingUserId) {
 
 module.exports = {
   createAttachment,
-  getAttachmentsForNote, // This might need update to reflect versioning or use getAttachmentDetails
-  getAttachmentsForBlock, // Same as above
+  // getAttachmentsForNote, // This might need update to reflect versioning or use getAttachmentDetails
+  // getAttachmentsForBlock, // Same as above
   deleteAttachment,
   updateAttachedFile,
   getAttachmentDetails,

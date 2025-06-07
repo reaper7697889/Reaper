@@ -1,5 +1,5 @@
 // src/backend/services/permissionService.js
-const { getDb } = require('../db');
+const { getDb } = require('../../../db'); // Corrected path
 const noteService = require('./noteService');
 const userService = require('./userService');
 const authService = require('./authService'); // Added for RBAC

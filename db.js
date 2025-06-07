@@ -371,6 +371,9 @@ function closeDb() {
   }
 }
 
-initializeDatabase();
+// Only initialize the database if not in a Jest test environment
+if (process.env.JEST_WORKER_ID === undefined) {
+  initializeDatabase();
+}
 
 module.exports = { getDb, closeDb };

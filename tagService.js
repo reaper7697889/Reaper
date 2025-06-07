@@ -1,6 +1,6 @@
 // src/backend/services/tagService.js
 
-const { getDb } = require("../db");
+const { getDb } = require("./db"); // Corrected path
 
 /**
  * Finds a tag by name, or creates it if it doesn't exist.

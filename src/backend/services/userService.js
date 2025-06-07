@@ -1,6 +1,6 @@
 // src/backend/services/userService.js
 const bcrypt = require('bcrypt');
-const { getDb } = require('../db');
+const { getDb } = require('../../../db'); // Corrected path
 
 const SALT_ROUNDS = 10; // bcrypt salt rounds
 

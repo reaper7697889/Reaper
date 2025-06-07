@@ -1,5 +1,5 @@
 // src/backend/services/insightsService.js
-const { getDb } = require('../db');
+const { getDb } = require('../../../db'); // Corrected path
 // Potentially userService if we needed to validate user existence beyond just ID match,
 // but for this function, direct ID comparison is sufficient for authorization.
 

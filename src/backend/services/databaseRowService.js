@@ -1,5 +1,5 @@
 // src/backend/services/databaseRowService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const databaseDefService = require("./databaseDefService"); // For getDatabaseById and getColumnsForDatabase
 const { evaluateFormula } = require('../utils/FormulaEvaluator');
 const { performAggregation } = require('../utils/RollupCalculator');

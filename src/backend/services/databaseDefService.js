@@ -1,5 +1,5 @@
 // src/backend/services/databaseDefService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 const authService = require('./authService'); // Added for RBAC
 
 const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'DATETIME', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'];
@@ -238,7 +238,7 @@ function updateDatabaseMetadata(databaseId, updates, requestingUserId) {
   }
 }
 
-function deleteDatabase(databaseId, requestingUserId) {
+async function deleteDatabase(databaseId, requestingUserId) { // Added async
   const db = getDb();
 
   const dbToDelete = await getDatabaseById(databaseId, null); // Unfiltered fetch, ensure it's awaited
@@ -281,7 +281,7 @@ function deleteDatabase(databaseId, requestingUserId) {
 }
 
 // --- Column Management ---
-function addColumn(args, requestingUserId) { // Added requestingUserId
+async function addColumn(args, requestingUserId) { // Added async, Added requestingUserId
   const {
     databaseId, name, type, columnOrder,
     defaultValue: origDefaultValue, selectOptions: origSelectOptions,
@@ -467,7 +467,7 @@ function getColumnsForDatabase(databaseId, requestingUserId = null) {
   }
 }
 
-function updateColumn(args, requestingUserId) { // Added requestingUserId
+async function updateColumn(args, requestingUserId) { // Added async, Added requestingUserId
   const { columnId, makeBidirectional, targetInverseColumnName, existingTargetInverseColumnId, ...updateData } = args;
   const db = getDb();
 
@@ -475,7 +475,7 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     return { success: false, error: "No update data or action provided." };
   }
 
-  const transaction = db.transaction(() => {
+  const transaction = db.transaction(async () => { // Added async
     const currentCol = db.prepare("SELECT * FROM database_columns WHERE id = ?").get(columnId);
     if (!currentCol) throw new Error("Column not found.");
 
@@ -695,12 +695,12 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
     }
 }
 
-function deleteColumn(columnId, requestingUserId) { // Added requestingUserId
+async function deleteColumn(columnId, requestingUserId) { // Added async, Added requestingUserId
   const db = getDb();
   // It's good practice to wrap this in a transaction if multiple dependent operations occur.
   // For this specific change, _clearInverseColumnLink is one operation, then delete.
   // SQLite operations are atomic per statement, but a transaction ensures both or neither.
-  const transaction = db.transaction(() => {
+  const transaction = db.transaction(async () => { // Added async
     const colInfo = db.prepare("SELECT database_id, inverse_column_id FROM database_columns WHERE id = ?").get(columnId);
     if (!colInfo) {
       // Throw an error to be caught by the outer catch, which will then return the error object.

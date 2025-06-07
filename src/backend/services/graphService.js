@@ -1,5 +1,5 @@
 // src/backend/services/graphService.js
-const { getDb } = require("../db");
+const { getDb } = require("../../../db"); // Corrected path
 
 /**
  * Assembles data for the knowledge graph visualization.
