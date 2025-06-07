@@ -31,10 +31,88 @@ Reaper is a versatile desktop application built with Electron, designed for pers
     *   `react-force-graph` for the knowledge graph visualization.
     *   And various other libraries for UI components and specific functionalities.
 
+### Database
+
+*   **Type:** SQLite
+*   **File:** The application uses a SQLite database stored in the file \`database.sqlite\`, located in the root directory of the project.
+*   **Initialization:** This database file is automatically created and its schema is initialized by the application on its first run if the file does not already exist.
+
 ## Getting Started
 
-(To be added: Instructions on how to build and run the project locally)
+Follow these instructions to get Reaper up and running on your local machine for development and testing purposes.
+
+### Prerequisites
+
+*   **Node.js:** Make sure you have Node.js installed. You can download it from [nodejs.org](https://nodejs.org/). npm (Node Package Manager) is included with Node.js.
+*   **Git:** You'll need Git to clone the repository. You can get it from [git-scm.com](https://git-scm.com/).
+*   **Electron (Optional Global Install):** While the project will use a local version of Electron via npm, you might find it useful to have Electron installed globally for easier command-line use in some cases: `npm install -g electron`. This is not strictly required to run the project.
+
+### Installation & Running
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/your-username/reaper-app.git
+    cd reaper
+    ```
+
+2.  **Install dependencies:**
+    This project uses npm to manage dependencies.
+    ```bash
+    npm install
+    ```
+
+3.  **Run the application:**
+    This command will start the Electron application.
+    ```bash
+    electron .
+    ```
+    The SQLite database (`database.sqlite` in the project root, as per `db.js`) will be automatically initialized on the first run if it doesn't exist.
 
 ## Contributing
 
-(To be added: Guidelines for contributing to the project)
+Contributions are welcome! If you'd like to help improve Reaper, please follow these guidelines.
+
+### Reporting Bugs
+
+*   If you find a bug, please check the existing GitHub Issues to see if it has already been reported.
+*   If not, create a new issue. Provide a clear title, a detailed description of the bug, steps to reproduce it, and information about your environment (OS, Reaper version if applicable).
+
+### Suggesting Enhancements
+
+*   If you have an idea for a new feature or an improvement to an existing one, feel free to open a new GitHub Issue.
+*   Describe your idea clearly, explaining the problem it solves or the value it adds.
+
+### Development Setup
+
+1.  Follow the instructions in the **Getting Started** section to set up the project locally.
+2.  Ensure you can run the application and all tests pass.
+
+### Running Tests
+
+This project uses Jest for automated testing. To run the tests:
+```bash
+npm test
+```
+To run tests for a specific file:
+```bash
+npm test path/to/your/testfile.test.js
+```
+Make sure all tests pass before submitting any changes.
+
+### Pull Request Process
+
+1.  **Fork the repository** on GitHub.
+2.  **Create a new branch** for your feature or bug fix:
+    ```bash
+    git checkout -b feature/your-feature-name
+    # or
+    # git checkout -b fix/your-bug-fix-name
+    ```
+3.  **Make your changes.** Adhere to the existing code style as much as possible.
+4.  **Test your changes thoroughly.** Add new tests if you're introducing new functionality. Ensure all existing and new tests pass.
+5.  **Commit your changes** with a clear and descriptive commit message.
+6.  **Push your branch** to your forked repository:
+    ```bash
+    git push origin your-branch-name
+    ```
+7.  **Open a Pull Request** against the main Reaper repository. Provide a clear description of your changes in the PR.

@@ -154,6 +154,247 @@ describe('Task Service', () => {
     });
   });
 
+  describe('Task Dependency Management', () => {
+    const taskId = 1;
+    const dependsOnTaskId = 2;
+    const requestingUserId = 1;
+    const mockTask1 = { id: taskId, user_id: requestingUserId, description: 'Task 1', is_completed: 0 };
+    const mockTask2 = { id: dependsOnTaskId, user_id: null, description: 'Task 2 (Public)', is_completed: 0 };
+
+    beforeEach(() => {
+      mockStmt.get.mockReset();
+      mockStmt.run.mockReset();
+      mockStmt.all.mockReset();
+    });
+
+    // --- addTaskDependency ---
+    describe('addTaskDependency', () => {
+      it('should add a task dependency successfully', async () => {
+        mockStmt.get.mockImplementation((idParam) => {
+          if (idParam === taskId) return mockTask1;
+          if (idParam === dependsOnTaskId) return mockTask2;
+          return undefined;
+        });
+        mockStmt.run.mockReturnValueOnce({ lastInsertRowid: 100, changes: 1 });
+
+        const result = await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+
+        expect(result.success).toBe(true);
+        expect(result.dependency).toEqual({ id: 100, task_id: taskId, depends_on_task_id: dependsOnTaskId });
+        expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO task_dependencies'));
+        expect(mockStmt.run).toHaveBeenCalledWith(taskId, dependsOnTaskId);
+        expect(mockStmt.get).toHaveBeenCalledWith(taskId); // For ownership check, service calls getTaskById(id, null)
+        expect(mockStmt.get).toHaveBeenCalledWith(dependsOnTaskId); // For existence check
+      });
+
+      it('should return error if task cannot depend on itself (service level check)', async () => {
+        const result = await taskService.addTaskDependency(taskId, taskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Task cannot depend on itself.");
+      });
+
+      it('should return error if primary task not found', async () => {
+        mockStmt.get.mockImplementationOnce(() => undefined);
+        const result = await taskService.addTaskDependency(99, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Task with ID 99 not found");
+      });
+
+      it('should return error if user does not own primary task', async () => {
+        mockStmt.get.mockReturnValueOnce({ ...mockTask1, user_id: 999 }); // Task owned by another user
+        const result = await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(`Authorization failed: You do not own task ${taskId}`);
+      });
+
+      it('should return error if dependent task (dependsOnTaskId) not found', async () => {
+        mockStmt.get.mockImplementation((idParam) => {
+          if (idParam === taskId) return mockTask1;
+          return undefined;
+        });
+        const result = await taskService.addTaskDependency(taskId, 98, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Task with ID 98 (to depend on) not found");
+      });
+
+      it('should handle SQLITE_CONSTRAINT_UNIQUE as already exists', async () => {
+        mockStmt.get.mockImplementation((idParam) => (idParam === taskId ? mockTask1 : mockTask2));
+        mockStmt.run.mockImplementationOnce(() => {
+          const err = new Error('SQLITE_CONSTRAINT_UNIQUE');
+          err.code = 'SQLITE_CONSTRAINT_UNIQUE';
+          throw err;
+        });
+        const result = await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(true);
+        expect(result.alreadyExists).toBe(true);
+      });
+
+      it('should handle SQLITE_CONSTRAINT_CHECK as task cannot depend on itself', async () => {
+        mockStmt.get.mockImplementation((idParam) => (idParam === taskId ? mockTask1 : mockTask2));
+        mockStmt.run.mockImplementationOnce(() => {
+          const err = new Error('SQLITE_CONSTRAINT_CHECK');
+          err.code = 'SQLITE_CONSTRAINT_CHECK';
+          throw err;
+        });
+        const result = await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Task cannot depend on itself (CHECK constraint failed)");
+      });
+
+      it('should handle general DB error on insert', async () => {
+        mockStmt.get.mockImplementation((idParam) => (idParam === taskId ? mockTask1 : mockTask2));
+        mockStmt.run.mockImplementationOnce(() => { throw new Error('DB Insert Dep Failed'); });
+        const result = await taskService.addTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Failed to add task dependency.");
+      });
+    });
+
+    describe('removeTaskDependency', () => {
+      it('should remove a task dependency successfully', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.run.mockReturnValueOnce({ changes: 1 });
+
+        const result = await taskService.removeTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(true);
+        expect(result.removed).toBe(true);
+        expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?'));
+        expect(mockStmt.run).toHaveBeenCalledWith(taskId, dependsOnTaskId);
+      });
+
+      it('should report success (removed: false) if dependency did not exist', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.run.mockReturnValueOnce({ changes: 0 });
+        const result = await taskService.removeTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(true);
+        expect(result.removed).toBe(false);
+      });
+
+      it('should return error if primary task not found for remove', async () => {
+        mockStmt.get.mockReturnValueOnce(undefined);
+        const result = await taskService.removeTaskDependency(99, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Task with ID 99 not found.");
+      });
+
+      it('should return error if user does not own primary task for remove', async () => {
+        mockStmt.get.mockReturnValueOnce({ ...mockTask1, user_id: 999 });
+        const result = await taskService.removeTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(`Authorization failed: You do not own task ${taskId}.`);
+      });
+
+      it('should return error if DB operation fails for remove', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.run.mockImplementationOnce(() => { throw new Error('DB Delete Dep Failed'); });
+        const result = await taskService.removeTaskDependency(taskId, dependsOnTaskId, requestingUserId);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Failed to remove task dependency.");
+      });
+    });
+
+    describe('getTaskPrerequisites', () => {
+      const prereqTask = { ...mockTask2, id: dependsOnTaskId, description: 'Prereq Task' }; // is_completed = 0
+
+      it('should retrieve prerequisites for a task, filtering by user', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockReturnValueOnce([prereqTask]);
+
+        const tasks = await taskService.getTaskPrerequisites(taskId, requestingUserId);
+        expect(tasks).toEqual([{...prereqTask, is_completed: false}]); // is_completed mapped
+        expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.depends_on_task_id WHERE td.task_id = ?'));
+        expect(mockStmt.all).toHaveBeenCalledWith(taskId);
+        expect(mockStmt.get).toHaveBeenCalledWith(taskId, requestingUserId); // Main task accessibility check
+      });
+
+      it('should retrieve all prerequisites if requestingUserId is null (after main task check)', async () => {
+        const publicPrereq = { ...prereqTask, user_id: null };
+        const userOwnedPrereq = { ...prereqTask, id: 3, user_id: 999 }; // Owned by another user
+        mockStmt.get.mockReturnValueOnce(mockTask1); // Main task accessible (owned by user 1)
+        mockStmt.all.mockReturnValueOnce([publicPrereq, userOwnedPrereq]);
+
+        const tasks = await taskService.getTaskPrerequisites(taskId, null); // requestingUserId is null
+        // Service logic internally filters results if requestingUserId is not null. If null, no post-filter.
+        expect(tasks).toEqual([
+            {...publicPrereq, is_completed: false},
+            {...userOwnedPrereq, is_completed: false}
+        ]);
+        expect(mockStmt.get).toHaveBeenCalledWith(taskId); // Main task check, when requestingUserId is null for getTaskById
+      });
+
+      it('should return empty array if main task not found or not accessible', async () => {
+        mockStmt.get.mockReturnValueOnce(null); // Main task not found/accessible
+        const tasks = await taskService.getTaskPrerequisites(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+        expect(mockStmt.all).not.toHaveBeenCalled(); // Should not attempt to get prerequisites
+      });
+
+      it('should return empty array if no prerequisites found', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockReturnValueOnce([]); // No prerequisites
+        const tasks = await taskService.getTaskPrerequisites(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+      });
+
+      it('should return empty array if DB error on fetching prerequisites', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockImplementationOnce(() => { throw new Error("DB Error"); });
+        const tasks = await taskService.getTaskPrerequisites(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+      });
+    });
+
+    describe('getTasksBlockedBy', () => {
+      const blockedTask = { ...mockTask2, id: dependsOnTaskId, description: 'Blocked Task' };
+
+      it('should retrieve tasks blocked by a task, filtering by user', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockReturnValueOnce([blockedTask]);
+
+        const tasks = await taskService.getTasksBlockedBy(taskId, requestingUserId);
+        expect(tasks).toEqual([{...blockedTask, is_completed: false}]);
+        expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('SELECT t.* FROM tasks t JOIN task_dependencies td ON t.id = td.task_id WHERE td.depends_on_task_id = ?'));
+        expect(mockStmt.all).toHaveBeenCalledWith(taskId);
+        expect(mockStmt.get).toHaveBeenCalledWith(taskId, requestingUserId); // Main task accessibility check
+      });
+
+      it('should retrieve all blocked tasks if requestingUserId is null (after main task check)', async () => {
+        const publicBlocked = { ...blockedTask, user_id: null };
+        const userOwnedBlocked = { ...blockedTask, id: 3, user_id: 999 };
+        mockStmt.get.mockReturnValueOnce(mockTask1); // Main task accessible
+        mockStmt.all.mockReturnValueOnce([publicBlocked, userOwnedBlocked]);
+
+        const tasks = await taskService.getTasksBlockedBy(taskId, null); // requestingUserId is null
+        expect(tasks).toEqual([
+            {...publicBlocked, is_completed: false},
+            {...userOwnedBlocked, is_completed: false}
+        ]);
+        expect(mockStmt.get).toHaveBeenCalledWith(taskId); // Main task check, when requestingUserId is null for getTaskById
+      });
+
+      it('should return empty array if main task not found or not accessible for blockedBy', async () => {
+        mockStmt.get.mockReturnValueOnce(null);
+        const tasks = await taskService.getTasksBlockedBy(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+        expect(mockStmt.all).not.toHaveBeenCalled();
+      });
+
+      it('should return empty array if no tasks are blocked', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockReturnValueOnce([]);
+        const tasks = await taskService.getTasksBlockedBy(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+      });
+
+      it('should return empty array if DB error on fetching blocked tasks', async () => {
+        mockStmt.get.mockReturnValueOnce(mockTask1);
+        mockStmt.all.mockImplementationOnce(() => { throw new Error("DB Error"); });
+        const tasks = await taskService.getTasksBlockedBy(taskId, requestingUserId);
+        expect(tasks).toEqual([]);
+      });
+    });
+  });
+
   describe('getTasksForNote', () => {
     const noteId = 1;
     const requestingUserId = 1;
@@ -614,3 +855,4 @@ describe('Task Service', () => {
   //      ... and so on
 
 });
+// [end of src/backend/services/taskService.test.js] // This was the erroneously added line
