@@ -374,8 +374,8 @@ async function createVoiceNote(fileDetails, { title, folder_id = null, workspace
     const noteContent = JSON.stringify({ attachmentId: attachmentId });
     const noteTitle = title || attachmentResult.attachment.original_filename || `Voice Note ${new Date().toISOString().substring(0,10)}`;
 
-    // createNote is synchronous and returns newNoteId or null
-    const newNoteId = createNote({
+    // createNote is an async function, so it should be awaited.
+    const newNoteId = await createNote({
       type: 'voice', // Assuming 'voice' is a valid type to be added to CHECK constraint in notes table
       title: noteTitle,
       content: noteContent,
