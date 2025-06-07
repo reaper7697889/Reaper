@@ -222,7 +222,27 @@ function initializeDatabase() {
   `);
 
   // --- Smart Rules Table ---
-  db.exec(`CREATE TABLE IF NOT EXISTS smart_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, target_database_id INTEGER NOT NULL, trigger_type TEXT NOT NULL CHECK(trigger_type IN ('ON_ROW_UPDATE')), trigger_config TEXT, condition_formula TEXT, action_type TEXT NOT NULL CHECK(action_type IN ('UPDATE_SAME_ROW')), action_config TEXT NOT NULL, is_enabled BOOLEAN NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (target_database_id) REFERENCES note_databases(id) ON DELETE CASCADE);`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS smart_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        target_database_id INTEGER NOT NULL,
+        trigger_type TEXT NOT NULL CHECK(trigger_type IN ('ON_ROW_UPDATE', 'TIME_BASED_SCHEDULE', 'TIME_BASED_INTERVAL')),
+        trigger_config TEXT,
+        condition_formula TEXT,
+        action_type TEXT NOT NULL CHECK(action_type IN ('UPDATE_SAME_ROW')),
+        action_config TEXT NOT NULL,
+        is_enabled BOOLEAN NOT NULL DEFAULT 1,
+        schedule_cron TEXT DEFAULT NULL,
+        schedule_interval_seconds INTEGER DEFAULT NULL,
+        last_triggered_at DATETIME DEFAULT NULL,
+        timezone TEXT DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (target_database_id) REFERENCES note_databases(id) ON DELETE CASCADE
+    );
+  `);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trigger_smart_rules_updated_at AFTER UPDATE ON smart_rules FOR EACH ROW BEGIN UPDATE smart_rules SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; END;`);
 
   // --- History Tables ---
@@ -350,10 +370,26 @@ function initializeDatabase() {
         original_filename TEXT,
         version_number INTEGER NOT NULL,
         user_id INTEGER, -- User who uploaded this specific version
+        extracted_metadata TEXT DEFAULT NULL, -- Stores JSON strings of any extracted metadata
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
         UNIQUE (attachment_id, version_number)
+    );
+  `);
+
+  // --- Entity Attachment Links Table ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entity_attachment_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attachment_id INTEGER NOT NULL,
+        entity_type TEXT NOT NULL CHECK (entity_type IN ('note', 'database_row')),
+        entity_id INTEGER NOT NULL,
+        user_id INTEGER, -- User who created the link
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+        UNIQUE (attachment_id, entity_type, entity_id)
     );
   `);
 

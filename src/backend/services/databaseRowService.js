@@ -454,18 +454,25 @@ async function updateRow({ rowId, values, recurrence_rule, _triggerDepth = 0, re
         }
         if (Array.isArray(rawValue)) {
           rawValue.forEach((targetRowId, index) => {
-            if (typeof targetRowId !== 'number') throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}.`);
-
-            // --- BEGIN VALIDATION (copied and adapted from addRow) ---
-            if (colDef.relation_target_entity_type === 'NOTES_TABLE') {
-              const targetNote = db.prepare("SELECT id FROM notes WHERE id = ?").get(targetRowId);
-              if (!targetNote) throw new Error(`Target note ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
-            } else { // NOTE_DATABASES
-              const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ?").get(targetRowId);
-              if (!targetRow) throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist.`);
-              if (targetRow.database_id !== colDef.linked_database_id) throw new Error(`Target row ID ${targetRowId} does not belong to linked DB ${colDef.linked_database_id}.`);
+            // Validate targetRowId before inserting link
+            if (typeof targetRowId !== 'number') {
+                throw new Error(`Invalid targetRowId ${targetRowId} for RELATION column ${colDef.name}. Must be a number.`);
             }
-            // --- END VALIDATION ---
+            if (colDef.relation_target_entity_type === 'NOTES_TABLE') {
+                const targetNote = db.prepare("SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL").get(targetRowId); // Ensure not deleted
+                if (!targetNote) {
+                    throw new Error(`Target note ID ${targetRowId} for RELATION column ${colDef.name} does not exist or is deleted.`);
+                }
+            } else { // NOTE_DATABASES
+                const targetRow = db.prepare("SELECT database_id FROM database_rows WHERE id = ? AND deleted_at IS NULL").get(targetRowId); // Ensure not deleted
+                if (!targetRow) {
+                    throw new Error(`Target row ID ${targetRowId} for RELATION column ${colDef.name} does not exist or is deleted.`);
+                }
+                if (targetRow.database_id !== colDef.linked_database_id) {
+                    throw new Error(`Target row ID ${targetRowId} does not belong to the linked database ${colDef.linked_database_id}.`);
+                }
+            }
+            // End validation
 
             linkInsertStmt.run(rowId, columnId, targetRowId, index);
             if (colDef.inverse_column_id !== null && colDef.relation_target_entity_type === 'NOTE_DATABASES') {

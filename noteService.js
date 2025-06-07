@@ -140,14 +140,29 @@ function updateNote(id, updateData) {
  */
 function deleteNote(id) {
   const db = getDb();
-  // Note: Related data (tags, links, blocks, attachments, tasks) should be handled by CASCADE constraints
-  const stmt = db.prepare("DELETE FROM notes WHERE id = ?");
+  // Note: Related data (tags, links, blocks, tasks) should be handled by CASCADE constraints.
+  // Attachments are now handled by entity_attachment_links, so explicit deletion is needed here.
+
+  db.prepare("BEGIN").run(); // Start transaction
+
   try {
-    const info = stmt.run(id);
+    // Step 1: Delete links from entity_attachment_links
+    const deleteLinksStmt = db.prepare("DELETE FROM entity_attachment_links WHERE entity_type = 'note' AND entity_id = ?");
+    deleteLinksStmt.run(id);
+    console.log(`Deleted attachment links for note ${id}.`);
+
+    // Step 2: Delete the note itself
+    const deleteNoteStmt = db.prepare("DELETE FROM notes WHERE id = ?");
+    const info = deleteNoteStmt.run(id);
+
+    db.prepare("COMMIT").run(); // Commit transaction
+
     console.log(`Deleted note ${id}. Rows affected: ${info.changes}`);
     return info.changes > 0;
+
   } catch (err) {
     console.error(`Error deleting note ${id}:`, err.message);
+    db.prepare("ROLLBACK").run(); // Rollback transaction on error
     return false;
   }
 }
