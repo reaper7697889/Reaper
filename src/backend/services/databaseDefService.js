@@ -2,6 +2,8 @@
 const { getDb } = require("../db");
 const authService = require('./authService'); // Added for RBAC
 
+const SYSTEM_USER_ID = 0; // Define SYSTEM_USER_ID
+
 const ALLOWED_COLUMN_TYPES = ['TEXT', 'NUMBER', 'DATE', 'DATETIME', 'BOOLEAN', 'SELECT', 'MULTI_SELECT', 'RELATION', 'FORMULA', 'ROLLUP', 'LOOKUP'];
 const ALLOWED_ROLLUP_FUNCTIONS = [
     'COUNT_ALL', 'COUNT_VALUES', 'COUNT_UNIQUE_VALUES',
@@ -113,10 +115,13 @@ function getDatabaseById(databaseId, requestingUserId = null) {
   let query = "SELECT id, note_id, name, is_calendar, user_id, created_at, updated_at, event_start_column_id, event_end_column_id FROM note_databases WHERE id = ?";
   const params = [databaseId];
 
-  if (requestingUserId !== null) {
-    query += " AND (user_id = ? OR user_id IS NULL)";
+  // Apply user filtering only if requestingUserId is not the system user and not null
+  if (requestingUserId !== SYSTEM_USER_ID && requestingUserId !== null) {
+    query += " AND (user_id = ? OR user_id IS NULL)"; // Standard user can see their own DBs or public ones
     params.push(requestingUserId);
   }
+  // If requestingUserId === SYSTEM_USER_ID, no additional user_id filter is added, so it fetches by id only.
+  // If requestingUserId === null (e.g. internal unfiltered call), also no additional user_id filter.
 
   try {
     const row = db.prepare(query).get(...params);
@@ -399,7 +404,7 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
     if (type === 'DATETIME' && finalValues.defaultValue === "NOW()") finalValues.defaultValue = new Date().toISOString(); // Example default handling
   }
 
-  const runTransaction = db.transaction(() => {
+  const runTransaction = db.transaction(async () => { // Changed to async to allow await inside
     const colAStmt = db.prepare( `INSERT INTO database_columns ( database_id, name, type, column_order, default_value, select_options, linked_database_id, relation_target_entity_type, inverse_column_id, formula_definition, formula_result_type, rollup_source_relation_column_id, rollup_target_column_id, rollup_function, lookup_source_relation_column_id, lookup_target_value_column_id, lookup_multiple_behavior, validation_rules ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)` );
     const colAInfo = colAStmt.run( databaseId, trimmedName, type, columnOrder, finalValues.defaultValue, finalValues.selectOptions, finalValues.linkedDatabaseId, finalValues.relationTargetEntityType, finalValues.formulaDefinition, finalValues.formulaResultType, finalValues.rollupSourceRelId, finalValues.rollupTargetId, finalValues.rollupFunction, finalValues.lookupSourceRelId, finalValues.lookupTargetValId, finalValues.lookupMultiBehavior, finalValues.validationRules );
     const colAId = colAInfo.lastInsertRowid;
@@ -416,6 +421,29 @@ function addColumn(args, requestingUserId) { // Added requestingUserId
         db.prepare("UPDATE database_columns SET inverse_column_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(colAId, colBId);
       } else {
         // Create new inverse column (colB)
+        // Permission check for target database schema modification
+        const targetDb = await getDatabaseById(finalValues.linkedDatabaseId, null); // Unfiltered fetch
+        if (!targetDb) {
+            throw new Error(`Target database ${finalValues.linkedDatabaseId} for inverse column not found.`);
+        }
+
+        const isTargetOwner = targetDb.user_id === requestingUserId;
+        const isAdminForTarget = await authService.checkUserRole(requestingUserId, 'ADMIN');
+        let canModifyTargetSchema = isTargetOwner;
+
+        if (!isTargetOwner && targetDb.user_id !== null) { // Not owner and target DB is not public
+            if (isAdminForTarget) canModifyTargetSchema = true;
+        } else if (targetDb.user_id === null) { // Public target DB
+            if (!isAdminForTarget) {
+                throw new Error("Authorization failed: Only ADMIN can create inverse columns in a public target database implicitly.");
+            }
+            canModifyTargetSchema = true;
+        }
+
+        if (!canModifyTargetSchema) {
+            throw new Error(`User ${requestingUserId} is not authorized to create an inverse column in target database ${finalValues.linkedDatabaseId}.`);
+        }
+
         const colBName = targetInverseColumnName || `${trimmedName}_inverse_of_${parentDb.name}`.slice(0, 255); // Ensure name is reasonable
         const colBOrder = db.prepare("SELECT COUNT(*) as count FROM database_columns WHERE database_id = ?").get(finalValues.linkedDatabaseId).count + 1;
 
@@ -530,7 +558,7 @@ function updateColumn(args, requestingUserId) { // Added requestingUserId
 
     // Apply settings based on finalType
     if (finalState.type === 'RELATION') {
-        if (!ALLOWED_RATION_TARGET_ENTITY_TYPES.includes(finalState.relation_target_entity_type)) throw new Error(`Invalid relation_target_entity_type: ${finalState.relation_target_entity_type}`);
+        if (!ALLOWED_RELATION_TARGET_ENTITY_TYPES.includes(finalState.relation_target_entity_type)) throw new Error(`Invalid relation_target_entity_type: ${finalState.relation_target_entity_type}`);
         fieldsToSet.set("relation_target_entity_type", finalState.relation_target_entity_type);
         if (finalState.relation_target_entity_type === 'NOTE_DATABASES') {
             if (finalState.linked_database_id === null || finalState.linked_database_id === undefined) throw new Error("linkedDatabaseId required for RELATION to NOTE_DATABASES.");

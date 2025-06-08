@@ -233,6 +233,17 @@ async function updateTimeLog(logId, updates, requestingUserId) {
         // Validate access to the target entity of the log
         await _validateTarget(currentLog.log_target_type, currentLog.log_target_id, requestingUserId, "updateTimeLog (target check)");
 
+        // Ownership check for the log itself
+        if (currentLog.user_id !== requestingUserId) {
+            // Optional: Allow ADMINs to modify any log
+            // const authService = require('./authService'); // Import if using ADMIN override
+            // const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+            // if (!isAdmin) {
+            //     throw new Error("Authorization failed: You do not own this time log and are not an ADMIN.");
+            // }
+            throw new Error("Authorization failed: You do not own this time log.");
+        }
+
         // If timer is active, only description can be updated, or it must be stopped first.
         if (currentLog.end_time === null && (updates.startTimeStr || updates.endTimeStr || updates.durationSeconds !== undefined)) {
             throw new Error("Cannot modify times/duration of an active timer. Stop the timer first or update only description.");
@@ -311,6 +322,17 @@ async function deleteTimeLog(logId, requestingUserId) {
 
         await _validateTarget(currentLog.log_target_type, currentLog.log_target_id, requestingUserId, "deleteTimeLog (target check)");
 
+        // Ownership check for the log itself
+        if (currentLog.user_id !== requestingUserId) {
+            // Optional: Allow ADMINs to modify any log
+            // const authService = require('./authService'); // Import if using ADMIN override
+            // const isAdmin = await authService.checkUserRole(requestingUserId, 'ADMIN');
+            // if (!isAdmin) {
+            //     throw new Error("Authorization failed: You do not own this time log and are not an ADMIN.");
+            // }
+            throw new Error("Authorization failed: You do not own this time log.");
+        }
+
         const stmt = db.prepare("DELETE FROM time_logs WHERE id = ?");
         const info = stmt.run(logId);
         if (info.changes === 0) {
@@ -333,7 +355,7 @@ async function deleteTimeLog(logId, requestingUserId) {
  * @param {number} targetId
  * @param {object} [options={}] - { dateRangeStartStr?, dateRangeEndStr?, limit=50, offset=0 }
  * @param {number | null} requestingUserId - ID of the user making the request.
- * @returns {Promise<Array<object>>} - Array of time log objects.
+ * @returns {Promise<object>} - { success: boolean, logs?: Array<object>, error?: string }
  */
 async function getLogsForTarget(targetType, targetId, { dateRangeStartStr, dateRangeEndStr, limit = 50, offset = 0 } = {}, requestingUserId) {
   const db = getDb();
@@ -354,10 +376,11 @@ async function getLogsForTarget(targetType, targetId, { dateRangeStartStr, dateR
     sql += " ORDER BY start_time DESC LIMIT ? OFFSET ?";
     params.push(limit, offset);
 
-    return db.prepare(sql).all(...params);
+    const logs = db.prepare(sql).all(...params);
+    return { success: true, logs };
   } catch (err) {
     console.error(`Error getting logs for ${targetType} ${targetId} (user ${requestingUserId}):`, err.message);
-    return [];
+    return { success: false, error: err.message || "Failed to retrieve logs."};
   }
 }
 
@@ -413,8 +436,8 @@ async function getTimeLogsForUser(targetUserId, { dateRangeStartStr, dateRangeEn
     const rows = db.prepare(sql).all(...params);
     // Return rows directly as the function is expected to return an array of time log objects,
     // not a { success: true, data: rows } wrapper, unless specified.
-    // The prompt asks for "Return an array of time log objects."
-    return rows;
+// The prompt asks for "Return an array of time log objects." -> Changed to consistent object return.
+    return { success: true, logs: rows };
 
   } catch (err) {
     console.error(`Error getting time logs for user ${targetUserId} (requested by ${requestingUserId}):`, err.message, err.stack);

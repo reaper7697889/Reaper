@@ -6,6 +6,7 @@ const linkService = require('./linkService');
 const tagService = require('./tagService');
 const databaseDefService = require('./databaseDefService');
 const databaseRowService = require('./databaseRowService');
+const permissionService = require('./permissionService'); // Added for permission checks
 
 // --- Helper Functions ---
 
@@ -46,10 +47,14 @@ function _parseCsvRow(rowString) {
  * @param {string} markdownContent
  * @param {string} titleHint - Fallback title if not found in H1.
  * @param {number|null} targetFolderId - Optional folder ID to import into.
+ * @param {number|null} requestingUserId - The ID of the user performing the import.
  * @returns {Promise<object>} - { success, note?: object, error?: string }
  */
-async function importMarkdownNoteFromString(markdownContent, titleHint, targetFolderId = null) {
+async function importMarkdownNoteFromString(markdownContent, titleHint, targetFolderId = null, requestingUserId = null) {
   try {
+    if (!requestingUserId) {
+        return { success: false, error: "User context is required to import this note." };
+    }
     if (typeof markdownContent !== 'string') {
       return { success: false, error: "Markdown content must be a string." };
     }
@@ -65,19 +70,14 @@ async function importMarkdownNoteFromString(markdownContent, titleHint, targetFo
       title: title,
       content: markdownContent,
       folder_id: targetFolderId,
+      userId: requestingUserId // Pass requestingUserId as userId
     });
 
-    // createNote in noteService now returns newNoteId directly, or null.
-    // It doesn't return an object like { success, note }.
-    // We need to adapt to how noteService.createNote works.
-    // Let's assume it returns the newNoteId or throws/returns null on error.
-    // For this example, I'll assume it returns the ID or null.
-    // A more robust createNote would return a structured object or throw.
-
-    if (createResult) { // Assuming createResult is the newNoteId
+    if (createResult) {
       const newNoteId = createResult;
       await linkService.updateLinksFromContent(newNoteId, markdownContent);
-      const newNote = await noteService.getNoteById(newNoteId); // Fetch the full note
+      // Pass requestingUserId when fetching the note back
+      const newNote = await noteService.getNoteById(newNoteId, requestingUserId);
       return { success: true, note: newNote };
     } else {
       return { success: false, error: "Failed to create note in database." };
@@ -92,9 +92,13 @@ async function importMarkdownNoteFromString(markdownContent, titleHint, targetFo
  * Imports notes from a JSON string.
  * @param {string} jsonString
  * @param {number|null} defaultFolderId - Optional default folder ID if not in note object.
+ * @param {number|null} requestingUserId - The ID of the user performing the import.
  * @returns {Promise<object>} - { overallSuccess, results: Array<{title, success, error?}> }
  */
-async function importJsonNotesFromString(jsonString, defaultFolderId = null) {
+async function importJsonNotesFromString(jsonString, defaultFolderId = null, requestingUserId = null) {
+  if (!requestingUserId) {
+    return { overallSuccess: false, error: "User context is required to import notes.", results: [] };
+  }
   let notesToImport;
   try {
     notesToImport = JSON.parse(jsonString);
@@ -121,10 +125,13 @@ async function importJsonNotesFromString(jsonString, defaultFolderId = null) {
         title: noteObject.title,
         content: noteObject.content,
         folder_id: folder_id,
+        userId: requestingUserId // Pass requestingUserId as userId
         // other fields like is_pinned, workspace_id could be added if present in noteObject
       });
 
       if (createdNoteId) {
+        // Assuming tagService and linkService either don't need explicit user context
+        // or will be updated separately. For now, calls remain as is.
         if (noteObject.tags && Array.isArray(noteObject.tags)) {
           for (const tagName of noteObject.tags) {
             if (typeof tagName === 'string') {
@@ -158,14 +165,29 @@ async function importJsonNotesFromString(jsonString, defaultFolderId = null) {
  * @param {string} csvString
  * @param {object} columnMapping - Optional: { "Target Column Name": "CSV Header Name" or csv_column_index }
  * @param {object} options - Optional: { skipHeader: true }
+ * @param {number|null} requestingUserId - The ID of the user performing the import.
  * @returns {Promise<object>} - { successCount, errorCount, errors: Array<{rowNumber, error}> }
  */
-async function importCsvToTableFromString(databaseId, csvString, columnMapping = {}, options = { skipHeader: true }) {
+async function importCsvToTableFromString(databaseId, csvString, columnMapping = {}, options = { skipHeader: true }, requestingUserId = null) {
   const results = { successCount: 0, errorCount: 0, errors: [] };
+
+  if (!requestingUserId) {
+    results.errors.push({ rowNumber: 0, error: "User context is required to import to table." });
+    results.errorCount = csvString.split(/\r?\n/).filter(line => line.trim() !== '').length - (options.skipHeader ? 1 : 0) || 1;
+    return results;
+  }
+
   try {
-    const targetColumns = await databaseDefService.getColumnsForDatabase(databaseId);
+    const permCheck = await permissionService.checkUserDatabasePermission(databaseId, requestingUserId, 'WRITE');
+    if (!permCheck.V) {
+        results.errors.push({ rowNumber: 0, error: "Authorization failed: Insufficient permissions to import rows to this database." });
+        results.errorCount = csvString.split(/\r?\n/).filter(line => line.trim() !== '').length - (options.skipHeader ? 1 : 0) || 1;
+        return results;
+    }
+
+    const targetColumns = await databaseDefService.getColumnsForDatabase(databaseId, requestingUserId); // Pass requestingUserId
     if (!targetColumns || targetColumns.length === 0) {
-      results.errors.push({ rowNumber: 0, error: "Target database has no columns defined." });
+      results.errors.push({ rowNumber: 0, error: "Target database has no columns defined or accessible." });
       results.errorCount = 1;
       return results;
     }
@@ -248,7 +270,7 @@ async function importCsvToTableFromString(databaseId, csvString, columnMapping =
 
       if (!rowHasError && Object.keys(rowDataForDb).length > 0) {
         try {
-          const addResult = await databaseRowService.addRow({ databaseId, values: rowDataForDb });
+          const addResult = await databaseRowService.addRow({ databaseId, values: rowDataForDb, requestingUserId }); // Pass requestingUserId
           if (addResult.success) {
             results.successCount++;
           } else {

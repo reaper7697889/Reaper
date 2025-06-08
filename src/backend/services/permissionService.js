@@ -1,6 +1,7 @@
 // src/backend/services/permissionService.js
 const { getDb } = require('../db');
 const noteService = require('./noteService');
+const SYSTEM_USER_ID = 0; // Define SYSTEM_USER_ID
 const userService = require('./userService');
 const authService = require('./authService'); // Added for RBAC
 const databaseDefService = require('./databaseDefService'); // For DB details
@@ -190,6 +191,9 @@ async function getPermissionsForNote(noteId, requestingUserId) {
 async function checkUserNotePermission(noteId, checkUserId, requiredPermissionLevel) {
   const db = getDb();
   try {
+    if (checkUserId === SYSTEM_USER_ID) {
+        return { V: true, level: 'SYSTEM' };
+    }
     if (!noteId || !checkUserId || !requiredPermissionLevel) {
       // console.warn("checkUserNotePermission called with missing parameters.");
       return { V: false, error: "Missing parameters for permission check." };
@@ -376,6 +380,9 @@ async function getPermissionsForDatabase(databaseId, requestingUserId) {
 async function checkUserDatabasePermission(databaseId, checkUserId, requiredPermissionLevel) {
   const db = getDb();
   try {
+    if (checkUserId === SYSTEM_USER_ID) {
+        return { V: true, level: 'SYSTEM' };
+    }
     if (!databaseId || !checkUserId || !requiredPermissionLevel) {
       return { V: false, error: "Missing parameters for database permission check." };
     }

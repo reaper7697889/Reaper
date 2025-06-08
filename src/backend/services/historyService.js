@@ -3,6 +3,10 @@ const { getDb } = require("../db");
 const noteService = require('./noteService');
 const databaseRowService = require('./databaseRowService');
 
+// In-memory storage for redo capability
+let lastUndoneNoteVersion = {}; // { noteId_userId: versionNumberToRestore }
+let lastUndoneRowVersion = {};   // { rowId_userId: versionNumberToRestore }
+
 // --- Internal Helper Functions ---
 
 function _parseJsonString(jsonString, fieldName, defaultValue = null) {
@@ -262,8 +266,28 @@ module.exports = {
   revertNoteToVersion,
   revertRowToVersion,
   undoLastChangeForRow,
-  undoLastChangeForNote, // Export the new function
+  undoLastChangeForNote,
+  redoLastChangeForNote, // Export new function
+  redoLastChangeForRow,  // Export new function
 };
+
+// Function to clear redo state, could be called by other services upon direct modification
+function clearRedoStateForNote(noteId, requestingUserId) {
+    const redoKey = `${noteId}_${requestingUserId}`;
+    if (lastUndoneNoteVersion[redoKey]) {
+        delete lastUndoneNoteVersion[redoKey];
+        // console.log(`Redo state cleared for note ${noteId}, user ${requestingUserId}`);
+    }
+}
+
+function clearRedoStateForRow(rowId, requestingUserId) {
+    const redoKey = `${rowId}_${requestingUserId}`;
+    if (lastUndoneRowVersion[redoKey]) {
+        delete lastUndoneRowVersion[redoKey];
+        // console.log(`Redo state cleared for row ${rowId}, user ${requestingUserId}`);
+    }
+}
+
 
 async function undoLastChangeForNote(noteId, requestingUserId) {
   if (noteId === null || noteId === undefined) {
@@ -293,17 +317,34 @@ async function undoLastChangeForNote(noteId, requestingUserId) {
     }
 
     // historyEntries[0] is the current state (latest version recorded).
+    // This is the version the user might want to "redo" back to.
+    const versionToStoreForRedo = historyEntries[0].version_number;
+
     // historyEntries[1] is the state *before* the last change was made (i.e., the state we want to revert to).
-    // So, we need to revert to version_number of historyEntries[1].
     const versionToRevertTo = historyEntries[1].version_number;
 
     if (versionToRevertTo === null || versionToRevertTo === undefined) {
       console.error(`undoLastChangeForNote: Version number to revert to is undefined for note ${noteId}. History entry:`, historyEntries[1]);
       return { success: false, error: "Could not determine the version number to revert to for the note." };
     }
+    if (versionToStoreForRedo === null || versionToStoreForRedo === undefined) {
+      console.error(`undoLastChangeForNote: Version number to store for redo is undefined for note ${noteId}. History entry:`, historyEntries[0]);
+      // Decide if this is fatal. Usually, if [0] is bad, [1] might also be an issue or non-existent.
+    }
+
 
     // Call revertNoteToVersion with the identified version number.
-    return await revertNoteToVersion(noteId, versionToRevertTo, requestingUserId);
+    const revertResult = await revertNoteToVersion(noteId, versionToRevertTo, requestingUserId);
+
+    if (revertResult.success) {
+        // Store the version of the state *before* this undo action for potential redo
+        if (versionToStoreForRedo !== null && versionToStoreForRedo !== undefined) {
+            const redoKey = `${noteId}_${requestingUserId}`;
+            lastUndoneNoteVersion[redoKey] = versionToStoreForRedo;
+            console.log(`Undo successful for note ${noteId}. Stored version ${versionToStoreForRedo} for redo.`);
+        }
+    }
+    return revertResult;
 
   } catch (err) {
     console.error(`Error in undoLastChangeForNote for note ${noteId} (user ${requestingUserId}):`, err.message, err.stack);
@@ -348,21 +389,86 @@ async function undoLastChangeForRow(rowId, requestingUserId) {
       return { success: false, message: "No previous version available to undo to for this row." };
     }
 
-    // history[0] is the current state (latest version recorded).
+    // history[0] is the current state (latest version recorded). This is what we'd "redo" to.
+    const versionToStoreForRedo = history[0].version_number;
+
     // history[1] is the state *before* the last change was made (i.e., the state we want to revert to).
-    // So, we need to revert to version_number of history[1].
     const versionToRevertTo = history[1].version_number;
 
     if (versionToRevertTo === null || versionToRevertTo === undefined) {
         console.error(`undoLastChangeForRow: Version number to revert to is undefined for row ${rowId}. History entry:`, history[1]);
         return { success: false, error: "Could not determine the version number to revert to." };
     }
+    if (versionToStoreForRedo === null || versionToStoreForRedo === undefined) {
+      console.error(`undoLastChangeForRow: Version number to store for redo is undefined for row ${rowId}. History entry:`, history[0]);
+    }
 
     // Call revertRowToVersion with the identified version number.
-    return await revertRowToVersion(rowId, versionToRevertTo, requestingUserId);
+    const revertResult = await revertRowToVersion(rowId, versionToRevertTo, requestingUserId);
+
+    if (revertResult.success) {
+        if (versionToStoreForRedo !== null && versionToStoreForRedo !== undefined) {
+            const redoKey = `${rowId}_${requestingUserId}`;
+            lastUndoneRowVersion[redoKey] = versionToStoreForRedo;
+            console.log(`Undo successful for row ${rowId}. Stored version ${versionToStoreForRedo} for redo.`);
+        }
+    }
+    return revertResult;
 
   } catch (err) {
     console.error(`Error in undoLastChangeForRow for row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
     return { success: false, error: err.message || "Failed to undo last change for row." };
+  }
+}
+
+// --- Redo Functions ---
+async function redoLastChangeForNote(noteId, requestingUserId) {
+  const redoKey = `${noteId}_${requestingUserId}`;
+  const versionToRestoreTo = lastUndoneNoteVersion[redoKey];
+
+  if (versionToRestoreTo === undefined || versionToRestoreTo === null) {
+    return { success: false, message: "No redo action available for this note." };
+  }
+
+  try {
+    // Attempt to revert to the stored "undone" version
+    const revertResult = await revertNoteToVersion(noteId, versionToRestoreTo, requestingUserId);
+
+    if (revertResult.success) {
+      // Clear the redo state for this note and user as it has been consumed
+      clearRedoStateForNote(noteId, requestingUserId);
+      console.log(`Redo successful for note ${noteId}. Restored to version ${versionToRestoreTo}.`);
+    } else {
+      console.error(`Redo failed for note ${noteId}. Attempted to restore version ${versionToRestoreTo}. Error: ${revertResult.error}`);
+    }
+    return revertResult;
+
+  } catch (err) {
+    console.error(`Error in redoLastChangeForNote for note ${noteId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to redo last change for note." };
+  }
+}
+
+async function redoLastChangeForRow(rowId, requestingUserId) {
+  const redoKey = `${rowId}_${requestingUserId}`;
+  const versionToRestoreTo = lastUndoneRowVersion[redoKey];
+
+  if (versionToRestoreTo === undefined || versionToRestoreTo === null) {
+    return { success: false, message: "No redo action available for this row." };
+  }
+
+  try {
+    const revertResult = await revertRowToVersion(rowId, versionToRestoreTo, requestingUserId);
+
+    if (revertResult.success) {
+      clearRedoStateForRow(rowId, requestingUserId);
+      console.log(`Redo successful for row ${rowId}. Restored to version ${versionToRestoreTo}.`);
+    } else {
+      console.error(`Redo failed for row ${rowId}. Attempted to restore version ${versionToRestoreTo}. Error: ${revertResult.error}`);
+    }
+    return revertResult;
+  } catch (err) {
+    console.error(`Error in redoLastChangeForRow for row ${rowId} (user ${requestingUserId}):`, err.message, err.stack);
+    return { success: false, error: err.message || "Failed to redo last change for row." };
   }
 }

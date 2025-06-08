@@ -44,50 +44,62 @@ function _csvEscape(value) {
  * Prepares data for exporting a single note.
  * @param {number} noteId
  * @param {string} format - 'json' or 'markdown'
+ * @param {number|null} requestingUserId - The ID of the user performing the export.
  * @returns {Promise<object|null>} - { filename, data } or null on error/not found.
  */
-async function getNoteExportData(noteId, format = 'json') {
+async function getNoteExportData(noteId, format = 'json', requestingUserId = null) {
   try {
-    const note = await noteService.getNoteById(noteId); // Assuming getNoteById is async or can be awaited
+    if (!requestingUserId) {
+        return { success: false, error: "User context is required to export note data." };
+    }
+    const note = await noteService.getNoteById(noteId, requestingUserId); // Pass requestingUserId
     if (!note) {
-      return null;
+      // noteService.getNoteById should ideally return error or null if not accessible/found
+      return { success: false, error: "Note not found or not accessible." };
     }
 
     const safeTitle = (note.title || `note_${noteId}`).replace(/[^a-z0-9]/gi, '_').substring(0, 50);
 
     if (format === 'json') {
-      const tags = await tagService.getTagsForNote(noteId);
-      const outgoingLinks = await linkService.getOutgoingLinks(noteId);
-      const backlinks = await linkService.getBacklinks(noteId);
-      // Assuming these services exist and return arrays of objects:
-      const tasks = await taskService.getTasksForNote ? await taskService.getTasksForNote(noteId) : [];
-      const attachments = await attachmentService.getAttachmentsForNote ? await attachmentService.getAttachmentsForNote(noteId) : [];
+      // Pass requestingUserId to related services if they support/require it
+      const tags = await tagService.getTagsForNote(noteId); // Assuming tagService might not need userId if note access is confirmed
+      const outgoingLinks = await linkService.getOutgoingLinks(noteId); // Same assumption
+      const backlinks = await linkService.getBacklinks(noteId); // Same assumption
+      const tasks = await taskService.getTasksForNote ? await taskService.getTasksForNote(noteId, requestingUserId) : []; // Assuming taskService may need it
+      // Use getAttachmentsForEntity for the new system
+      const attachmentsResult = await attachmentService.getAttachmentsForEntity('note', noteId, requestingUserId);
+      const attachments = attachmentsResult.success ? attachmentsResult.attachments : [];
+
 
       const noteJsonObject = {
         ...note,
-        tags: tags.map(t => t.name), // Assuming tags are objects with a 'name' property
+        tags: tags.map(t => t.name),
         outgoingLinks,
         backlinks,
         tasks,
         attachments,
       };
       return {
+        success: true, // Added success flag
         filename: `note_${noteId}_${safeTitle}.json`,
-        data: JSON.stringify(noteJsonObject, null, 2), // Pretty print JSON
+        data: JSON.stringify(noteJsonObject, null, 2),
       };
     } else if (format === 'markdown') {
       if (note.type === 'markdown') {
         return {
+          success: true, // Added success flag
           filename: `${safeTitle}.md`,
           data: note.content || "",
         };
-      } else if (note.type === 'simple') { // Assuming 'simple' notes contain HTML
+      } else if (note.type === 'simple') {
         return {
+          success: true, // Added success flag
           filename: `${safeTitle}.txt`,
           data: `--- Note Type: Simple (HTML) ---\n\n${note.content || ""}`,
         };
-      } else { // Other types like drawing, workspace_page, etc.
+      } else {
         return {
+          success: true, // Added success flag
           filename: `${safeTitle}_${note.type}.txt`,
           data: `--- Note Type: ${note.type} ---\n\nContent for this note type is not directly exportable as Markdown.\nJSON representation:\n${JSON.stringify(note, null, 2)}`,
         };
@@ -103,56 +115,75 @@ async function getNoteExportData(noteId, format = 'json') {
 
 /**
  * Prepares data for exporting a collection of notes.
- * For now, supports all notes, or all notes of a specific type.
  * @param {object} args - { filter = { type: 'markdown', all: true }, format = 'json' }
+ * @param {number|null} requestingUserId - The ID of the user performing the export.
  * @returns {Promise<object|Array<object>|null>}
  */
-async function getNotesCollectionExportData({ filter = {}, format = 'json' } = {}) {
+async function getNotesCollectionExportData({ filter = {}, format = 'json' } = {}, requestingUserId = null) {
   try {
-    // Assumption: noteService.getAllNotes() exists or can be implemented.
-    // For this subtask, if it doesn't exist, this function will be limited.
-    // Let's simulate a placeholder if it's not available from context.
+    if (!requestingUserId) {
+        return { success: false, error: "User context is required to export notes collection." };
+    }
+
+    // Assuming noteService.getAllNotes or a similar permission-aware function exists or will be implemented.
+    // For now, this function will rely on getNoteExportData's permission checks for each note.
     let allNotes = [];
     if (typeof noteService.getAllNotes === 'function') {
-        allNotes = await noteService.getAllNotes();
+        // If getAllNotes is permission-aware, it should accept requestingUserId
+        allNotes = await noteService.getAllNotes({ requestingUserId });
     } else {
-        console.warn("noteService.getAllNotes() is not implemented. Exporting empty collection or sample.");
-        // As a fallback, try to get a few notes if possible, or just return empty.
-        // This part would need actual implementation of getAllNotes or similar.
-        // For now, let's assume it might return an empty array to avoid breaking.
+        console.warn("noteService.getAllNotes() is not implemented or not permission-aware. Export might be incomplete or fail.");
+        // Fallback: if no central way to get all *accessible* notes, this export will be limited
+        // or would need to fetch all IDs and filter one by one, which is inefficient.
+        // For this subtask, we'll assume if getAllNotes is used, it's been adapted.
+        // If it just returns ALL notes, then the permission check in getNoteExportData is crucial.
+         allNotes = await noteService.getAllNotes(); // Simulate if it doesn't take userId yet
     }
 
     let filteredNotes = allNotes;
-    if (filter.noteType && filter.all) {
+    if (filter.noteType && filter.all !== false) { // filter.all might be undefined, default to true if type is given
       filteredNotes = allNotes.filter(note => note.type === filter.noteType);
     } else if (filter.folderId) {
-      // Placeholder: if noteService had getNotesByFolder, it would be used here.
-      // filteredNotes = await noteService.getNotesByFolder(filter.folderId);
-      console.warn(`Filtering by folderId not fully implemented in getNotesCollectionExportData without direct noteService.getNotesByFolder call here.`);
+      // This would need a permission-aware noteService.getNotesByFolder(folderId, requestingUserId)
+      // filteredNotes = await noteService.getNotesByFolder(filter.folderId, requestingUserId);
+      console.warn(`Filtering by folderId in getNotesCollectionExportData requires a permission-aware noteService.getNotesByFolder.`);
+      // For now, if folderId is the only filter, we can't reliably apply it without fetching all notes of that folder then checking each.
+      // This part indicates a dependency on noteService enhancements.
+      // To avoid exporting everything if folderId is specified but not handled:
+      if(Object.keys(filter).length === 1 && filter.folderId) { // only folderId filter
+          return {success: false, error: "Filtering by folderId for collection export is not fully supported without specific service update."};
+      }
     }
-    // Add more filters as needed
+    // Further filtering might be needed here based on accessibility if getAllNotes wasn't fully filtered.
 
     if (format === 'json') {
       const allNoteJsonObjects = [];
       for (const note of filteredNotes) {
-        const exportData = await getNoteExportData(note.id, 'json');
-        if (exportData && exportData.data) {
-          allNoteJsonObjects.push(JSON.parse(exportData.data)); // Parse back from string to object
+        // Pass requestingUserId to getNoteExportData for individual permission checks
+        const exportData = await getNoteExportData(note.id, 'json', requestingUserId);
+        if (exportData && exportData.success && exportData.data) {
+          allNoteJsonObjects.push(JSON.parse(exportData.data));
+        } else if (exportData && !exportData.success) {
+            console.warn(`Skipping note ID ${note.id} in collection export due to error/access issue: ${exportData.error}`);
         }
       }
       return {
+        success: true, // Added success flag
         filename: `reaper_notes_export_${Date.now()}.json`,
         data: JSON.stringify(allNoteJsonObjects, null, 2),
       };
     } else if (format === 'markdown') {
       const markdownFiles = [];
       for (const note of filteredNotes) {
-        const exportData = await getNoteExportData(note.id, 'markdown');
-        if (exportData) {
-          markdownFiles.push(exportData);
+        // Pass requestingUserId
+        const exportData = await getNoteExportData(note.id, 'markdown', requestingUserId);
+        if (exportData && exportData.success) { // Check success flag
+          markdownFiles.push({filename: exportData.filename, data: exportData.data});
+        } else if (exportData && !exportData.success) {
+            console.warn(`Skipping note ID ${note.id} in Markdown collection export due to error/access issue: ${exportData.error}`);
         }
       }
-      return markdownFiles; // Array of { filename, data }
+      return markdownFiles; // This is an array of {filename, data}, client needs to handle zipping.
     } else {
       return { success: false, error: `Unsupported export format: ${format}` };
     }
