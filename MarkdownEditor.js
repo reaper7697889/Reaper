@@ -3,6 +3,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize from 'rehype-sanitize';
+import 'katex/dist/katex.min.css'; // KaTeX CSS
+import remarkMath from 'remark-math';   // KaTeX plugins
+import rehypeKatex from 'rehype-katex'; // KaTeX plugins
+import rehypePrismPlus from 'rehype-prism-plus'; // Prism for syntax highlighting
+import ReactPlayer from 'react-player/lazy'; // For video embeds
+import remarkSimpleVideoEmbed from './remark-plugins/remarkSimpleVideoEmbed'; // Custom plugin
 import './MarkdownEditor.css';
 
 const MarkdownEditor = ({
@@ -31,6 +37,30 @@ const MarkdownEditor = ({
   // Toggle between edit-only, preview-only, and split view
   const toggleView = () => {
     setShowPreview(prev => !prev);
+  };
+
+  const customRenderers = {
+    video: ({ node }) => {
+      if (node && node.url) {
+        // Check if URL is valid for ReactPlayer (it's quite broad)
+        if (ReactPlayer.canPlay(node.url)) {
+          return (
+            <div className="embedded-video-wrapper" style={{ position: 'relative', paddingTop: '56.25%' /* 16:9 Aspect Ratio */ }}>
+              <ReactPlayer
+                url={node.url}
+                controls={true}
+                width="100%"
+                height="100%"
+                style={{ position: 'absolute', top: 0, left: 0 }}
+              />
+            </div>
+          );
+        } else {
+          return <p style={{color: 'red'}}>Invalid or unsupported video URL: {node.url}</p>;
+        }
+      }
+      return <p style={{color: 'red'}}>Error embedding video: Invalid node structure.</p>;
+    }
   };
 
   return (
@@ -69,8 +99,9 @@ const MarkdownEditor = ({
         {showPreview && (
           <div className="markdown-preview">
             <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeRaw, rehypeSanitize]}
+              remarkPlugins={[remarkGfm, remarkMath, remarkSimpleVideoEmbed]}
+              rehypePlugins={[rehypeRaw, rehypeSanitize, [rehypePrismPlus, { showLineNumbers: true }], rehypeKatex]}
+              components={customRenderers}
             >
               {content || '*Preview will appear here*'}
             </ReactMarkdown>

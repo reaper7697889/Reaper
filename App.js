@@ -6,6 +6,9 @@ import DrawingEditor from './components/DrawingEditor';
 import VoiceMemoEditor from './components/VoiceMemoEditor';
 import KnowledgeGraph from './components/KnowledgeGraph';
 import './App.css';
+import 'prismjs/plugins/copy-to-clipboard/prism-copy-to-clipboard.js';
+import 'prismjs/plugins/copy-to-clipboard/prism-copy-to-clipboard.css';
+import 'prismjs/plugins/line-numbers/prism-line-numbers.css';
 
 // --- Placeholder Components (Refined) ---
 

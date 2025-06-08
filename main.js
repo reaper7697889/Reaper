@@ -25,6 +25,7 @@ const calendarService = require('./src/backend/services/calendarService');
 const timelineService = require('./src/backend/services/timelineService');
 const timeLogService = require('./src/backend/services/timeLogService');
 const userService = require('./src/backend/services/userService'); // Added userService
+const suggestionService = require('./src/backend/services/suggestionService');
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -50,6 +51,35 @@ ipcMain.handle("db:getNoteById", (e, noteId, requestingUserId) => noteService.ge
 ipcMain.handle("db:createNote", (e, noteData) => noteService.createNote(noteData)); // createNote expects userId in noteData
 ipcMain.handle("db:updateNote", (e, noteId, updateData, requestingUserId) => noteService.updateNote(noteId, updateData, requestingUserId));
 ipcMain.handle("db:deleteNote", (e, noteId, requestingUserId) => noteService.deleteNote(noteId, requestingUserId));
+ipcMain.handle("templates:get", (e, requestingUserId) => noteService.getTemplates({ userId: requestingUserId }));
+ipcMain.handle("note:setTemplateStatus", (e, noteId, isTemplate, requestingUserId) => {
+  return noteService.updateNote(noteId, { is_template: isTemplate }, requestingUserId);
+});
+ipcMain.handle('template:createBlank', async (e, requestingUserId, initialTitle = "Untitled Template") => {
+  if (!requestingUserId) {
+    return { success: false, error: "User ID is required to create a template." };
+  }
+  const noteData = {
+    title: initialTitle,
+    type: 'markdown', // Default to Markdown, or could be a user preference later
+    content: '',       // Blank content
+    is_template: 1,  // Mark as template
+    userId: requestingUserId
+  };
+  try {
+    const newTemplateId = await noteService.createNote(noteData);
+    if (newTemplateId) {
+      // Fetch the full note object to return, as createNote only returns the ID
+      const newTemplate = await noteService.getNoteById(newTemplateId, requestingUserId, { bypassPermissionCheck: false });
+      return { success: true, template: newTemplate };
+    } else {
+      return { success: false, error: "Failed to create blank template note." };
+    }
+  } catch (error) {
+    console.error("Error in template:createBlank IPC handler:", error);
+    return { success: false, error: error.message || "IPC Error: Failed to create blank template." };
+  }
+});
 
 // Tag Service
 ipcMain.handle("db:findOrCreateTag", (e, tagName) => tagService.findOrCreateTag(tagName));
@@ -130,6 +160,21 @@ ipcMain.handle("tasks:getTasksBlockedBy", async (event, taskId, requestingUserId
         console.error("Error in 'tasks:getTasksBlockedBy' IPC handler:", error);
         return { success: false, error: error.message || "Failed to get tasks blocked by." };
     }
+});
+
+// Suggestion Service
+ipcMain.handle("suggestions:getRelatedByTags", async (e, noteId, requestingUserId, limit) => {
+  if (!noteId || !requestingUserId) {
+    console.error('[IPC suggestions:getRelatedByTags] Missing noteId or requestingUserId');
+    return { success: false, error: "noteId and requestingUserId are required.", suggestions: [] };
+  }
+  try {
+    const suggestions = await suggestionService.getRelatedNotesByTags({ noteId, requestingUserId, limit });
+    return { success: true, suggestions: suggestions };
+  } catch (error) {
+    console.error(`[IPC suggestions:getRelatedByTags] Error for noteId ${noteId}:`, error);
+    return { success: false, error: error.message, suggestions: [] };
+  }
 });
 
 // Graph Service

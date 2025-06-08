@@ -1,0 +1,44 @@
+/* VideoBlockComponent.css */
+.video-block {
+  border: 1px solid #ccc;
+  padding: 10px;
+  margin: 10px 0;
+  border-radius: 4px;
+}
+
+.video-block-input-area {
+  margin-bottom: 10px;
+}
+
+.video-block-input-area label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 0.9em;
+  color: #555;
+}
+
+.video-block-input {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  box-sizing: border-box;
+}
+
+.video-block-player-wrapper {
+  position: relative;
+  padding-top: 56.25%; /* 16:9 Aspect Ratio */
+  background-color: #000; /* Black background for player area */
+}
+
+.video-block-react-player {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.video-block-error {
+  color: red;
+  font-size: 0.9em;
+  margin-top: 5px;
+}

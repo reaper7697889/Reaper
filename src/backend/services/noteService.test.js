@@ -49,10 +49,34 @@ describe('Note Service', () => {
 
       expect(newNoteId).toBe(123);
       expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO notes'));
-      expect(mockStmt.run).toHaveBeenCalledWith('simple', 'Test Note', 'Test Content', null, null, 1, 0);
+      expect(mockStmt.run).toHaveBeenCalledWith('simple', 'Test Note', 'Test Content', null, null, 1, 0, 0); // Added is_template default
       expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
         noteId: 123,
-        newValues: expect.objectContaining({ title: 'Test Note', content: 'Test Content', type: 'simple', userId: 1 })
+        newValues: expect.objectContaining({ title: 'Test Note', content: 'Test Content', type: 'simple', userId: 1, is_template: 0 })
+      }));
+    });
+
+    it('should create a note that is a template', async () => {
+      mockStmt.run.mockReturnValue({ lastInsertRowid: 125 });
+      const templateData = { type: 'markdown', title: 'My Test Template', content: 'Template content', userId: 1, is_template: 1 };
+
+      const newTemplateId = await noteService.createNote(templateData);
+
+      expect(newTemplateId).toBe(125);
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO notes'));
+      expect(mockStmt.run).toHaveBeenCalledWith(
+        templateData.type,
+        templateData.title,
+        templateData.content,
+        null, // folder_id
+        null, // workspace_id
+        templateData.userId,
+        0,    // is_pinned (default from createNote destructuring)
+        1     // is_template
+      );
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: 125,
+        newValues: expect.objectContaining({ title: templateData.title, is_template: 1 })
       }));
     });
 
@@ -84,15 +108,14 @@ describe('Note Service', () => {
 
   // --- getNoteById ---
   describe('getNoteById', () => {
-    const mockNoteBasic = { id: 1, type: 'simple', title: 'Test', content: 'Content', user_id: 1, deleted_at: null };
+    const mockNoteBasic = { id: 1, type: 'simple', title: 'Test', content: 'Content', user_id: 1, deleted_at: null, is_template: 0, is_pinned: 0, is_archived: 0, folder_id: null, workspace_id: null, created_at: '2023-01-01T00:00:00.000Z', updated_at: '2023-01-01T00:00:00.000Z', deleted_by_user_id: null };
 
-    it('should return a note if found and user is owner', async () => {
+    it('should return a note with is_template if found and user is owner', async () => {
       mockStmt.get.mockReturnValue(mockNoteBasic);
-      // Use noteService.getNoteById directly, as it's the actual function.
       const note = await noteService.getNoteById(1, 1);
-      expect(note).toEqual(mockNoteBasic);
+      expect(note).toEqual(mockNoteBasic); // is_template is part of mockNoteBasic
       expect(mockDb.prepare).toHaveBeenCalledWith(
-        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ? AND deleted_at IS NULL")
+        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ? AND deleted_at IS NULL")
       );
       expect(mockStmt.get).toHaveBeenCalledWith(1);
     });
@@ -104,14 +127,14 @@ describe('Note Service', () => {
     });
 
     it('should return note if public (user_id is null)', async () => {
-      const publicNote = { ...mockNoteBasic, user_id: null };
+      const publicNote = { ...mockNoteBasic, user_id: null, is_template: 1 };
       mockStmt.get.mockReturnValue(publicNote);
       const note = await noteService.getNoteById(1, 2);
       expect(note).toEqual(publicNote);
     });
 
     it('should return note if user has explicit READ permission', async () => {
-      const otherUserNote = { ...mockNoteBasic, user_id: 2 };
+      const otherUserNote = { ...mockNoteBasic, user_id: 2, is_template: 0 };
       mockStmt.get.mockReturnValue(otherUserNote);
       permissionService.checkUserNotePermission.mockResolvedValue({ V: true });
       const note = await noteService.getNoteById(1, 1);
@@ -120,7 +143,7 @@ describe('Note Service', () => {
     });
 
     it('should return null if user does not have READ permission and is not owner', async () => {
-      const otherUserNote = { ...mockNoteBasic, user_id: 2 };
+      const otherUserNote = { ...mockNoteBasic, user_id: 2, is_template: 0 };
       mockStmt.get.mockReturnValue(otherUserNote);
       permissionService.checkUserNotePermission.mockResolvedValue({ V: false });
       const note = await noteService.getNoteById(1, 1);
@@ -128,21 +151,22 @@ describe('Note Service', () => {
     });
 
     it('should return note if bypassPermissionCheck is true', async () => {
-      mockStmt.get.mockReturnValue(mockNoteBasic);
+      const templateNote = { ...mockNoteBasic, is_template: 1 };
+      mockStmt.get.mockReturnValue(templateNote);
       const note = await noteService.getNoteById(1, 999, { bypassPermissionCheck: true });
-      expect(note).toEqual(mockNoteBasic);
+      expect(note).toEqual(templateNote);
       expect(permissionService.checkUserNotePermission).not.toHaveBeenCalled();
     });
 
     it('should prepare query without "deleted_at IS NULL" if includeDeleted is true', async () => {
-      const deletedNote = { ...mockNoteBasic, deleted_at: '2023-01-01T00:00:00.000Z' };
+      const deletedNote = { ...mockNoteBasic, deleted_at: '2023-01-01T00:00:00.000Z', is_template: 0 };
       mockStmt.get.mockReturnValue(deletedNote);
       await noteService.getNoteById(1, 1, { includeDeleted: true, bypassPermissionCheck: true });
       expect(mockDb.prepare).toHaveBeenCalledWith(
-        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?")
+        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?")
       );
       const prepareCalls = mockDb.prepare.mock.calls;
-      const relevantCall = prepareCalls.find(call => call[0].includes("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?"));
+      const relevantCall = prepareCalls.find(call => call[0].includes("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?"));
       expect(relevantCall[0]).not.toContain("AND deleted_at IS NULL");
     });
   });
@@ -150,7 +174,7 @@ describe('Note Service', () => {
   // --- updateNote ---
   describe('updateNote', () => {
     let updateData;
-    const existingNoteBaseProperties = { id: 1, type: 'simple', title: 'Old Title', content: 'Old Content', user_id: 1, folder_id: null, workspace_id: null, is_pinned: 0, is_archived: 0 };
+    const existingNoteBaseProperties = { id: 1, type: 'simple', title: 'Old Title', content: 'Old Content', user_id: 1, folder_id: null, workspace_id: null, is_pinned: 0, is_archived: 0, is_template: 0 };
 
     beforeEach(() => {
       updateData = { title: 'New Title', content: 'New Content' };
@@ -158,26 +182,81 @@ describe('Note Service', () => {
       // calls the *actual* getNoteById internally. We control its behavior via mockStmt.get.
 
       permissionService.checkUserNotePermission.mockResolvedValue({ V: true });
-      mockStmt.run.mockReturnValue({ changes: 1 });
+      mockStmt.run.mockClear().mockReturnValue({ changes: 1 }); // Clear run mock from other tests
+      mockStmt.get.mockClear(); // Clear get mock from other tests
     });
 
     // No afterEach needed here.
 
     it('should update a note successfully by owner', async () => {
-      const currentExistingNote = { ...existingNoteBaseProperties };
-      // Configure the db mock for the internal call to actual getNoteById
+      const currentExistingNote = { ...existingNoteBaseProperties, is_template: 0 }; // Explicitly set for clarity
       mockStmt.get.mockReturnValueOnce(JSON.parse(JSON.stringify(currentExistingNote)));
 
       const result = await noteService.updateNote(currentExistingNote.id, updateData, currentExistingNote.user_id);
       expect(result).toBe(true);
-      // We expect the *actual* getNoteById to have been called, which means mockStmt.get was called.
-      expect(mockStmt.get).toHaveBeenCalledWith(currentExistingNote.id);
+      expect(mockStmt.get).toHaveBeenCalledWith(currentExistingNote.id); // For initial fetch in updateNote
       expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('UPDATE notes SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'));
-      expect(mockStmt.run).toHaveBeenCalledWith('New Title', 'New Content', 1);
+      expect(mockStmt.run).toHaveBeenCalledWith('New Title', 'New Content', currentExistingNote.id);
       expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
-        noteId: 1,
-        oldValues: { title: 'Old Title', content: 'Old Content', type: 'simple' },
-        newValues: expect.objectContaining({ title: 'New Title', content: 'New Content' })
+        noteId: currentExistingNote.id,
+        oldValues: expect.objectContaining({ title: 'Old Title', is_template: 0 }),
+        newValues: expect.objectContaining({ title: 'New Title', is_template: 0 })
+      }));
+    });
+
+    it('should update is_template status from false to true and record history', async () => {
+      const noteId = 1;
+      const requestingUserId = 1;
+      const existingNote = { ...existingNoteBaseProperties, id: noteId, user_id: requestingUserId, is_template: 0 };
+      const updatePayload = { is_template: true };
+
+      mockStmt.get.mockReturnValueOnce(JSON.parse(JSON.stringify(existingNote)));
+      mockStmt.run.mockReturnValueOnce({ changes: 1 });
+
+      const result = await noteService.updateNote(noteId, updatePayload, requestingUserId);
+
+      expect(result).toBe(true);
+      // Check only the relevant parts of the SQL for is_template
+      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("UPDATE notes SET is_template = ?"));
+      expect(prepareCall).toBeDefined();
+      expect(prepareCall[0]).toContain("is_template = ?");
+
+      // Check the arguments to run. is_template is 1, then updated_at, then id.
+      // The exact call depends on other fields if they were also updated, but is_template should be first here.
+      const runCall = mockStmt.run.mock.calls.find(call => call.length === 2 && call[0] === 1 && call[1] === noteId); // [1 (for true), noteId]
+      expect(runCall).toBeDefined();
+
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: noteId,
+        oldValues: expect.objectContaining({ is_template: 0 }),
+        newValues: expect.objectContaining({ is_template: true }),
+        changedFields: expect.arrayContaining(['is_template'])
+      }));
+    });
+
+    it('should update is_template status from true to false and record history', async () => {
+      const noteId = 1;
+      const requestingUserId = 1;
+      const existingNote = { ...existingNoteBaseProperties, id: noteId, user_id: requestingUserId, is_template: 1 };
+      const updatePayload = { is_template: false };
+
+      mockStmt.get.mockReturnValueOnce(JSON.parse(JSON.stringify(existingNote)));
+      mockStmt.run.mockReturnValueOnce({ changes: 1 });
+
+      const result = await noteService.updateNote(noteId, updatePayload, requestingUserId);
+
+      expect(result).toBe(true);
+      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("UPDATE notes SET is_template = ?"));
+      expect(prepareCall).toBeDefined();
+
+      const runCall = mockStmt.run.mock.calls.find(call => call.length === 2 && call[0] === 0 && call[1] === noteId); // [0 (for false), noteId]
+      expect(runCall).toBeDefined();
+
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: noteId,
+        oldValues: expect.objectContaining({ is_template: 1 }),
+        newValues: expect.objectContaining({ is_template: false }),
+        changedFields: expect.arrayContaining(['is_template'])
       }));
     });
 
@@ -419,6 +498,51 @@ describe('Note Service', () => {
     });
   });
 
+  // --- getTemplates ---
+  describe('getTemplates', () => {
+    const userId = 1;
+    const mockTemplate1 = { id: 1, title: 'Template A', type: 'markdown', user_id: userId, is_template: 1, updated_at: '2023-01-01T10:00:00.000Z' };
+    const mockTemplate2 = { id: 2, title: 'Template B (Public)', type: 'simple', user_id: null, is_template: 1, updated_at: '2023-01-02T10:00:00.000Z' };
+    // const mockNotATemplate = { id: 3, title: 'Not a Template', type: 'simple', user_id: userId, is_template: 0, updated_at: '...' }; // Not used directly in these tests
+    const mockOtherUserTemplate = { id: 4, title: 'Other User Template', type: 'markdown', user_id: 2, is_template: 1, updated_at: '2023-01-03T10:00:00.000Z'};
+
+    beforeEach(() => {
+      mockStmt.all.mockReset();
+    });
+
+    it('should retrieve all templates for a user (owned and public)', async () => {
+      mockStmt.all.mockReturnValueOnce([mockTemplate1, mockTemplate2]);
+      const templates = await noteService.getTemplates({ userId });
+
+      expect(templates).toEqual([mockTemplate1, mockTemplate2]);
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template FROM notes WHERE is_template = 1 AND (user_id = ? OR user_id IS NULL) ORDER BY title ASC"));
+      expect(mockStmt.all).toHaveBeenCalledWith(userId);
+    });
+
+    it('should retrieve all templates if no userId is provided', async () => {
+      // This reflects the current service logic: if userId is null, it fetches ALL templates.
+      const allTemplates = [mockTemplate1, mockTemplate2, mockOtherUserTemplate];
+      mockStmt.all.mockReturnValueOnce(allTemplates);
+      const templates = await noteService.getTemplates({ userId: null }); // or getTemplates({})
+
+      expect(templates).toEqual(allTemplates);
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template FROM notes WHERE is_template = 1 ORDER BY title ASC"));
+      expect(mockStmt.all).toHaveBeenCalledWith(); // No params if userId is null
+    });
+
+    it('should return empty array if no templates found', async () => {
+      mockStmt.all.mockReturnValueOnce([]);
+      const templates = await noteService.getTemplates({ userId });
+      expect(templates).toEqual([]);
+    });
+
+    it('should return empty array on DB error', async () => {
+      mockStmt.all.mockImplementationOnce(() => { throw new Error("DB Error"); });
+      const templates = await noteService.getTemplates({ userId });
+      expect(templates).toEqual([]);
+    });
+  });
+
   // --- listNotesByFolder ---
   describe('listNotesByFolder', () => {
     const mockNotesFromDb = [
@@ -546,7 +670,8 @@ describe('Note Service', () => {
         mockNoteDetails.folder_id,
         mockNoteDetails.workspace_id, // workspace_id
         mockRequestingUserId,
-        mockNoteDetails.is_pinned // is_pinned
+        mockNoteDetails.is_pinned, // is_pinned
+        0 // is_template (defaults to 0 in createNote)
       );
       expect(attachmentService.updateAttachmentParent).toHaveBeenCalledWith(mockAttachmentId, mockNewNoteId, 'note', mockRequestingUserId);
       expect(mockStmt.get).toHaveBeenCalledWith(mockNewNoteId);

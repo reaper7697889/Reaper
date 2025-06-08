@@ -1,0 +1,32 @@
+/* LatexBlockComponent.css */
+.latex-block {
+  border: 1px solid #ccc;
+  padding: 10px;
+  margin: 10px 0;
+  border-radius: 4px;
+}
+
+.latex-block-input {
+  width: 100%;
+  min-height: 50px;
+  border: 1px solid #ddd;
+  padding: 8px;
+  margin-bottom: 10px;
+  font-family: monospace;
+  font-size: 0.95em;
+  box-sizing: border-box; /* Ensures padding doesn't expand width */
+}
+
+.latex-block-preview {
+  padding: 10px;
+  background-color: #f9f9f9;
+  border-radius: 3px;
+  overflow-x: auto; /* Handle wide equations */
+}
+
+.latex-block-error {
+  color: red;
+  font-size: 0.9em;
+  margin-top: 5px;
+  white-space: pre-wrap; /* Preserve error message formatting */
+}

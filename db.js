@@ -66,6 +66,7 @@ function initializeDatabase() {
         is_archived BOOLEAN DEFAULT 0,
         deleted_at DATETIME DEFAULT NULL,
         deleted_by_user_id INTEGER DEFAULT NULL,
+        is_template BOOLEAN DEFAULT 0 NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE SET NULL,

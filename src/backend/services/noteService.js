@@ -12,7 +12,7 @@ const authService = require('./authService'); // Added for RBAC
 async function createNote(noteData) { // Changed to async to use authService
   const db = getDb();
   // Ensure userId is destructured, defaulting to null if not provided
-  const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0, userId = null } = noteData;
+  const { type, title, content, folder_id = null, workspace_id = null, is_pinned = 0, userId = null, is_template = 0 } = noteData;
 
   // RBAC Check: Viewers cannot create notes
   if (userId) { // Check only if userId is provided for the note
@@ -33,11 +33,11 @@ async function createNote(noteData) { // Changed to async to use authService
   let newNoteId;
   const transaction = db.transaction(() => {
     const stmt = db.prepare(`
-      INSERT INTO notes (type, title, content, folder_id, workspace_id, user_id, is_pinned, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO notes (type, title, content, folder_id, workspace_id, user_id, is_pinned, is_template, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
     // Pass userId to the SQL execution
-    const info = stmt.run(type, title, content, folder_id, workspace_id, userId, is_pinned ? 1 : 0);
+    const info = stmt.run(type, title, content, folder_id, workspace_id, userId, is_pinned ? 1 : 0, is_template ? 1 : 0);
     newNoteId = info.lastInsertRowid;
     if (!newNoteId) {
       throw new Error("Failed to create note or retrieve newNoteId.");
@@ -49,8 +49,8 @@ async function createNote(noteData) { // Changed to async to use authService
     if (newNoteId) {
         console.log(`Created note with ID: ${newNoteId}`);
         // Ensure userId is part of the newValues for history if available
-        const newValuesForHistory = { title, content, type, folder_id, workspace_id, is_pinned, userId };
-        const oldValuesForHistory = { title: null, content: null, type: null, folder_id: null, workspace_id: null, is_pinned: null, userId: null };
+        const newValuesForHistory = { title, content, type, folder_id, workspace_id, is_pinned, userId, is_template };
+        const oldValuesForHistory = { title: null, content: null, type: null, folder_id: null, workspace_id: null, is_pinned: null, userId: null, is_template: 0 };
         // Determine changed fields more comprehensively for history
         const changedFieldsArray = Object.keys(newValuesForHistory).filter(k =>
             newValuesForHistory[k] !== undefined && newValuesForHistory[k] !== oldValuesForHistory[k]
@@ -74,7 +74,7 @@ async function createNote(noteData) { // Changed to async to use authService
 // Added options parameter with bypassPermissionCheck and includeDeleted
 async function getNoteById(id, requestingUserId = null, options = { bypassPermissionCheck: false, includeDeleted: false }) {
   const db = getDb();
-  let baseQuery = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?";
+  let baseQuery = "SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?";
   const params = [id];
 
   if (!options.includeDeleted) {
@@ -164,15 +164,15 @@ async function updateNote(noteId, updateData, requestingUserId) {
   const oldNote = noteToUpdate;
 
   // user_id is set at creation and checked for ownership. Not typically part of updatableNoteFields by user.
-  const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type };
+  const oldValuesForHistory = { title: oldNote.title, content: oldNote.content, type: oldNote.type, is_template: oldNote.is_template };
   const newValuesForHistory = { ...oldValuesForHistory };
   const changedFieldsArray = [];
 
   // user_id is generally not in updatableNoteFields by typical user actions, but rather set at creation or by specific ownership transfer logic.
   // If user_id can be part of updateData, it needs to be added to updatableNoteFields.
   // For now, assuming user_id is NOT changed via general updateNote.
-  const updatableNoteFields = ["title", "content", "type", "folder_id", "workspace_id", "is_pinned", "is_archived"];
-  const versionedFields = ["title", "content", "type"];
+  const updatableNoteFields = ["title", "content", "type", "folder_id", "workspace_id", "is_pinned", "is_archived", "is_template"];
+  const versionedFields = ["title", "content", "type", "is_template"];
   const fieldsToUpdateInNotes = [];
   const valuesForNotesUpdate = [];
 
@@ -336,8 +336,26 @@ module.exports = {
   updateNote,
   deleteNote,
   listNotesByFolder,
+  getTemplates, // Export new function
   createVoiceNote, // Export new function
 };
+
+async function getTemplates({ userId = null }) {
+  const db = getDb();
+  let sql = "SELECT id, type, title, user_id, updated_at, is_template FROM notes WHERE is_template = 1";
+  const params = [];
+  if (userId !== null) {
+    sql += " AND (user_id = ? OR user_id IS NULL)"; // User's own templates + public templates
+    params.push(userId);
+  }
+  sql += " ORDER BY title ASC";
+  try {
+    return db.prepare(sql).all(...params);
+  } catch (err) {
+    console.error(`Error getting templates for user ${userId}:`, err.message);
+    return [];
+  }
+}
 
 async function createVoiceNote(fileDetails, { title, folder_id = null, workspace_id = null, is_pinned = 0 }, requestingUserId) {
   if (!requestingUserId) {

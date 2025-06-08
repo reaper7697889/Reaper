@@ -20,6 +20,23 @@ Reaper is a versatile desktop application built with Electron, designed for pers
 
 *   **Cross-Platform:** Being an Electron application, Reaper can potentially run on Windows, macOS, and Linux.
 
+*   **Enhanced Content Capabilities:**
+    *   **Note Templates:**
+        *   Create reusable templates from your notes. Mark any note as a template to quickly generate new notes with pre-filled content.
+        *   Use dynamic placeholders like \`{{date:YYYY-MM-DD}}\`, \`{{time:HH:MM}}\`, \`{{uuid}}\`, and \`{{cursor}}\` within your templates.
+    *   **LaTeX/Math Support:**
+        *   Seamlessly embed mathematical formulas and equations using LaTeX.
+        *   Supports inline math with \`$E=mc^2$ \` and block math with \`$$ \\frac{a}{b} $$\`.
+        *   Powered by KaTeX for fast and accurate rendering within Markdown notes.
+    *   **Enhanced Code Blocks (Markdown):**
+        *   Enjoy rich syntax highlighting for a wide variety of programming languages within your Markdown code fences.
+        *   Code blocks now feature line numbers for easy reference.
+        *   A convenient "Copy" button allows you to quickly copy code snippets.
+        *   Powered by Prism.js.
+    *   **Video Embedding (Markdown):**
+        *   Easily embed videos from YouTube and Vimeo directly into your Markdown notes.
+        *   Simply paste the video URL on its own line, and it will be rendered using an embedded player.
+
 ## Technology Stack
 
 *   **Frontend:** React
