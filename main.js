@@ -1,9 +1,10 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron"); // Added dialog
+const { app, BrowserWindow, ipcMain, dialog, Notification } = require("electron"); // Added dialog & Notification
 const path = require("path");
 const fs = require('fs').promises; // Changed to fs.promises
 
 // Import backend services
 require("./src/backend/db"); // Initialize DB connection
+const reminderService = require('./src/backend/services/reminderService');
 const noteService = require("./src/backend/services/noteService");
 const tagService = require("./src/backend/services/tagService");
 const blockService = require("./src/backend/services/blockService");
@@ -26,6 +27,7 @@ const timelineService = require('./src/backend/services/timelineService');
 const timeLogService = require('./src/backend/services/timeLogService');
 const userService = require('./src/backend/services/userService'); // Added userService
 const suggestionService = require('./src/backend/services/suggestionService');
+const journalService = require('./src/backend/services/journalService');
 
 function createWindow() {
   const mainWindow = new BrowserWindow({
@@ -42,6 +44,77 @@ function createWindow() {
 
   // mainWindow.webContents.openDevTools(); // Optional
 }
+
+// --- Reminder Polling Logic ---
+let reminderIntervalId = null;
+let currentReminderUserId = null; // This needs to be set on user login
+
+function startReminderPolling(userId) {
+  if (reminderIntervalId) {
+    clearInterval(reminderIntervalId);
+  }
+  if (!userId) {
+    console.log('[Reminders] No user ID, polling not started.');
+    currentReminderUserId = null;
+    return;
+  }
+  currentReminderUserId = userId;
+  console.log(`[Reminders] Starting polling for user ${currentReminderUserId}`);
+
+  reminderIntervalId = setInterval(async () => {
+    if (!currentReminderUserId) {
+      // console.log('[Reminders] No current user for polling tick.');
+      return;
+    }
+    // console.log(`[Reminders] Checking pending reminders for user ${currentReminderUserId}...`);
+    try {
+      const pendingReminders = await reminderService.checkPendingReminders(currentReminderUserId);
+      if (pendingReminders && pendingReminders.length > 0) {
+        const mainWindow = BrowserWindow.getAllWindows()[0]; // Get main window reference
+
+        pendingReminders.forEach(async (reminder) => {
+          console.log(`[Reminders] Triggering notification for note ${reminder.noteId}: ${reminder.title}`);
+          const notification = new Notification({
+            title: "Reaper Reminder",
+            body: reminder.title || 'A note needs your attention!',
+            // icon: path.join(__dirname, 'path/to/icon.png') // Optional icon
+          });
+
+          notification.on('click', () => {
+            console.log(`[Reminders] Notification for note ${reminder.noteId} clicked.`);
+            if (mainWindow) {
+              mainWindow.focus(); // Focus the app window
+              // Send IPC message to renderer to navigate to the note
+              mainWindow.webContents.send('navigate-to-note', reminder.noteId);
+            }
+          });
+
+          notification.show();
+
+          // Mark reminder as triggered (clear reminder_at)
+          // Pass currentReminderUserId as the requestingUser for the update operation
+          await reminderService.markReminderAsTriggered(reminder.noteId, currentReminderUserId);
+        });
+      }
+    } catch (error) {
+      console.error('[Reminders] Error during reminder check polling:', error);
+    }
+  }, 60000); // Check every 60 seconds
+}
+
+function stopReminderPolling() {
+  if (reminderIntervalId) {
+    clearInterval(reminderIntervalId);
+    reminderIntervalId = null;
+    console.log(`[Reminders] Stopped polling for user ${currentReminderUserId}`);
+    currentReminderUserId = null;
+  }
+}
+
+// TODO: Integrate with user login/logout
+// ipcMain.on('user-logged-in', (event, userId) => { startReminderPolling(userId); });
+// ipcMain.on('user-logged-out', () => { stopReminderPolling(); });
+
 
 // --- IPC Handlers ---
 
@@ -78,6 +151,45 @@ ipcMain.handle('template:createBlank', async (e, requestingUserId, initialTitle 
   } catch (error) {
     console.error("Error in template:createBlank IPC handler:", error);
     return { success: false, error: error.message || "IPC Error: Failed to create blank template." };
+  }
+});
+
+// Journal Service
+ipcMain.handle("journal:getOrCreateDailyNote", async (e, dateString, requestingUserId, config) => {
+  if (!dateString || !requestingUserId) {
+    console.error('[IPC journal:getOrCreateDailyNote] Missing dateString or requestingUserId');
+    return { success: false, error: "dateString and requestingUserId are required.", note: null };
+  }
+  try {
+    const date = new Date(dateString); // Convert string from frontend to Date object
+    if (isNaN(date.getTime())) {
+      return { success: false, error: "Invalid dateString provided.", note: null };
+    }
+    const note = await journalService.getOrCreateDailyNote({ date, requestingUserId, config });
+    if (note) {
+      return { success: true, note: note };
+    } else {
+      return { success: false, error: "Failed to get or create daily note.", note: null };
+    }
+  } catch (error) {
+    console.error(`[IPC journal:getOrCreateDailyNote] Error for date ${dateString}:`, error);
+    return { success: false, error: error.message, note: null };
+  }
+});
+
+// Reminder Service IPC (New)
+ipcMain.handle('reminder:markAsTriggered', async (e, noteId, requestingUserId) => {
+  // It's important that only the user who owns the note or an admin can mark it.
+  // The markReminderAsTriggered in reminderService calls noteService.updateNote,
+  // which already performs an ownership check for the requestingUserId.
+  if (!noteId || !requestingUserId) {
+    return { success: false, error: "noteId and requestingUserId are required." };
+  }
+  try {
+    return await reminderService.markReminderAsTriggered(noteId, requestingUserId);
+  } catch (error) {
+    console.error(`[IPC reminder:markAsTriggered] Error for noteId ${noteId}:`, error);
+    return { success: false, error: error.message };
   }
 });
 
@@ -462,7 +574,12 @@ ipcMain.handle("user:login", async (event, username, password) => {
 
 // --- App Lifecycle ---
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow();
+  // FOR TESTING ONLY - REPLACE WITH ACTUAL USER LOGIN LOGIC
+  const MOCK_LOGGED_IN_USER_ID = 1;
+  if (MOCK_LOGGED_IN_USER_ID) { startReminderPolling(MOCK_LOGGED_IN_USER_ID); }
+});
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();

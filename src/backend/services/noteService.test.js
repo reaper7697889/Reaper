@@ -49,10 +49,10 @@ describe('Note Service', () => {
 
       expect(newNoteId).toBe(123);
       expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO notes'));
-      expect(mockStmt.run).toHaveBeenCalledWith('simple', 'Test Note', 'Test Content', null, null, 1, 0, 0); // Added is_template default
+      expect(mockStmt.run).toHaveBeenCalledWith('simple', 'Test Note', 'Test Content', null, null, 1, 0, 0, null); // Added reminder_at default
       expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
         noteId: 123,
-        newValues: expect.objectContaining({ title: 'Test Note', content: 'Test Content', type: 'simple', userId: 1, is_template: 0 })
+        newValues: expect.objectContaining({ title: 'Test Note', content: 'Test Content', type: 'simple', userId: 1, is_template: 0, reminder_at: null })
       }));
     });
 
@@ -72,11 +72,12 @@ describe('Note Service', () => {
         null, // workspace_id
         templateData.userId,
         0,    // is_pinned (default from createNote destructuring)
-        1     // is_template
+        1,    // is_template
+        null  // reminder_at (default)
       );
       expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
         noteId: 125,
-        newValues: expect.objectContaining({ title: templateData.title, is_template: 1 })
+        newValues: expect.objectContaining({ title: templateData.title, is_template: 1, reminder_at: null })
       }));
     });
 
@@ -104,18 +105,48 @@ describe('Note Service', () => {
       expect(mockDb.prepare).not.toHaveBeenCalled();
       expect(authService.getUserWithRole).toHaveBeenCalledWith(2);
     });
+
+    it('should create a note with a reminder_at if provided', async () => {
+      mockStmt.run.mockReturnValue({ lastInsertRowid: 126 });
+      const reminderTime = new Date().toISOString();
+      const noteDataWithReminder = {
+        type: 'simple', title: 'Reminder Note', content: 'Content', userId: 1,
+        reminder_at: reminderTime
+      };
+      historyService.recordNoteHistory.mockResolvedValueOnce({success: true}); // Ensure this mock is specific if needed, or rely on beforeEach
+
+      const newNoteId = await noteService.createNote(noteDataWithReminder);
+
+      expect(newNoteId).toBe(126);
+      expect(mockStmt.run).toHaveBeenCalledWith(
+        noteDataWithReminder.type,
+        noteDataWithReminder.title,
+        noteDataWithReminder.content,
+        null, // folder_id
+        null, // workspace_id
+        noteDataWithReminder.userId,
+        0,    // is_pinned
+        0,    // is_template (default from createNote destructuring)
+        reminderTime // reminder_at
+      );
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: 126,
+        oldValues: expect.objectContaining({ reminder_at: null }), // reminder_at is null for oldValues on creation
+        newValues: expect.objectContaining({ reminder_at: reminderTime })
+      }));
+    });
   });
 
   // --- getNoteById ---
   describe('getNoteById', () => {
-    const mockNoteBasic = { id: 1, type: 'simple', title: 'Test', content: 'Content', user_id: 1, deleted_at: null, is_template: 0, is_pinned: 0, is_archived: 0, folder_id: null, workspace_id: null, created_at: '2023-01-01T00:00:00.000Z', updated_at: '2023-01-01T00:00:00.000Z', deleted_by_user_id: null };
+    const mockNoteBasic = { id: 1, type: 'simple', title: 'Test', content: 'Content', user_id: 1, deleted_at: null, is_template: 0, reminder_at: null, is_pinned: 0, is_archived: 0, folder_id: null, workspace_id: null, created_at: '2023-01-01T00:00:00.000Z', updated_at: '2023-01-01T00:00:00.000Z', deleted_by_user_id: null };
 
     it('should return a note with is_template if found and user is owner', async () => {
       mockStmt.get.mockReturnValue(mockNoteBasic);
       const note = await noteService.getNoteById(1, 1);
       expect(note).toEqual(mockNoteBasic); // is_template is part of mockNoteBasic
       expect(mockDb.prepare).toHaveBeenCalledWith(
-        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ? AND deleted_at IS NULL")
+        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, reminder_at, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ? AND deleted_at IS NULL")
       );
       expect(mockStmt.get).toHaveBeenCalledWith(1);
     });
@@ -163,10 +194,10 @@ describe('Note Service', () => {
       mockStmt.get.mockReturnValue(deletedNote);
       await noteService.getNoteById(1, 1, { includeDeleted: true, bypassPermissionCheck: true });
       expect(mockDb.prepare).toHaveBeenCalledWith(
-        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?")
+        expect.stringContaining("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, reminder_at, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?")
       );
       const prepareCalls = mockDb.prepare.mock.calls;
-      const relevantCall = prepareCalls.find(call => call[0].includes("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?"));
+      const relevantCall = prepareCalls.find(call => call[0].includes("SELECT id, type, title, content, folder_id, workspace_id, user_id, is_pinned, is_archived, is_template, reminder_at, created_at, updated_at, deleted_at, deleted_by_user_id FROM notes WHERE id = ?"));
       expect(relevantCall[0]).not.toContain("AND deleted_at IS NULL");
     });
   });
@@ -174,7 +205,7 @@ describe('Note Service', () => {
   // --- updateNote ---
   describe('updateNote', () => {
     let updateData;
-    const existingNoteBaseProperties = { id: 1, type: 'simple', title: 'Old Title', content: 'Old Content', user_id: 1, folder_id: null, workspace_id: null, is_pinned: 0, is_archived: 0, is_template: 0 };
+    const existingNoteBaseProperties = { id: 1, type: 'simple', title: 'Old Title', content: 'Old Content', user_id: 1, folder_id: null, workspace_id: null, is_pinned: 0, is_archived: 0, is_template: 0, reminder_at: null };
 
     beforeEach(() => {
       updateData = { title: 'New Title', content: 'New Content' };
@@ -365,6 +396,51 @@ describe('Note Service', () => {
       const updateNotesPrepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("UPDATE notes SET"));
       expect(updateNotesPrepareCall).toBeUndefined();
     });
+
+    it('should update reminder_at from null to a new datetime and record history', async () => {
+      const noteId = 1;
+      const requestingUserId = 1;
+      const reminderTime = new Date().toISOString();
+      const existingNote = { ...existingNoteBaseProperties, id:noteId, user_id: requestingUserId, reminder_at: null };
+      mockStmt.get.mockReturnValueOnce(JSON.parse(JSON.stringify(existingNote))); // For getNoteById
+      mockStmt.run.mockReturnValueOnce({ changes: 1 }); // For the UPDATE notes
+
+      const result = await noteService.updateNote(noteId, { reminder_at: reminderTime }, requestingUserId);
+
+      expect(result).toBe(true); // Adjusted to expect boolean true
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringMatching(/UPDATE notes SET reminder_at = \?, updated_at = CURRENT_TIMESTAMP WHERE id = \?/i));
+      // The order of parameters in run might vary based on other fields being updated.
+      // If ONLY reminder_at is updated, it would be (reminderTime, noteId) after updated_at is appended.
+      // Let's assume it's the first in updateData, so it's (reminderTime, noteId)
+      expect(mockStmt.run).toHaveBeenCalledWith(reminderTime, noteId);
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: noteId,
+        oldValues: expect.objectContaining({ reminder_at: null }),
+        newValues: expect.objectContaining({ reminder_at: reminderTime }),
+        changedFields: expect.arrayContaining(['reminder_at'])
+      }));
+    });
+
+    it('should clear reminder_at (set to null) and record history', async () => {
+      const noteId = 1;
+      const requestingUserId = 1;
+      const initialReminderTime = new Date().toISOString();
+      const existingNote = { ...existingNoteBaseProperties, id:noteId, user_id: requestingUserId, reminder_at: initialReminderTime };
+      mockStmt.get.mockReturnValueOnce(JSON.parse(JSON.stringify(existingNote))); // For getNoteById
+      mockStmt.run.mockReturnValueOnce({ changes: 1 }); // For the UPDATE notes
+
+      const result = await noteService.updateNote(noteId, { reminder_at: null }, requestingUserId);
+
+      expect(result).toBe(true); // Adjusted
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringMatching(/UPDATE notes SET reminder_at = \?, updated_at = CURRENT_TIMESTAMP WHERE id = \?/i));
+      expect(mockStmt.run).toHaveBeenCalledWith(null, noteId); // reminder_at=null
+      expect(historyService.recordNoteHistory).toHaveBeenCalledWith(expect.objectContaining({
+        noteId: noteId,
+        oldValues: expect.objectContaining({ reminder_at: initialReminderTime }),
+        newValues: expect.objectContaining({ reminder_at: null }),
+        changedFields: expect.arrayContaining(['reminder_at'])
+      }));
+    });
   });
 
   // --- deleteNote ---
@@ -501,10 +577,9 @@ describe('Note Service', () => {
   // --- getTemplates ---
   describe('getTemplates', () => {
     const userId = 1;
-    const mockTemplate1 = { id: 1, title: 'Template A', type: 'markdown', user_id: userId, is_template: 1, updated_at: '2023-01-01T10:00:00.000Z' };
-    const mockTemplate2 = { id: 2, title: 'Template B (Public)', type: 'simple', user_id: null, is_template: 1, updated_at: '2023-01-02T10:00:00.000Z' };
-    // const mockNotATemplate = { id: 3, title: 'Not a Template', type: 'simple', user_id: userId, is_template: 0, updated_at: '...' }; // Not used directly in these tests
-    const mockOtherUserTemplate = { id: 4, title: 'Other User Template', type: 'markdown', user_id: 2, is_template: 1, updated_at: '2023-01-03T10:00:00.000Z'};
+    const mockTemplate1 = { id: 1, title: 'Template A', type: 'markdown', user_id: userId, is_template: 1, updated_at: '2023-01-01T10:00:00.000Z', reminder_at: null };
+    const mockTemplate2 = { id: 2, title: 'Template B (Public)', type: 'simple', user_id: null, is_template: 1, updated_at: '2023-01-02T10:00:00.000Z', reminder_at: null };
+    const mockOtherUserTemplate = { id: 4, title: 'Other User Template', type: 'markdown', user_id: 2, is_template: 1, updated_at: '2023-01-03T10:00:00.000Z', reminder_at: '2023-01-15T11:00:00.000Z'};
 
     beforeEach(() => {
       mockStmt.all.mockReset();
@@ -515,7 +590,7 @@ describe('Note Service', () => {
       const templates = await noteService.getTemplates({ userId });
 
       expect(templates).toEqual([mockTemplate1, mockTemplate2]);
-      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template FROM notes WHERE is_template = 1 AND (user_id = ? OR user_id IS NULL) ORDER BY title ASC"));
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template, reminder_at FROM notes WHERE is_template = 1 AND (user_id = ? OR user_id IS NULL) ORDER BY title ASC"));
       expect(mockStmt.all).toHaveBeenCalledWith(userId);
     });
 
@@ -526,7 +601,7 @@ describe('Note Service', () => {
       const templates = await noteService.getTemplates({ userId: null }); // or getTemplates({})
 
       expect(templates).toEqual(allTemplates);
-      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template FROM notes WHERE is_template = 1 ORDER BY title ASC"));
+      expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining("SELECT id, type, title, user_id, updated_at, is_template, reminder_at FROM notes WHERE is_template = 1 ORDER BY title ASC"));
       expect(mockStmt.all).toHaveBeenCalledWith(); // No params if userId is null
     });
 
@@ -546,10 +621,10 @@ describe('Note Service', () => {
   // --- listNotesByFolder ---
   describe('listNotesByFolder', () => {
     const mockNotesFromDb = [
-      { id: 1, type: 'simple', title: 'Note A', user_id: 1, is_pinned: 1, updated_at: '2023-01-01 10:00:00', deleted_at: null },
-      { id: 2, type: 'markdown', title: 'Note B', user_id: 1, is_pinned: 0, updated_at: '2023-01-02 10:00:00', deleted_at: null },
-      { id: 3, type: 'simple', title: 'Public Note C', user_id: null, is_pinned: 0, updated_at: '2023-01-03 10:00:00', deleted_at: null },
-      { id: 4, type: 'simple', title: 'Deleted Note D', user_id: 1, is_pinned: 0, updated_at: '2023-01-04 10:00:00', deleted_at: '2023-01-04 11:00:00' },
+      { id: 1, type: 'simple', title: 'Note A', user_id: 1, is_pinned: 1, updated_at: '2023-01-01 10:00:00', deleted_at: null, reminder_at: null },
+      { id: 2, type: 'markdown', title: 'Note B', user_id: 1, is_pinned: 0, updated_at: '2023-01-02 10:00:00', deleted_at: null, reminder_at: '2023-01-15T10:00:00.000Z' },
+      { id: 3, type: 'simple', title: 'Public Note C', user_id: null, is_pinned: 0, updated_at: '2023-01-03 10:00:00', deleted_at: null, reminder_at: null },
+      { id: 4, type: 'simple', title: 'Deleted Note D', user_id: 1, is_pinned: 0, updated_at: '2023-01-04 10:00:00', deleted_at: '2023-01-04 11:00:00', reminder_at: null },
     ];
 
     beforeEach(() => {
@@ -563,7 +638,7 @@ describe('Note Service', () => {
       const result = noteService.listNotesByFolder(10, 1); // folderId 10, requestingUserId 1
 
       expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining(
-        "SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at FROM notes WHERE folder_id = ? AND is_archived = 0 AND deleted_at IS NULL AND (user_id = ? OR user_id IS NULL) ORDER BY is_pinned DESC, updated_at DESC"
+        "SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at, reminder_at FROM notes WHERE folder_id = ? AND is_archived = 0 AND deleted_at IS NULL AND (user_id = ? OR user_id IS NULL) ORDER BY is_pinned DESC, updated_at DESC"
       ));
       expect(mockStmt.all).toHaveBeenCalledWith(10, 1);
       expect(result).toEqual(expectedNotes);
@@ -576,7 +651,7 @@ describe('Note Service', () => {
       const result = noteService.listNotesByFolder(10, 1, { includeDeleted: true });
 
       // Query should not contain "AND deleted_at IS NULL"
-      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at FROM notes WHERE folder_id = ?"));
+      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at, reminder_at FROM notes WHERE folder_id = ?"));
       expect(prepareCall[0]).not.toContain("AND deleted_at IS NULL");
       expect(prepareCall[0]).toContain("AND (user_id = ? OR user_id IS NULL)"); // User filtering should still apply
 
@@ -592,7 +667,7 @@ describe('Note Service', () => {
       const result = noteService.listNotesByFolder(10, null); // No requestingUserId
 
       expect(mockDb.prepare).toHaveBeenCalledWith(expect.stringContaining(
-        "SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at FROM notes WHERE folder_id = ? AND is_archived = 0 AND deleted_at IS NULL ORDER BY is_pinned DESC, updated_at DESC"
+        "SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at, reminder_at FROM notes WHERE folder_id = ? AND is_archived = 0 AND deleted_at IS NULL ORDER BY is_pinned DESC, updated_at DESC"
       )); // No user_id filtering in WHERE clause
       expect(mockStmt.all).toHaveBeenCalledWith(10); // Only folderId
       expect(result).toEqual(allNonDeletedNotesInFolder);
@@ -603,7 +678,7 @@ describe('Note Service', () => {
 
       const result = noteService.listNotesByFolder(10, null, { includeDeleted: true });
 
-      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at FROM notes WHERE folder_id = ?"));
+      const prepareCall = mockDb.prepare.mock.calls.find(call => call[0].includes("SELECT id, type, title, user_id, is_pinned, updated_at, deleted_at, reminder_at FROM notes WHERE folder_id = ?"));
       expect(prepareCall[0]).not.toContain("AND deleted_at IS NULL"); // No deleted_at filtering
       expect(prepareCall[0]).not.toContain("AND (user_id = ? OR user_id IS NULL)"); // No user_id filtering
 

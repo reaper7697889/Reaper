@@ -37,6 +37,17 @@ Reaper is a versatile desktop application built with Electron, designed for pers
         *   Easily embed videos from YouTube and Vimeo directly into your Markdown notes.
         *   Simply paste the video URL on its own line, and it will be rendered using an embedded player.
 
+*   **Time-Based Organization & Reminders:**
+    *   **Daily Notes & Journaling:**
+        *   Supports daily note-taking, typically identified by a title like "Journal YYYY-MM-DD".
+        *   (Planned UI Feature) Automatic creation of a "Today" note can be configured, potentially using a custom "Daily Note Template".
+        *   (Planned UI Feature) A dedicated Journal view with a calendar will allow easy navigation and access to your daily entries.
+    *   **Note Reminders (MVP):**
+        *   Set a specific date and time for a reminder on any note.
+        *   Receive a local desktop notification when a reminder is due.
+        *   (Planned UI Feature) Clicking a notification will navigate you directly to the relevant note.
+        *   Currently, reminders are one-time and will be cleared after triggering.
+
 ## Technology Stack
 
 *   **Frontend:** React
